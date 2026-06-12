@@ -70,6 +70,43 @@ vec3 cosineSample(vec3 n, inout uint seed)
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - r2)));
 }
 
+// ---------------------------------------------------------------------------
+// GGX microfacet sampling (Heitz 2018, "Sampling the GGX Distribution of
+// Visible Normals", JCGT 7-4). Sampling visible normals makes the estimator
+// weight just G2/G1 — near-constant variance, and no samples are wasted on
+// below-horizon half-vectors like the old reflect+fuzz hack.
+// ---------------------------------------------------------------------------
+float ggxLambda(float alpha, float cosT)
+{
+    float c2 = cosT * cosT;
+    float tan2 = max(1.0 - c2, 0.0) / max(c2, 1e-8);
+    return 0.5 * (-1.0 + sqrt(1.0 + alpha * alpha * tan2));
+}
+
+// Ve = view direction in tangent space (+Z = shading normal). Returns the
+// sampled half-vector in tangent space.
+vec3 sampleGGXVNDF(vec3 Ve, float alpha, float r1, float r2)
+{
+    vec3 Vh = normalize(vec3(alpha * Ve.x, alpha * Ve.y, Ve.z));
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = lensq > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+    float r = sqrt(r1);
+    float phi = 6.28318530718 * r2;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+    vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    return normalize(vec3(alpha * Nh.x, alpha * Nh.y, max(1e-6, Nh.z)));
+}
+
+void tangentBasis(vec3 n, out vec3 t, out vec3 b)
+{
+    t = normalize(cross(abs(n.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0), n));
+    b = cross(n, t);
+}
+
 // Indirect bright outliers would otherwise persist in the accumulation buffer
 // as near-permanent fireflies.
 vec3 clampFirefly(vec3 c, float maxC)
@@ -297,6 +334,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     bool specularRay = true; // sun disc only visible to camera/mirror rays (NEE covers diffuse)
+    bool diffuseBounced = false; // gates roughness regularization (see below)
     float envLod = 0.0;
     firstAlbedo = vec3(1.0); // sky default: uniform albedo lets sky pixels filter together
     firstNormal = vec3(0.0);
@@ -320,6 +358,14 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         float roughness = m1.x;
         float transmission = m1.y;
         float ior = max(m1.z, 1.0);
+
+        // Path-space regularization (Kaplanyan/Dachsbacher): once the path has
+        // gone diffuse, clamp roughness up so glossy chains converge instead of
+        // sparkling. Camera-visible and pure specular chains keep their true
+        // roughness, so mirrors and glass stay sharp. Mildly biased — same
+        // trade as the blurred env mips and the firefly clamp.
+        if (diffuseBounced)
+            roughness = max(roughness, 0.25);
 
         // Entering vs exiting must be read off the raw face normal — after the
         // flip below that information is gone.
@@ -348,13 +394,24 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         // multiplied by the lobe tint, never divided.
         bool doDiffuse = false;
         if (rand(seed) < metallic) {
-            // Rough metal: perfect mirror perturbed by roughness^2.
-            vec3 fuzz = vec3(rand(seed), rand(seed), rand(seed)) * 2.0 - 1.0;
-            rd = normalize(reflect(rd, n) + roughness * roughness * fuzz);
-            if (dot(rd, n) <= 0.0)
-                break;
+            // Rough metal: GGX VNDF sample; weight = G2/G1, tint = albedo
+            // (stand-in for conductor Fresnel in this factor-only model).
+            float alpha = max(roughness * roughness, 1e-3);
+            vec3 t, b;
+            tangentBasis(n, t, b);
+            vec3 Vts = vec3(dot(-rd, t), dot(-rd, b), dot(-rd, n));
+            if (Vts.z <= 0.0)
+                break; // view grazes under the shading normal
+            vec3 Hts = sampleGGXVNDF(Vts, alpha, rand(seed), rand(seed));
+            vec3 H = t * Hts.x + b * Hts.y + n * Hts.z;
+            vec3 newRd = reflect(rd, H);
+            float ndl = dot(newRd, n);
+            if (ndl <= 0.0)
+                break; // rare with VNDF, but reflect can still graze under
+            float lamV = ggxLambda(alpha, Vts.z);
+            rd = newRd;
             ro = pos;
-            throughput *= albedo;
+            throughput *= albedo * (1.0 + lamV) / (1.0 + lamV + ggxLambda(alpha, ndl));
             // Fuzzy lobes shouldn't see the near-delta procedural sun disc (spikes),
             // and blurred env lookups suit them.
             specularRay = roughness < 0.25;
@@ -366,29 +423,44 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             // (eta = ior) underestimates F near the TIR cone — accepted, same
             // approximation as Ray Tracing in One Weekend; don't compensate by
             // tinting lobes.
+            float alpha = max(roughness * roughness, 1e-3);
+            vec3 t, b;
+            tangentBasis(n, t, b);
+            vec3 Vts = vec3(dot(-rd, t), dot(-rd, b), dot(-rd, n));
+            if (Vts.z <= 0.0)
+                break; // view grazes under the shading normal
+            vec3 Hts = sampleGGXVNDF(Vts, alpha, rand(seed), rand(seed));
+            vec3 H = t * Hts.x + b * Hts.y + n * Hts.z;
+            float lamV = ggxLambda(alpha, Vts.z);
+
             float eta = frontFace ? 1.0 / ior : ior;
-            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+            float cosI = clamp(dot(-rd, H), 0.0, 1.0);
             float f0 = (1.0 - eta) / (1.0 + eta);
             f0 *= f0;
             float F = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
-            vec3 refr = refract(rd, n, eta);
+            vec3 refr = refract(rd, H, eta);
             if (dot(refr, refr) == 0.0)
                 F = 1.0; // total internal reflection: the whole lobe reflects
-            vec3 fuzz = (vec3(rand(seed), rand(seed), rand(seed)) * 2.0 - 1.0) * roughness * roughness;
             if (rand(seed) < F) {
-                rd = normalize(reflect(rd, n) + fuzz);
-                if (dot(rd, n) <= 0.0)
+                vec3 newRd = reflect(rd, H);
+                float ndl = dot(newRd, n);
+                if (ndl <= 0.0)
                     break;
+                rd = newRd;
                 ro = pos;
-                // Dielectric specular is uncolored — throughput unchanged.
+                // Dielectric specular is uncolored — only the G2/G1 weight.
+                throughput *= (1.0 + lamV) / (1.0 + lamV + ggxLambda(alpha, ndl));
                 specularRay = roughness < 0.25;
                 envLod = roughness < 0.25 ? envLod : 2.0;
             } else if (rand(seed) < transmission) {
-                rd = normalize(refr + fuzz);
-                if (dot(rd, gn) >= 0.0)
-                    break; // fuzz pushed the refracted ray back outside
+                float ndl = -dot(refr, n);
+                if (ndl <= 0.0)
+                    break; // rough half-vector refracted back outside
+                rd = refr;
                 ro = pos - gn * 4e-3; // far side of the surface, or it re-hits itself
-                throughput *= albedo; // see-through tint (cheap stand-in for Beer-Lambert)
+                // See-through tint (cheap stand-in for Beer-Lambert); same
+                // G2/G1 masking-shadowing approximation as the reflect branch.
+                throughput *= albedo * (1.0 + lamV) / (1.0 + lamV + ggxLambda(alpha, ndl));
                 specularRay = roughness < 0.25;
                 envLod = roughness < 0.25 ? envLod : 2.0;
             } else {
@@ -421,6 +493,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             ro = pos;
             throughput *= albedo;
             specularRay = false;
+            diffuseBounced = true; // later lobes get regularized roughness
             envLod = 3.0; // blurred env for indirect diffuse
         }
 
