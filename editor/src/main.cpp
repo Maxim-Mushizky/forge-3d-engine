@@ -4,6 +4,15 @@
 #include <cstring>
 #include <string>
 
+// Hybrid-graphics laptops route OpenGL to the integrated GPU by default —
+// the path tracer would run on the iGPU while the discrete GPU idles. These
+// exported symbols are the documented driver hints for the high-performance
+// GPU; they must live in the executable, not the static engine lib.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
 namespace {
 bool EndsWithNoCase(const std::string& s, const std::string& suffix)
 {
