@@ -23,4 +23,8 @@ target_include_directories(forge PUBLIC src)
 target_include_directories(forge PRIVATE ${tinygltf_SOURCE_DIR} ${tinyobjloader_SOURCE_DIR} vendor)
 target_link_libraries(forge PUBLIC glfw libglew_static glm::glm opengl32)
 target_link_libraries(forge PRIVATE manifold::manifold)
-target_compile_definitions(forge PUBLIC FORGE_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
+# Where the editor loads runtime assets (shaders, models) from. Defaults to the
+# in-tree assets dir for local dev; override with -D FORGE_ASSET_DIR="assets" to
+# resolve relative to the working dir for a portable deployment bundle.
+set(FORGE_ASSET_DIR "${CMAKE_SOURCE_DIR}/assets" CACHE STRING "Runtime asset directory")
+target_compile_definitions(forge PUBLIC FORGE_ASSET_DIR="${FORGE_ASSET_DIR}")
