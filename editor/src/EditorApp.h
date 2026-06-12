@@ -142,6 +142,7 @@ private:
     bool m_RayTracing = false;
     PathTracer m_PathTracer;
     int m_Bounces = 4;
+    int m_AdaptiveSpp = 4; // samples per frame while idle; grows/shrinks with frame time
     bool m_Denoise = true;
     float m_DenoiseStrength = 0.7f;
     float m_Aperture = 0.0f;    // 0 = DOF off

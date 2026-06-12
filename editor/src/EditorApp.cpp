@@ -279,10 +279,28 @@ void EditorApp::UpdateRayTracer()
     m_LastAperture = aperture;
     m_LastFocusDist = m_FocusDist;
 
-    // 1 spp while interacting (latency), 4 spp while converging (4x faster).
+    // Frame-budget adaptive sampling: 1 spp while interacting (latency); while
+    // idle, grow samples per frame as long as the frame time stays under budget
+    // so a fast GPU converges at its own throughput instead of the UI frame
+    // rate (the shader loops u_SamplesPerPass sub-samples in one dispatch).
+    // Under vsync the swap blocks when the GPU falls behind, so the UI frame
+    // time is an honest feedback signal; gradual doubling keeps any single
+    // dispatch far from the Windows TDR limit.
+    int spp = 1;
+    if (reset) {
+        m_AdaptiveSpp = 4; // restart gently after interaction
+    } else if (m_PathTracer.SampleCount() >= 8192) {
+        return; // converged long ago — stop burning the GPU
+    } else {
+        float dt = ImGui::GetIO().DeltaTime;
+        if (dt < 1.0f / 45.0f)
+            m_AdaptiveSpp = std::min(m_AdaptiveSpp * 2, 128);
+        else if (dt > 1.0f / 20.0f)
+            m_AdaptiveSpp = std::max(m_AdaptiveSpp / 2, 1);
+        spp = m_AdaptiveSpp;
+    }
     m_PathTracer.SetDenoise(m_Denoise, m_DenoiseStrength);
-    m_PathTracer.Dispatch(viewProj, m_Camera.Position(), m_Sun, m_Bounces, m_FrameLights, m_Env.get(),
-                          reset ? 1 : 4);
+    m_PathTracer.Dispatch(viewProj, m_Camera.Position(), m_Sun, m_Bounces, m_FrameLights, m_Env.get(), spp);
 }
 
 void EditorApp::BuildDockLayoutIfNeeded(unsigned int dockspaceID)
