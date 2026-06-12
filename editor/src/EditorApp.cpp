@@ -4,6 +4,7 @@
 
 #include <forge/assets/AssetManager.h>
 #include <forge/assets/MeshFactory.h>
+#include <forge/assets/SceneSerializer.h>
 #include <forge/assets/StlExporter.h>
 #include <forge/core/Log.h>
 #include <forge/geometry/MeshEdit.h>
@@ -17,7 +18,10 @@
 #include <backends/imgui_impl_opengl3.h>
 #include <ImGuizmo.h>
 
-#include <gif.h> // single TU only: gif-h's functions are not inline
+#include <gif.h>   // single TU only: gif-h's functions are not inline
+#include <json.hpp> // nlohmann, bundled with tinygltf (extras blob for scene files)
+
+#include <fstream>
 
 // gif-h's GifWriter is an anonymous-struct typedef, so it can't be forward
 // declared — this wrapper gives the header a nameable opaque type.
@@ -27,6 +31,7 @@ struct ForgeGifWriter {
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <unordered_map>
@@ -80,6 +85,8 @@ EditorApp::EditorApp()
     cube.transform.translation = {0.0f, 0.5f, 0.0f};
     cube.material.albedo = {0.85f, 0.35f, 0.25f};
 
+    LoadRecentFiles();
+    MarkSaved(); // the starter scene isn't "unsaved work"
 }
 
 EditorApp::~EditorApp()
@@ -91,8 +98,19 @@ EditorApp::~EditorApp()
 
 void EditorApp::Run()
 {
-    while (!m_Window.ShouldClose()) {
+    while (true) {
         m_Window.PollEvents();
+
+        // Close intercept: the X button must respect unsaved work.
+        if (m_Window.ShouldClose()) {
+            if (!SceneDirty() || m_ForceClose)
+                break;
+            m_Window.SetShouldClose(false);
+            m_PendingAction = FileAction::Exit;
+            m_ShowUnsavedModal = true;
+        }
+
+        UpdateWindowTitle();
 
         float az = glm::radians(m_SunAzimuth), el = glm::radians(m_SunElevation);
         m_Sun.direction = -vec3(std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az));
@@ -106,6 +124,7 @@ void EditorApp::Run()
         ImGui::NewFrame();
         ImGuizmo::BeginFrame();
 
+        DrawMainMenuBar(); // before the dockspace so it claims the top work area
         unsigned int dockspaceID = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
         BuildDockLayoutIfNeeded(dockspaceID);
 
@@ -323,6 +342,16 @@ void EditorApp::HandleShortcuts()
         }
     }
 
+    // File ops (Ctrl+Shift+S checked before Ctrl+S).
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N))
+        RequestWithUnsavedCheck(FileAction::NewScene);
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O))
+        RequestWithUnsavedCheck(FileAction::OpenScene);
+    if (io.KeyCtrl && io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S))
+        SaveSceneAs();
+    else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S))
+        SaveScene();
+
     if (ImGui::IsKeyPressed(ImGuiKey_Delete))
         DeleteSelected();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D))
@@ -429,7 +458,447 @@ bool EditorApp::LoadHDRIFile(const std::string& path)
     if (!env->Load(path))
         return false;
     m_Env = std::move(env);
+    m_EnvPath = path;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Scene files (#1)
+// ---------------------------------------------------------------------------
+
+std::string EditorApp::MeshRecipe(const Mesh* mesh) const
+{
+    if (mesh == m_CubeMesh.get()) return "cube";
+    if (mesh == m_SphereMesh.get()) return "sphere";
+    if (mesh == m_PlaneMesh.get()) return "plane";
+    if (mesh == m_CylinderMesh.get()) return "cylinder";
+    if (mesh == m_ConeMesh.get()) return "cone";
+    if (mesh == m_TorusMesh.get()) return "torus";
+    if (mesh == m_SculptSphereMesh.get()) return "sculpt-sphere";
+    if (mesh == m_TerrainMesh.get()) return "terrain";
+    return "";
+}
+
+std::shared_ptr<Mesh> EditorApp::MeshFromRecipe(const std::string& recipe) const
+{
+    if (recipe == "cube") return m_CubeMesh;
+    if (recipe == "sphere") return m_SphereMesh;
+    if (recipe == "plane") return m_PlaneMesh;
+    if (recipe == "cylinder") return m_CylinderMesh;
+    if (recipe == "cone") return m_ConeMesh;
+    if (recipe == "torus") return m_TorusMesh;
+    if (recipe == "sculpt-sphere") return m_SculptSphereMesh;
+    if (recipe == "terrain") return m_TerrainMesh;
+    return nullptr;
+}
+
+std::string EditorApp::BuildExtrasJson() const
+{
+    using nlohmann::json;
+    json j;
+    j["sun"] = {{"azimuth", m_SunAzimuth},
+                {"elevation", m_SunElevation},
+                {"intensity", m_Sun.intensity},
+                {"color", {m_Sun.color.x, m_Sun.color.y, m_Sun.color.z}}};
+    j["sky"] = {{"hdri", m_EnvPath},
+                {"intensity", m_Env ? m_Env->intensity : 1.0f},
+                {"rotation", m_Env ? m_Env->rotationDegrees : 0.0f}};
+    j["rt"] = {{"enabled", m_RayTracing}, {"bounces", m_Bounces},     {"scale", m_RTScale},
+               {"denoise", m_Denoise},    {"denoiseStrength", m_DenoiseStrength},
+               {"aperture", m_Aperture},  {"focus", m_FocusDist},
+               {"ground", m_PathTracer.GroundPlane()}};
+    EditorCamera::Bookmark cam = m_Camera.GetBookmark();
+    j["camera"] = {{"focal", {cam.focalPoint.x, cam.focalPoint.y, cam.focalPoint.z}},
+                   {"distance", cam.distance},
+                   {"pitch", cam.pitch},
+                   {"yaw", cam.yaw},
+                   {"ortho", m_Camera.IsOrthographic()}};
+    json bookmarks = json::array();
+    for (const CameraBookmark& b : m_Bookmarks) {
+        if (!b.set) {
+            bookmarks.push_back(nullptr);
+            continue;
+        }
+        bookmarks.push_back({{"focal", {b.value.focalPoint.x, b.value.focalPoint.y, b.value.focalPoint.z}},
+                             {"distance", b.value.distance},
+                             {"pitch", b.value.pitch},
+                             {"yaw", b.value.yaw}});
+    }
+    j["bookmarks"] = std::move(bookmarks);
+    j["spawnCounter"] = m_SpawnCounter;
+    j["stlScale"] = m_StlScale;
+    return j.dump();
+}
+
+// Type-checked json getters: scene files are hand-editable by design, so a
+// string where a number belongs must skip the field, never throw.
+namespace {
+float NumOr(const nlohmann::json& o, const char* key, float fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_number() ? it->get<float>() : fallback;
+}
+int IntOr(const nlohmann::json& o, const char* key, int fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_number_integer() ? it->get<int>() : fallback;
+}
+bool BoolOr(const nlohmann::json& o, const char* key, bool fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_boolean() ? it->get<bool>() : fallback;
+}
+std::string StrOr(const nlohmann::json& o, const char* key, const std::string& fallback)
+{
+    auto it = o.find(key);
+    return it != o.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+vec3 Vec3Or(const nlohmann::json& o, const char* key, const vec3& fallback)
+{
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_array() || it->size() != 3 || !(*it)[0].is_number() ||
+        !(*it)[1].is_number() || !(*it)[2].is_number())
+        return fallback;
+    return {(*it)[0].get<float>(), (*it)[1].get<float>(), (*it)[2].get<float>()};
+}
+} // namespace
+
+void EditorApp::ApplyExtrasJson(const std::string& extras)
+{
+    using nlohmann::json;
+    json j = json::parse(extras, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object())
+        return; // old or hand-edited file without extras: keep current settings
+
+    if (auto s = j.find("sun"); s != j.end() && s->is_object()) {
+        m_SunAzimuth = NumOr(*s, "azimuth", m_SunAzimuth);
+        m_SunElevation = NumOr(*s, "elevation", m_SunElevation);
+        m_Sun.intensity = NumOr(*s, "intensity", m_Sun.intensity);
+        m_Sun.color = Vec3Or(*s, "color", m_Sun.color);
+    }
+    if (auto s = j.find("sky"); s != j.end() && s->is_object()) {
+        std::string hdri = StrOr(*s, "hdri", "");
+        if (hdri.empty()) {
+            m_Env.reset();
+            m_EnvPath.clear();
+        } else if (LoadHDRIFile(hdri)) {
+            m_Env->intensity = NumOr(*s, "intensity", 1.0f);
+            m_Env->rotationDegrees = NumOr(*s, "rotation", 0.0f);
+        } else {
+            // The loaded scene must not inherit whatever sky was up before.
+            m_Env.reset();
+            m_EnvPath.clear();
+            FORGE_WARN("Scene references a missing HDRI: %s", hdri.c_str());
+        }
+    }
+    if (auto s = j.find("rt"); s != j.end() && s->is_object()) {
+        m_RayTracing = BoolOr(*s, "enabled", m_RayTracing);
+        m_Bounces = IntOr(*s, "bounces", m_Bounces);
+        m_RTScale = NumOr(*s, "scale", m_RTScale);
+        m_Denoise = BoolOr(*s, "denoise", m_Denoise);
+        m_DenoiseStrength = NumOr(*s, "denoiseStrength", m_DenoiseStrength);
+        m_Aperture = NumOr(*s, "aperture", m_Aperture);
+        m_FocusDist = NumOr(*s, "focus", m_FocusDist);
+        m_PathTracer.SetGroundPlane(BoolOr(*s, "ground", m_PathTracer.GroundPlane()));
+    }
+    if (auto s = j.find("camera"); s != j.end() && s->is_object()) {
+        EditorCamera::Bookmark cam;
+        cam.focalPoint = Vec3Or(*s, "focal", {0.0f, 0.5f, 0.0f});
+        cam.distance = NumOr(*s, "distance", 8.0f);
+        cam.pitch = NumOr(*s, "pitch", 0.45f);
+        cam.yaw = NumOr(*s, "yaw", 0.65f);
+        m_Camera.SetOrthographic(BoolOr(*s, "ortho", false));
+        m_Camera.ApplyBookmark(cam);
+    }
+    if (auto s = j.find("bookmarks"); s != j.end() && s->is_array()) {
+        for (size_t i = 0; i < 4 && i < s->size(); ++i) {
+            const json& b = (*s)[i];
+            m_Bookmarks[i].set = b.is_object();
+            if (!m_Bookmarks[i].set)
+                continue;
+            m_Bookmarks[i].value.focalPoint = Vec3Or(b, "focal", vec3(0.0f));
+            m_Bookmarks[i].value.distance = NumOr(b, "distance", 8.0f);
+            m_Bookmarks[i].value.pitch = NumOr(b, "pitch", 0.0f);
+            m_Bookmarks[i].value.yaw = NumOr(b, "yaw", 0.0f);
+        }
+    }
+    m_SpawnCounter = IntOr(j, "spawnCounter", m_SpawnCounter);
+    m_StlScale = NumOr(j, "stlScale", m_StlScale);
+}
+
+uint64_t EditorApp::SettingsHash() const
+{
+    // FNV-1a over the scene-level settings BuildExtrasJson serializes, except
+    // camera pose/bookmarks (view changes shouldn't flag unsaved work).
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void* data, size_t bytes) {
+        const uint8_t* p = (const uint8_t*)data;
+        for (size_t i = 0; i < bytes; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(&m_SunAzimuth, sizeof(m_SunAzimuth));
+    mix(&m_SunElevation, sizeof(m_SunElevation));
+    mix(&m_Sun.intensity, sizeof(m_Sun.intensity));
+    mix(&m_Sun.color, sizeof(m_Sun.color));
+    mix(m_EnvPath.data(), m_EnvPath.size());
+    float envIntensity = m_Env ? m_Env->intensity : 0.0f;
+    float envRotation = m_Env ? m_Env->rotationDegrees : 0.0f;
+    mix(&envIntensity, sizeof(envIntensity));
+    mix(&envRotation, sizeof(envRotation));
+    mix(&m_RayTracing, sizeof(m_RayTracing));
+    mix(&m_Bounces, sizeof(m_Bounces));
+    mix(&m_RTScale, sizeof(m_RTScale));
+    mix(&m_Denoise, sizeof(m_Denoise));
+    mix(&m_DenoiseStrength, sizeof(m_DenoiseStrength));
+    mix(&m_Aperture, sizeof(m_Aperture));
+    bool ground = m_PathTracer.GroundPlane();
+    mix(&ground, sizeof(ground));
+    mix(&m_StlScale, sizeof(m_StlScale));
+    return h;
+}
+
+bool EditorApp::SceneDirty() const
+{
+    return m_Commands.Revision() != m_SavedRevision || SettingsHash() != m_SavedSettingsHash;
+}
+
+void EditorApp::MarkSaved()
+{
+    m_SavedRevision = m_Commands.Revision();
+    m_SavedSettingsHash = SettingsHash();
+}
+
+void EditorApp::DoNewScene()
+{
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit();
+    m_Extrude.Disarm();
+    m_Scene.Entities().clear();
+    SelectOnly(0);
+    m_Commands.Clear();
+    m_ScenePath.clear();
+
+    // A new scene must not inherit the previous scene's environment/settings —
+    // reset everything BuildExtrasJson serializes.
+    m_Env.reset();
+    m_EnvPath.clear();
+    m_Sun = DirectionalLight{};
+    m_SunAzimuth = 40.0f;
+    m_SunElevation = 50.0f;
+    m_RayTracing = false;
+    m_Bounces = 4;
+    m_RTScale = 0.75f;
+    m_Denoise = true;
+    m_DenoiseStrength = 0.7f;
+    m_Aperture = 0.0f;
+    m_FocusDist = -1.0f;
+    m_PathTracer.SetGroundPlane(true);
+    for (CameraBookmark& b : m_Bookmarks)
+        b.set = false;
+    m_Camera.SetOrthographic(false);
+    m_Camera.ApplyBookmark({{0.0f, 0.5f, 0.0f}, 8.0f, 0.45f, 0.65f});
+    m_SpawnCounter = 1;
+    m_StlScale = 100.0f;
+
+    MarkSaved();
+    m_LastSceneHash = 0; // force RT re-upload
+}
+
+void EditorApp::OpenSceneFile(const std::string& path)
+{
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit();
+    m_Extrude.Disarm();
+
+    std::string extras;
+    auto fromRecipe = [this](const std::string& r) { return MeshFromRecipe(r); };
+    if (!LoadSceneFile(path, m_Scene, extras, fromRecipe)) {
+        FORGE_ERROR("Could not open scene: %s", path.c_str());
+        return;
+    }
+    SelectOnly(0);
+    m_Commands.Clear();
+    ApplyExtrasJson(extras);
+    m_ScenePath = path;
+    MarkSaved();
+    AddRecentFile(path);
+    m_LastSceneHash = 0; // force RT re-upload
+}
+
+bool EditorApp::SaveScene()
+{
+    if (m_ScenePath.empty())
+        return SaveSceneAs();
+    auto toRecipe = [this](const Mesh* m) { return MeshRecipe(m); };
+    if (!SaveSceneFile(m_ScenePath, m_Scene, BuildExtrasJson(), toRecipe)) {
+        FORGE_ERROR("Save failed: %s", m_ScenePath.c_str());
+        return false;
+    }
+    MarkSaved();
+    AddRecentFile(m_ScenePath);
+    return true;
+}
+
+bool EditorApp::SaveSceneAs()
+{
+    std::string path = SaveFileDialog(m_Window.NativeHandle(), "Forge Scene\0*.forge\0", "forge");
+    if (path.empty())
+        return false;
+    std::string previous = m_ScenePath; // only adopt the new path once the write lands
+    m_ScenePath = path;
+    if (!SaveScene()) {
+        m_ScenePath = previous;
+        return false;
+    }
+    return true;
+}
+
+void EditorApp::RequestWithUnsavedCheck(FileAction action, const std::string& openPath)
+{
+    m_PendingAction = action;
+    m_PendingOpenPath = openPath;
+    if (SceneDirty()) {
+        m_ShowUnsavedModal = true;
+        return;
+    }
+    ExecutePendingAction();
+}
+
+void EditorApp::ExecutePendingAction()
+{
+    FileAction action = m_PendingAction;
+    std::string openPath = m_PendingOpenPath;
+    m_PendingAction = FileAction::None;
+    m_PendingOpenPath.clear();
+
+    switch (action) {
+    case FileAction::NewScene:
+        DoNewScene();
+        break;
+    case FileAction::OpenScene: {
+        if (openPath.empty())
+            openPath = OpenFileDialog(m_Window.NativeHandle(), "Forge Scene\0*.forge\0All Files\0*.*\0");
+        if (!openPath.empty())
+            OpenSceneFile(openPath);
+        break;
+    }
+    case FileAction::Exit:
+        m_ForceClose = true;
+        m_Window.SetShouldClose(true);
+        break;
+    case FileAction::None:
+        break;
+    }
+}
+
+void EditorApp::DrawMainMenuBar()
+{
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("New", "Ctrl+N"))
+                RequestWithUnsavedCheck(FileAction::NewScene);
+            if (ImGui::MenuItem("Open...", "Ctrl+O"))
+                RequestWithUnsavedCheck(FileAction::OpenScene);
+            if (ImGui::BeginMenu("Open Recent", !m_RecentFiles.empty())) {
+                // Iterate a copy: opening mutates the recents list.
+                for (const std::string& path : std::vector<std::string>(m_RecentFiles))
+                    if (ImGui::MenuItem(path.c_str()))
+                        RequestWithUnsavedCheck(FileAction::OpenScene, path);
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save", "Ctrl+S"))
+                SaveScene();
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S"))
+                SaveSceneAs();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit"))
+                RequestWithUnsavedCheck(FileAction::Exit);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+
+    if (m_ShowUnsavedModal) {
+        ImGui::OpenPopup("Unsaved Changes");
+        m_ShowUnsavedModal = false;
+    }
+    if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        std::string name = m_ScenePath.empty()
+                               ? "Untitled"
+                               : std::filesystem::path(m_ScenePath).filename().string();
+        ImGui::Text("Save changes to %s?", name.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("Save", ImVec2(110, 0))) {
+            ImGui::CloseCurrentPopup();
+            if (SaveScene())
+                ExecutePendingAction();
+            else
+                m_PendingAction = FileAction::None; // save canceled/failed: stay put
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", ImVec2(110, 0))) {
+            ImGui::CloseCurrentPopup();
+            ExecutePendingAction();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110, 0))) {
+            ImGui::CloseCurrentPopup();
+            m_PendingAction = FileAction::None;
+            m_PendingOpenPath.clear();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void EditorApp::UpdateWindowTitle()
+{
+    std::string name = m_ScenePath.empty()
+                           ? "Untitled"
+                           : std::filesystem::path(m_ScenePath).filename().string();
+    std::string title = name + (SceneDirty() ? "*" : "") + " - Forge Editor";
+    if (title != m_LastTitle) {
+        m_Window.SetTitle(title);
+        m_LastTitle = title;
+    }
+}
+
+static std::filesystem::path RecentFilesPath()
+{
+    const char* base = std::getenv("LOCALAPPDATA");
+    std::filesystem::path dir = base ? std::filesystem::path(base) / "Forge"
+                                     : std::filesystem::temp_directory_path() / "Forge";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / "recent.txt";
+}
+
+void EditorApp::AddRecentFile(const std::string& path)
+{
+    m_RecentFiles.erase(std::remove(m_RecentFiles.begin(), m_RecentFiles.end(), path),
+                        m_RecentFiles.end());
+    m_RecentFiles.insert(m_RecentFiles.begin(), path);
+    if (m_RecentFiles.size() > 8)
+        m_RecentFiles.resize(8);
+    SaveRecentFiles();
+}
+
+void EditorApp::LoadRecentFiles()
+{
+    std::ifstream in(RecentFilesPath());
+    std::string line;
+    while (std::getline(in, line))
+        if (!line.empty())
+            m_RecentFiles.push_back(line);
+}
+
+void EditorApp::SaveRecentFiles() const
+{
+    std::ofstream out(RecentFilesPath(), std::ios::trunc);
+    for (const std::string& p : m_RecentFiles)
+        out << p << "\n";
 }
 
 void EditorApp::ImportModel()
@@ -1038,8 +1507,10 @@ void EditorApp::DrawSidebar()
         if (m_Env && m_Env->Valid()) {
             ImGui::SliderFloat("Sky intensity", &m_Env->intensity, 0.0f, 4.0f);
             ImGui::SliderFloat("Sky rotation", &m_Env->rotationDegrees, 0.0f, 360.0f, "%.0f deg");
-            if (ImGui::Button("Clear HDRI", ImVec2(-1, 0)))
+            if (ImGui::Button("Clear HDRI", ImVec2(-1, 0))) {
                 m_Env.reset();
+                m_EnvPath.clear();
+            }
         }
     }
 

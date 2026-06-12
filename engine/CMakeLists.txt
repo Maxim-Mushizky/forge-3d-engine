@@ -11,6 +11,8 @@ add_library(forge STATIC
     src/forge/assets/MeshFactory.cpp
     src/forge/assets/ModelImporter.cpp
     src/forge/assets/StlExporter.cpp
+    src/forge/assets/SceneFormat.cpp
+    src/forge/assets/SceneSerializer.cpp
     src/forge/geometry/MeshEdit.cpp
     src/forge/geometry/MeshBoolean.cpp
     src/forge/geometry/MeshRemesh.cpp

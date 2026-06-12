@@ -19,9 +19,11 @@ public:
     Window& operator=(const Window&) = delete;
 
     bool ShouldClose() const;
+    void SetShouldClose(bool value); // intercept close for unsaved-changes prompts
     void PollEvents();
     void SwapBuffers();
     void SetVSync(bool enabled);
+    void SetTitle(const std::string& title);
 
     uint32_t Width() const { return m_Width; }
     uint32_t Height() const { return m_Height; }

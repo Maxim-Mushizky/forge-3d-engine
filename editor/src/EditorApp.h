@@ -73,7 +73,30 @@ public:
     void SetRayTracing(bool enabled) { m_RayTracing = enabled; }
     bool LoadHDRIFile(const std::string& path);
     void ToggleSculptMode();
+    void OpenSceneFile(const std::string& path); // CLI arg / recents / drag-drop
 private:
+    // --- scene file lifecycle (#1) ---------------------------------------
+    enum class FileAction { None, NewScene, OpenScene, Exit };
+    void DrawMainMenuBar(); // also owns the unsaved-changes modal
+    void DoNewScene();
+    bool SaveScene();   // Save As when untitled; true once written
+    bool SaveSceneAs();
+    void RequestWithUnsavedCheck(FileAction action, const std::string& openPath = "");
+    void ExecutePendingAction();
+    // Dirty = entity edits (command revision) OR scene-level settings changes
+    // (sun/sky/RT/export — hashed). Camera pose is deliberately excluded:
+    // orbiting around your model isn't unsaved work.
+    bool SceneDirty() const;
+    void MarkSaved();
+    uint64_t SettingsHash() const;
+    void UpdateWindowTitle();
+    std::string BuildExtrasJson() const;
+    void ApplyExtrasJson(const std::string& extras);
+    std::string MeshRecipe(const Mesh* mesh) const;            // "" = not a shared primitive
+    std::shared_ptr<Mesh> MeshFromRecipe(const std::string& recipe) const;
+    void AddRecentFile(const std::string& path);
+    void LoadRecentFiles();
+    void SaveRecentFiles() const;
     void UpdateRayTracer();
     void GatherLights();
     uint64_t SceneHash() const;
@@ -126,6 +149,17 @@ private:
     std::string m_BoolStatus; // last boolean error, shown in the Modify section
     char m_TextInput[64] = "Forge";
     float m_TextDepth = 0.25f;
+
+    std::string m_ScenePath;        // empty = untitled
+    std::string m_EnvPath;          // HDRI source path (for serialization)
+    uint64_t m_SavedRevision = 0;     // CommandStack revision at last save
+    uint64_t m_SavedSettingsHash = 0; // SettingsHash() at last save
+    std::vector<std::string> m_RecentFiles;
+    FileAction m_PendingAction = FileAction::None;
+    std::string m_PendingOpenPath;
+    bool m_ShowUnsavedModal = false;
+    bool m_ForceClose = false;      // user chose to discard on exit
+    std::string m_LastTitle;
 
     struct TurntableJob {
         bool active = false;

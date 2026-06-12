@@ -134,6 +134,7 @@ public:
     {
         m_UndoStack.push_back(std::move(command));
         m_RedoStack.clear();
+        ++m_Revision;
     }
 
     bool Undo(Scene& scene)
@@ -143,6 +144,7 @@ public:
         m_UndoStack.back()->Undo(scene);
         m_RedoStack.push_back(std::move(m_UndoStack.back()));
         m_UndoStack.pop_back();
+        ++m_Revision;
         return true;
     }
 
@@ -153,12 +155,26 @@ public:
         m_RedoStack.back()->Redo(scene);
         m_UndoStack.push_back(std::move(m_RedoStack.back()));
         m_RedoStack.pop_back();
+        ++m_Revision;
         return true;
     }
+
+    void Clear()
+    {
+        m_UndoStack.clear();
+        m_RedoStack.clear();
+        ++m_Revision;
+    }
+
+    // Monotonic edit counter: comparing against the value at last save gives
+    // dirty tracking without hooking every call site. (Undoing back to the
+    // saved state still reads as dirty — a harmless false positive.)
+    uint64_t Revision() const { return m_Revision; }
 
 private:
     std::vector<std::unique_ptr<Command>> m_UndoStack;
     std::vector<std::unique_ptr<Command>> m_RedoStack;
+    uint64_t m_Revision = 0;
 };
 
 } // namespace forge

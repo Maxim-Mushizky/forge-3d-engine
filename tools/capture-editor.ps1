@@ -28,7 +28,8 @@ public class FECap {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   public static IntPtr Find(uint pid, string title) {
     IntPtr found = IntPtr.Zero;
-    EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == pid && IsWindowVisible(h)) { var sb = new StringBuilder(256); GetWindowText(h, sb, 256); if (sb.ToString() == title) { found = h; return false; } } return true; }, IntPtr.Zero);
+    // Substring match: the title carries the scene name ("duck.forge* - Forge Editor").
+    EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == pid && IsWindowVisible(h)) { var sb = new StringBuilder(256); GetWindowText(h, sb, 256); if (sb.ToString().Contains(title)) { found = h; return false; } } return true; }, IntPtr.Zero);
     return found;
   }
 }

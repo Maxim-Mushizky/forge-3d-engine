@@ -56,8 +56,10 @@ Window::~Window()
 }
 
 bool Window::ShouldClose() const { return glfwWindowShouldClose(m_Handle); }
+void Window::SetShouldClose(bool value) { glfwSetWindowShouldClose(m_Handle, value ? GLFW_TRUE : GLFW_FALSE); }
 void Window::PollEvents() { glfwPollEvents(); }
 void Window::SwapBuffers() { glfwSwapBuffers(m_Handle); }
 void Window::SetVSync(bool enabled) { glfwSwapInterval(enabled ? 1 : 0); }
+void Window::SetTitle(const std::string& title) { glfwSetWindowTitle(m_Handle, title.c_str()); }
 
 } // namespace forge
