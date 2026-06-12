@@ -81,17 +81,20 @@ vec3 clampFirefly(vec3 c, float maxC)
 // ---------------------------------------------------------------------------
 // Intersection
 // ---------------------------------------------------------------------------
+// Traversal records only (t, barycentrics, triangle index); shading attributes
+// are resolved once afterwards so rejected candidates never touch normal data.
 struct Hit {
     float t;
-    vec3 n;  // interpolated shading normal
-    vec3 gn; // geometric (face) normal — robust for offsets/sidedness
+    float u, v; // barycentrics at the accepted hit
+    int tri;    // -1 = miss
+    vec3 n;     // interpolated shading normal (filled by resolveHit)
+    vec3 gn;    // geometric (face) normal — robust for offsets/sidedness
     int mat;
 };
 
 bool triIntersect(int i, vec3 ro, vec3 rd, inout Hit h)
 {
-    vec4 a = b_Tris[i * 6 + 0];
-    vec3 v0 = a.xyz;
+    vec3 v0 = b_Tris[i * 6 + 0].xyz;
     vec3 e1 = b_Tris[i * 6 + 1].xyz - v0;
     vec3 e2 = b_Tris[i * 6 + 2].xyz - v0;
     vec3 p = cross(rd, e2);
@@ -111,51 +114,102 @@ bool triIntersect(int i, vec3 ro, vec3 rd, inout Hit h)
     if (t <= 1e-4 || t >= h.t)
         return false;
     h.t = t;
-    vec3 n0 = b_Tris[i * 6 + 3].xyz;
-    vec3 n1 = b_Tris[i * 6 + 4].xyz;
-    vec3 n2 = b_Tris[i * 6 + 5].xyz;
-    h.n = normalize(n0 * (1.0 - u - v) + n1 * u + n2 * v);
-    h.gn = normalize(cross(e1, e2));
-    h.mat = floatBitsToInt(a.w);
+    h.u = u;
+    h.v = v;
+    h.tri = i;
     return true;
 }
 
-bool boxHit(vec3 bmin, vec3 bmax, vec3 ro, vec3 invD, float tMax)
+void resolveHit(inout Hit h)
+{
+    int i = h.tri;
+    vec4 a = b_Tris[i * 6 + 0];
+    vec3 v0 = a.xyz;
+    vec3 e1 = b_Tris[i * 6 + 1].xyz - v0;
+    vec3 e2 = b_Tris[i * 6 + 2].xyz - v0;
+    vec3 n0 = b_Tris[i * 6 + 3].xyz;
+    vec3 n1 = b_Tris[i * 6 + 4].xyz;
+    vec3 n2 = b_Tris[i * 6 + 5].xyz;
+    h.n = normalize(n0 * (1.0 - h.u - h.v) + n1 * h.u + n2 * h.v);
+    h.gn = normalize(cross(e1, e2));
+    h.mat = floatBitsToInt(a.w);
+}
+
+// Axis-parallel rays make 1/rd infinite; if ro then sits exactly on a slab
+// plane, 0 * inf = NaN and min/max ordering is undefined. Nudge zero components.
+vec3 safeInvDir(vec3 rd)
+{
+    return 1.0 / mix(rd, vec3(1e-9), lessThan(abs(rd), vec3(1e-9)));
+}
+
+// Slab test returning the entry distance (1e30 on miss) so callers can order
+// children near-first and prune nodes beyond the current closest hit.
+float boxDist(vec3 bmin, vec3 bmax, vec3 ro, vec3 invD, float tMax)
 {
     vec3 t0 = (bmin - ro) * invD;
     vec3 t1 = (bmax - ro) * invD;
     vec3 tn = min(t0, t1), tf = max(t0, t1);
     float tEnter = max(max(tn.x, tn.y), tn.z);
     float tExit = min(min(tf.x, tf.y), tf.z);
-    return tExit >= 0.0 && tEnter <= tExit && tEnter <= tMax;
+    return (tExit >= 0.0 && tEnter <= tExit && tEnter <= tMax) ? max(tEnter, 0.0) : 1e30;
 }
 
+// Ordered closest-hit traversal: descend the nearer child first, stash the far
+// one with its entry distance, and skip stashed nodes that fall beyond the
+// shrinking h.t — far subtrees get pruned instead of visited.
 bool traverse(vec3 ro, vec3 rd, inout Hit h)
 {
+    h.tri = -1;
     if (u_NumNodes == 0)
         return false;
-    vec3 invD = 1.0 / rd;
+    vec3 invD = safeInvDir(rd);
+    vec4 ra = b_Nodes[0], rb = b_Nodes[1];
+    if (boxDist(ra.xyz, rb.xyz, ro, invD, h.t) >= 1e30)
+        return false;
     int stack[32];
+    float dstack[32];
     int sp = 0;
-    stack[sp++] = 0;
-    bool anyHit = false;
-    while (sp > 0) {
-        int ni = stack[--sp];
+    int ni = 0;
+    while (true) {
         vec4 a = b_Nodes[ni * 2 + 0];
         vec4 b = b_Nodes[ni * 2 + 1];
-        if (!boxHit(a.xyz, b.xyz, ro, invD, h.t))
-            continue;
         int leftFirst = floatBitsToInt(a.w);
         int count = floatBitsToInt(b.w);
         if (count > 0) {
             for (int i = 0; i < count; ++i)
-                anyHit = triIntersect(leftFirst + i, ro, rd, h) || anyHit;
-        } else if (sp + 2 <= 32) {
-            stack[sp++] = leftFirst;
-            stack[sp++] = leftFirst + 1;
+                triIntersect(leftFirst + i, ro, rd, h);
+        } else {
+            int li = leftFirst, ri = leftFirst + 1;
+            float dl = boxDist(b_Nodes[li * 2].xyz, b_Nodes[li * 2 + 1].xyz, ro, invD, h.t);
+            float dr = boxDist(b_Nodes[ri * 2].xyz, b_Nodes[ri * 2 + 1].xyz, ro, invD, h.t);
+            if (dl > dr) {
+                int ti = li; li = ri; ri = ti;
+                float td = dl; dl = dr; dr = td;
+            }
+            if (dl < 1e30) {
+                if (dr < 1e30 && sp < 32) {
+                    stack[sp] = ri;
+                    dstack[sp] = dr;
+                    ++sp;
+                }
+                ni = li;
+                continue;
+            }
         }
+        // Pop the next stashed node still nearer than the current closest hit.
+        bool next = false;
+        while (sp > 0) {
+            --sp;
+            if (dstack[sp] <= h.t) {
+                ni = stack[sp];
+                next = true;
+                break;
+            }
+        }
+        if (!next)
+            break;
     }
-    return anyHit;
+    return h.tri >= 0;
 }
 
 // Occlusion-only triangle test: no normal fetch, no hit record — shadow rays
@@ -189,7 +243,7 @@ bool occludedRange(vec3 ro, vec3 rd, float tMax)
 {
     if (u_NumNodes == 0)
         return false;
-    vec3 invD = 1.0 / rd;
+    vec3 invD = safeInvDir(rd);
     int stack[32];
     int sp = 0;
     stack[sp++] = 0;
@@ -197,7 +251,7 @@ bool occludedRange(vec3 ro, vec3 rd, float tMax)
         int ni = stack[--sp];
         vec4 a = b_Nodes[ni * 2 + 0];
         vec4 b = b_Nodes[ni * 2 + 1];
-        if (!boxHit(a.xyz, b.xyz, ro, invD, tMax))
+        if (boxDist(a.xyz, b.xyz, ro, invD, tMax) >= 1e30)
             continue;
         int leftFirst = floatBitsToInt(a.w);
         int count = floatBitsToInt(b.w);
@@ -256,6 +310,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             radiance += bounce == 0 ? c : clampFirefly(c, 10.0);
             break;
         }
+        resolveHit(h);
 
         vec4 m0 = b_Mats[h.mat * 3 + 0];
         vec4 m1 = b_Mats[h.mat * 3 + 1];
