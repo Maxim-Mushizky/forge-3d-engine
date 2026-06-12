@@ -1,0 +1,73 @@
+#version 460 core
+
+// GGX-prefilter the source equirect for one roughness level (one mip).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0, rgba16f) uniform writeonly image2D u_Out;
+
+uniform sampler2D u_Src;
+uniform float u_Roughness;
+
+const float PI = 3.14159265359;
+
+vec3 uvToDir(vec2 uv)
+{
+    float phi = (uv.x - 0.5) * 2.0 * PI;
+    float theta = uv.y * PI;
+    float s = sin(theta);
+    return vec3(s * cos(phi), cos(theta), s * sin(phi));
+}
+
+vec2 dirToUV(vec3 d)
+{
+    return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
+}
+
+float radicalInverse(uint bits)
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+vec3 importanceSampleGGX(vec2 Xi, vec3 N, float roughness)
+{
+    float a = roughness * roughness;
+    float phi = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    vec3 up = abs(N.z) < 0.999 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    return normalize(T * H.x + B * H.y + N * H.z);
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_Out);
+    if (px.x >= size.x || px.y >= size.y)
+        return;
+
+    vec3 N = uvToDir((vec2(px) + 0.5) / vec2(size));
+    vec3 V = N; // standard split-sum assumption
+
+    const uint kSamples = 128u;
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (uint i = 0u; i < kSamples; ++i) {
+        vec2 Xi = vec2((float(i) + 0.5) / float(kSamples), radicalInverse(i));
+        vec3 H = importanceSampleGGX(Xi, N, max(u_Roughness, 0.03));
+        vec3 L = reflect(-V, H);
+        float NoL = dot(N, L);
+        if (NoL > 0.0) {
+            sum += textureLod(u_Src, dirToUV(L), u_Roughness * 4.0).rgb * NoL;
+            weight += NoL;
+        }
+    }
+    imageStore(u_Out, px, vec4(sum / max(weight, 1e-4), 1.0));
+}

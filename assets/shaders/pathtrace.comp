@@ -1,0 +1,309 @@
+#version 460 core
+
+// Progressive path tracer: u_SamplesPerPass samples per pixel per dispatch.
+// Materials: lambertian diffuse + rough-metal reflection (factor-only, no textures).
+// Lights: directional sun (NEE, soft cone), point lights (NEE), emissive surfaces,
+// equirect HDRI environment or procedural gradient sky.
+// Variance control: blurred env mip for non-specular rays, firefly clamp on
+// indirect pickups (both mildly biased — right tradeoff for a beginner tool).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba32f) uniform image2D u_Accum;
+layout(binding = 1, rgba8) uniform writeonly image2D u_Display;
+
+// 6 vec4 per triangle: v0(w=material), v1, v2, n0, n1, n2
+layout(std430, binding = 2) readonly buffer Triangles { vec4 b_Tris[]; };
+// 2 vec4 per node: min(w=leftFirst), max(w=count)
+layout(std430, binding = 3) readonly buffer Nodes { vec4 b_Nodes[]; };
+// 3 vec4 per material: albedo+metallic, roughness, emissive
+layout(std430, binding = 4) readonly buffer Materials { vec4 b_Mats[]; };
+
+uniform mat4 u_InvViewProj;
+uniform vec3 u_CamPos;
+uniform int u_SampleIndex;
+uniform int u_FrameIndex; // monotonic — independent of accumulation restarts
+uniform int u_SamplesPerPass;
+uniform int u_MaxBounces;
+uniform int u_NumNodes;
+uniform vec3 u_SunDir; // direction light travels
+uniform vec3 u_SunColor;
+uniform float u_SunIntensity;
+
+uniform int u_NumPointLights;
+uniform vec3 u_LightPos[8];
+uniform vec3 u_LightColor[8]; // premultiplied by intensity
+uniform float u_LightRange[8];
+
+uniform sampler2D u_EnvMap; // equirect HDRI (with mips)
+uniform int u_HasEnv;
+uniform float u_EnvIntensity;
+uniform float u_EnvRotation;
+
+const float PI = 3.14159265359;
+
+// ---------------------------------------------------------------------------
+// RNG (PCG)
+// ---------------------------------------------------------------------------
+uint pcg(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint w = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+float rand(inout uint seed) { return float(pcg(seed)) / 4294967296.0; }
+
+vec3 cosineSample(vec3 n, inout uint seed)
+{
+    float r1 = rand(seed), r2 = rand(seed);
+    float phi = 6.28318530718 * r1;
+    float r = sqrt(r2);
+    vec3 t = normalize(cross(abs(n.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0), n));
+    vec3 b = cross(n, t);
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - r2)));
+}
+
+// Indirect bright outliers would otherwise persist in the accumulation buffer
+// as near-permanent fireflies.
+vec3 clampFirefly(vec3 c, float maxC)
+{
+    float m = max(c.r, max(c.g, c.b));
+    return m > maxC ? c * (maxC / m) : c;
+}
+
+// ---------------------------------------------------------------------------
+// Intersection
+// ---------------------------------------------------------------------------
+struct Hit {
+    float t;
+    vec3 n;  // interpolated shading normal
+    vec3 gn; // geometric (face) normal — robust for offsets/sidedness
+    int mat;
+};
+
+bool triIntersect(int i, vec3 ro, vec3 rd, inout Hit h)
+{
+    vec4 a = b_Tris[i * 6 + 0];
+    vec3 v0 = a.xyz;
+    vec3 e1 = b_Tris[i * 6 + 1].xyz - v0;
+    vec3 e2 = b_Tris[i * 6 + 2].xyz - v0;
+    vec3 p = cross(rd, e2);
+    float det = dot(e1, p);
+    if (abs(det) < 1e-8)
+        return false;
+    float inv = 1.0 / det;
+    vec3 tv = ro - v0;
+    float u = dot(tv, p) * inv;
+    if (u < 0.0 || u > 1.0)
+        return false;
+    vec3 q = cross(tv, e1);
+    float v = dot(rd, q) * inv;
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+    float t = dot(e2, q) * inv;
+    if (t <= 1e-4 || t >= h.t)
+        return false;
+    h.t = t;
+    vec3 n0 = b_Tris[i * 6 + 3].xyz;
+    vec3 n1 = b_Tris[i * 6 + 4].xyz;
+    vec3 n2 = b_Tris[i * 6 + 5].xyz;
+    h.n = normalize(n0 * (1.0 - u - v) + n1 * u + n2 * v);
+    h.gn = normalize(cross(e1, e2));
+    h.mat = floatBitsToInt(a.w);
+    return true;
+}
+
+bool boxHit(vec3 bmin, vec3 bmax, vec3 ro, vec3 invD, float tMax)
+{
+    vec3 t0 = (bmin - ro) * invD;
+    vec3 t1 = (bmax - ro) * invD;
+    vec3 tn = min(t0, t1), tf = max(t0, t1);
+    float tEnter = max(max(tn.x, tn.y), tn.z);
+    float tExit = min(min(tf.x, tf.y), tf.z);
+    return tExit >= 0.0 && tEnter <= tExit && tEnter <= tMax;
+}
+
+bool traverse(vec3 ro, vec3 rd, inout Hit h)
+{
+    if (u_NumNodes == 0)
+        return false;
+    vec3 invD = 1.0 / rd;
+    int stack[32];
+    int sp = 0;
+    stack[sp++] = 0;
+    bool anyHit = false;
+    while (sp > 0) {
+        int ni = stack[--sp];
+        vec4 a = b_Nodes[ni * 2 + 0];
+        vec4 b = b_Nodes[ni * 2 + 1];
+        if (!boxHit(a.xyz, b.xyz, ro, invD, h.t))
+            continue;
+        int leftFirst = floatBitsToInt(a.w);
+        int count = floatBitsToInt(b.w);
+        if (count > 0) {
+            for (int i = 0; i < count; ++i)
+                anyHit = triIntersect(leftFirst + i, ro, rd, h) || anyHit;
+        } else if (sp + 2 <= 32) {
+            stack[sp++] = leftFirst;
+            stack[sp++] = leftFirst + 1;
+        }
+    }
+    return anyHit;
+}
+
+bool occluded(vec3 ro, vec3 rd)
+{
+    Hit h;
+    h.t = 1e30;
+    return traverse(ro, rd, h);
+}
+
+bool occludedRange(vec3 ro, vec3 rd, float tMax)
+{
+    Hit h;
+    h.t = tMax; // traversal rejects hits beyond h.t
+    return traverse(ro, rd, h);
+}
+
+// ---------------------------------------------------------------------------
+// Environment. envLod: camera/mirror rays sample sharp (0); diffuse bounces
+// sample a blurred mip — a cheap stand-in for importance sampling that removes
+// most HDRI grain at the cost of mild bias.
+// ---------------------------------------------------------------------------
+vec3 sky(vec3 d, bool includeSun, float envLod)
+{
+    if (u_HasEnv == 1) {
+        vec2 uv = vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5 + u_EnvRotation / (2.0 * PI),
+                       acos(clamp(d.y, -1.0, 1.0)) / PI);
+        return textureLod(u_EnvMap, uv, envLod).rgb * u_EnvIntensity;
+    }
+    float t = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 grad = mix(vec3(0.30, 0.32, 0.36), vec3(0.12, 0.20, 0.38), t);
+    if (includeSun) {
+        float s = dot(d, normalize(-u_SunDir));
+        grad += u_SunColor * u_SunIntensity * 50.0 * smoothstep(0.9995, 0.9999, s);
+    }
+    return grad;
+}
+
+// ---------------------------------------------------------------------------
+vec3 tracePath(vec3 ro, vec3 rd, inout uint seed)
+{
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    bool specularRay = true; // sun disc only visible to camera/mirror rays (NEE covers diffuse)
+    float envLod = 0.0;
+
+    for (int bounce = 0; bounce < u_MaxBounces; ++bounce) {
+        Hit h;
+        h.t = 1e30;
+        if (!traverse(ro, rd, h)) {
+            vec3 c = throughput * sky(rd, specularRay, envLod);
+            radiance += bounce == 0 ? c : clampFirefly(c, 10.0);
+            break;
+        }
+
+        vec4 m0 = b_Mats[h.mat * 3 + 0];
+        vec4 m1 = b_Mats[h.mat * 3 + 1];
+        vec3 emissive = b_Mats[h.mat * 3 + 2].rgb;
+        vec3 albedo = m0.rgb;
+        float metallic = m0.w;
+        float roughness = m1.x;
+
+        // Face the geometric normal toward the ray; align the shading normal to it.
+        // Offsetting along the interpolated normal breaks on stretched/sculpted
+        // low-poly geometry (shadow rays start inside the surface -> black patches).
+        vec3 gn = dot(rd, h.gn) < 0.0 ? h.gn : -h.gn;
+        vec3 n = dot(h.n, gn) < 0.0 ? -h.n : h.n;
+        vec3 pos = ro + rd * h.t + gn * 2e-3;
+
+        {
+            vec3 c = throughput * emissive; // glowing surfaces are area lights
+            radiance += bounce == 0 ? c : clampFirefly(c, 10.0);
+        }
+
+        if (rand(seed) < metallic) {
+            // Rough metal: perfect mirror perturbed by roughness^2.
+            vec3 fuzz = vec3(rand(seed), rand(seed), rand(seed)) * 2.0 - 1.0;
+            rd = normalize(reflect(rd, n) + roughness * roughness * fuzz);
+            if (dot(rd, n) <= 0.0)
+                break;
+            ro = pos;
+            throughput *= albedo;
+            // Fuzzy lobes shouldn't see the near-delta procedural sun disc (spikes),
+            // and blurred env lookups suit them.
+            specularRay = roughness < 0.25;
+            envLod = roughness < 0.25 ? envLod : 2.0;
+        } else {
+            // Diffuse: next-event estimation toward the sun (soft cone) and point lights.
+            vec3 sunL = normalize(-u_SunDir +
+                                  (vec3(rand(seed), rand(seed), rand(seed)) - 0.5) * 0.06);
+            float ndl = max(dot(n, sunL), 0.0);
+            if (ndl > 0.0 && !occluded(pos, sunL))
+                radiance += throughput * (albedo / PI) * ndl * u_SunColor * u_SunIntensity;
+
+            for (int i = 0; i < u_NumPointLights; ++i) {
+                vec3 toLight = u_LightPos[i] - pos;
+                float dist = length(toLight);
+                vec3 L = toLight / dist;
+                float ndlp = max(dot(n, L), 0.0);
+                float window = clamp(1.0 - pow(dist / max(u_LightRange[i], 0.01), 4.0), 0.0, 1.0);
+                float atten = window * window / (dist * dist + 0.01);
+                if (ndlp > 0.0 && atten > 0.0 && !occludedRange(pos, L, dist - 0.01))
+                    radiance += throughput * (albedo / PI) * ndlp * u_LightColor[i] * atten;
+            }
+
+            rd = cosineSample(n, seed);
+            ro = pos;
+            throughput *= albedo;
+            specularRay = false;
+            envLod = 3.0; // blurred env for indirect diffuse
+        }
+
+        // Russian roulette after a few bounces.
+        if (bounce > 2) {
+            float pContinue = max(throughput.r, max(throughput.g, throughput.b));
+            if (rand(seed) > pContinue)
+                break;
+            throughput /= max(pContinue, 1e-4);
+        }
+    }
+    return radiance;
+}
+
+// ---------------------------------------------------------------------------
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_Accum);
+    if (px.x >= size.x || px.y >= size.y)
+        return;
+
+    vec3 sum = vec3(0.0);
+    for (int s = 0; s < u_SamplesPerPass; ++s) {
+        // Seed from the monotonic frame index so noise changes per frame while
+        // the camera moves instead of freezing into a static pattern.
+        uint seed = (uint(px.x) * 1973u + uint(px.y) * 9277u + uint(u_FrameIndex) * 26699u +
+                     uint(s) * 9781u) | 1u;
+        pcg(seed); // warm-up: decorrelate the first draw
+
+        // Jittered primary ray (fresh AA jitter per sub-sample).
+        vec2 uv = (vec2(px) + vec2(rand(seed), rand(seed))) / vec2(size);
+        vec4 pNear = u_InvViewProj * vec4(uv * 2.0 - 1.0, -1.0, 1.0);
+        vec4 pFar = u_InvViewProj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+        vec3 ro = pNear.xyz / pNear.w;
+        vec3 rd = normalize(pFar.xyz / pFar.w - ro);
+
+        sum += tracePath(ro, rd, seed);
+    }
+
+    vec4 prev = u_SampleIndex > 0 ? imageLoad(u_Accum, px) : vec4(0.0);
+    vec4 acc = prev + vec4(sum, float(u_SamplesPerPass));
+    imageStore(u_Accum, px, acc);
+
+    // Same ACES fit as the raster post stack so toggling modes doesn't shift brightness.
+    vec3 color = acc.rgb / float(u_SampleIndex + u_SamplesPerPass);
+    color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);
+    color = pow(color, vec3(1.0 / 2.2));
+    imageStore(u_Display, px, vec4(color, 1.0));
+}

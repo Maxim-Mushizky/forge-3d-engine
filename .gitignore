@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+*.env
+
+# Local AI/editor config
+.claude/
+CLAUDE.md
+
+# Build output
+build/
+
+# Logs
+*.log
+err.log
+out.log
+
+# ImGui / runtime-generated layout
+*.ini
+imgui.ini
+forge_ui.ini
