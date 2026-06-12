@@ -44,6 +44,8 @@ struct SavedEntity {
     float metallic = 0.0f, roughness = 0.5f;
     vec3 emissive{0.0f};
     float emissiveStrength = 0.0f;
+    float transmission = 0.0f; // 0 = solid, 1 = clear (water/glass)
+    float ior = 1.5f;
 
     bool lightEnabled = false;
     vec3 lightColor{1.0f};

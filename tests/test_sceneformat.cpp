@@ -45,6 +45,8 @@ SavedScene MakeReferenceScene()
     child.roughness = 0.1f;
     child.emissive = {1.0f, 0.5f, 0.0f};
     child.emissiveStrength = 3.5f;
+    child.transmission = 0.8f;
+    child.ior = 1.33f;
     s.entities.push_back(child);
 
     SavedEntity lamp;
@@ -105,6 +107,8 @@ void RunSceneFormatTests()
             CHECK(ApproxEq(child.metallic, 0.9f));
             CHECK(ApproxEq(child.roughness, 0.1f));
             CHECK(ApproxEq(child.emissiveStrength, 3.5f));
+            CHECK(ApproxEq(child.transmission, 0.8f));
+            CHECK(ApproxEq(child.ior, 1.33f));
             CHECK(!child.lightEnabled);
 
             const SavedEntity& lamp = back->entities[2];

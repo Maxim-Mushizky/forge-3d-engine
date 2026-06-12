@@ -19,7 +19,7 @@ layout(binding = 3, rgba16f) uniform writeonly image2D u_GuideNormalDepth; // xy
 layout(std430, binding = 2) readonly buffer Triangles { vec4 b_Tris[]; };
 // 2 vec4 per node: min(w=leftFirst), max(w=count)
 layout(std430, binding = 3) readonly buffer Nodes { vec4 b_Nodes[]; };
-// 3 vec4 per material: albedo+metallic, roughness, emissive
+// 3 vec4 per material: albedo+metallic, (roughness, transmission, ior, -), emissive
 layout(std430, binding = 4) readonly buffer Materials { vec4 b_Mats[]; };
 
 uniform mat4 u_InvViewProj;
@@ -318,6 +318,12 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         vec3 albedo = m0.rgb;
         float metallic = m0.w;
         float roughness = m1.x;
+        float transmission = m1.y;
+        float ior = max(m1.z, 1.0);
+
+        // Entering vs exiting must be read off the raw face normal — after the
+        // flip below that information is gone.
+        bool frontFace = dot(rd, h.gn) < 0.0;
 
         // Face the geometric normal toward the ray; align the shading normal to it.
         // Offsetting along the interpolated normal breaks on stretched/sculpted
@@ -337,6 +343,10 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             radiance += bounce == 0 ? c : clampFirefly(c, 10.0);
         }
 
+        // Lobe selection probability equals each lobe's energy share, so the
+        // probability and the lobe weight cancel — throughput is only ever
+        // multiplied by the lobe tint, never divided.
+        bool doDiffuse = false;
         if (rand(seed) < metallic) {
             // Rough metal: perfect mirror perturbed by roughness^2.
             vec3 fuzz = vec3(rand(seed), rand(seed), rand(seed)) * 2.0 - 1.0;
@@ -349,7 +359,46 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             // and blurred env lookups suit them.
             specularRay = roughness < 0.25;
             envLod = roughness < 0.25 ? envLod : 2.0;
+        } else if (transmission > 0.0) {
+            // Dielectric (water/glass): Schlick Fresnel picks an uncolored
+            // mirror reflection; otherwise refract with probability
+            // `transmission`, else fall through to diffuse. Exit-side Schlick
+            // (eta = ior) underestimates F near the TIR cone — accepted, same
+            // approximation as Ray Tracing in One Weekend; don't compensate by
+            // tinting lobes.
+            float eta = frontFace ? 1.0 / ior : ior;
+            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+            float f0 = (1.0 - eta) / (1.0 + eta);
+            f0 *= f0;
+            float F = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+            vec3 refr = refract(rd, n, eta);
+            if (dot(refr, refr) == 0.0)
+                F = 1.0; // total internal reflection: the whole lobe reflects
+            vec3 fuzz = (vec3(rand(seed), rand(seed), rand(seed)) * 2.0 - 1.0) * roughness * roughness;
+            if (rand(seed) < F) {
+                rd = normalize(reflect(rd, n) + fuzz);
+                if (dot(rd, n) <= 0.0)
+                    break;
+                ro = pos;
+                // Dielectric specular is uncolored — throughput unchanged.
+                specularRay = roughness < 0.25;
+                envLod = roughness < 0.25 ? envLod : 2.0;
+            } else if (rand(seed) < transmission) {
+                rd = normalize(refr + fuzz);
+                if (dot(rd, gn) >= 0.0)
+                    break; // fuzz pushed the refracted ray back outside
+                ro = pos - gn * 4e-3; // far side of the surface, or it re-hits itself
+                throughput *= albedo; // see-through tint (cheap stand-in for Beer-Lambert)
+                specularRay = roughness < 0.25;
+                envLod = roughness < 0.25 ? envLod : 2.0;
+            } else {
+                doDiffuse = true;
+            }
         } else {
+            doDiffuse = true;
+        }
+
+        if (doDiffuse) {
             // Diffuse: next-event estimation toward the sun (soft cone) and point lights.
             vec3 sunL = normalize(-u_SunDir +
                                   (vec3(rand(seed), rand(seed), rand(seed)) - 0.5) * 0.06);

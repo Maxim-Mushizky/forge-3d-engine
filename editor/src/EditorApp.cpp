@@ -216,6 +216,8 @@ uint64_t EditorApp::SceneHash() const
         mix(&e.material.roughness, sizeof(e.material.roughness));
         mix(&e.material.emissive, sizeof(e.material.emissive));
         mix(&e.material.emissiveStrength, sizeof(e.material.emissiveStrength));
+        mix(&e.material.transmission, sizeof(e.material.transmission));
+        mix(&e.material.ior, sizeof(e.material.ior));
         mix(&e.light, sizeof(e.light));
         const Mesh* mesh = e.mesh.get();
         mix(&mesh, sizeof(mesh));
@@ -1657,7 +1659,7 @@ void EditorApp::DrawSidebar()
                 m_RTScale = quality == 0 ? 0.5f : (quality == 1 ? 0.75f : 1.0f);
             ImGui::SetItemTooltip("Render resolution - lower converges much faster");
             ImGui::SliderInt("Bounces", &m_Bounces, 1, 8);
-            ImGui::SetItemTooltip("Light bounces. 3-4 is usually enough;\nmore adds noise faster than realism");
+            ImGui::SetItemTooltip("Light bounces. 3-4 is usually enough;\nglass and water want 6+ to see through.\nMore adds noise faster than realism");
             bool ground = m_PathTracer.GroundPlane();
             if (ImGui::Checkbox("Ground plane", &ground))
                 m_PathTracer.SetGroundPlane(ground);
@@ -1912,6 +1914,38 @@ void EditorApp::DrawInspector()
     ImGui::SliderFloat("Emission", &e->material.emissiveStrength, 0.0f, 20.0f);
     ImGui::SetItemTooltip("Makes the object glow and light the scene");
     track();
+    ImGui::SliderFloat("Transmission", &e->material.transmission, 0.0f, 1.0f);
+    ImGui::SetItemTooltip("0 = solid, 1 = clear like glass or water");
+    track();
+    if (e->material.transmission > 0.0f) {
+        ImGui::SliderFloat("IOR", &e->material.ior, 1.0f, 2.5f);
+        ImGui::SetItemTooltip("How much light bends: water 1.33, glass 1.5, diamond 2.4");
+        track();
+    }
+
+    // Preset buttons write fields programmatically, so they push their own undo
+    // entry instead of relying on track()'s widget edit-state.
+    auto preset = [&](const char* label, vec3 albedo, float metallic, float roughness, float transmission,
+                      float ior) {
+        if (ImGui::SmallButton(label)) {
+            Entity before = *e;
+            e->material.albedo = albedo;
+            e->material.metallic = metallic;
+            e->material.roughness = roughness;
+            e->material.transmission = transmission;
+            e->material.ior = ior;
+            m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+        }
+    };
+    ImGui::TextDisabled("Presets:");
+    ImGui::SameLine();
+    preset("Mirror", {0.95f, 0.95f, 0.95f}, 1.0f, 0.03f, 0.0f, 1.5f);
+    ImGui::SameLine();
+    preset("Water", {0.80f, 0.92f, 0.98f}, 0.0f, 0.02f, 1.0f, 1.33f);
+    ImGui::SameLine();
+    preset("Glass", {1.0f, 1.0f, 1.0f}, 0.0f, 0.0f, 1.0f, 1.5f);
+    ImGui::SameLine();
+    preset("Frosted", {1.0f, 1.0f, 1.0f}, 0.0f, 0.4f, 1.0f, 1.5f);
 
     if (e->light.enabled) {
         sepText("Point Light");

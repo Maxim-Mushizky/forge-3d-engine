@@ -5,6 +5,8 @@
 
 #include <GL/glew.h>
 
+#include <algorithm>
+
 namespace forge {
 
 static std::string AssetPath(const char* relative)
@@ -185,6 +187,7 @@ void Renderer::DrawItemMain(const DrawItem& item)
     if (m_Mode == ShadingMode::PBR) {
         shader->SetFloat("u_Metallic", material.metallic);
         shader->SetFloat("u_Roughness", material.roughness);
+        shader->SetFloat("u_Transmission", material.transmission);
         shader->SetInt("u_MRMap", 1);
         shader->SetInt("u_HasMRMap", hasMRMap ? 1 : 0);
         shader->SetInt("u_EnvIrradiance", 6);
@@ -208,10 +211,33 @@ void Renderer::EndScene(const Framebuffer& target)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     for (const DrawItem& item : m_Queue)
-        DrawItemMain(item);
+        if (item.material.transmission <= 0.0f)
+            DrawItemMain(item);
 
     if (m_Environment && m_Environment->Valid())
         SkyPass(); // after opaques: fills only background pixels (depth = 1)
+
+    // Transmissive pass: after the sky so the background shows through, blended
+    // back-to-front, depth test on but writes off (glass shouldn't occlude).
+    std::vector<const DrawItem*> transmissive;
+    for (const DrawItem& item : m_Queue)
+        if (item.material.transmission > 0.0f)
+            transmissive.push_back(&item);
+    if (!transmissive.empty()) {
+        std::sort(transmissive.begin(), transmissive.end(), [&](const DrawItem* a, const DrawItem* b) {
+            vec3 va = vec3(a->transform[3]) - m_CameraPosition;
+            vec3 vb = vec3(b->transform[3]) - m_CameraPosition;
+            float da = glm::dot(va, va), db = glm::dot(vb, vb);
+            return da > db; // far first
+        });
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        for (const DrawItem* item : transmissive)
+            DrawItemMain(*item);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
 
     if (!m_Outlines.empty()) {
         m_Flat->Bind();
