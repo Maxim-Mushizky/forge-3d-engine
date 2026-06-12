@@ -50,8 +50,10 @@ public:
     void BeginScene(const mat4& viewProjection, const vec3& cameraPosition, const DirectionalLight& light);
     void Submit(const Mesh& mesh, const mat4& transform, const Material& material, bool castShadow = true);
     void SubmitLight(const vec3& position, const vec3& color, float intensity, float range);
-    void SetOutline(const Mesh& mesh, const mat4& transform); // selection wireframe
-    void EndScene(const Framebuffer& target);                 // leaves `target` bound
+    // Selection wireframe; call once per highlighted entity (multi-select
+    // outlines everything, the primary selection gets a brighter color).
+    void AddOutline(const Mesh& mesh, const mat4& transform, const vec3& color);
+    void EndScene(const Framebuffer& target); // leaves `target` bound
 
 private:
     struct DrawItem {
@@ -87,9 +89,15 @@ private:
     DirectionalLight m_Light;
     const Environment* m_Environment = nullptr;
 
+    struct OutlineItem {
+        const Mesh* mesh;
+        mat4 transform;
+        vec3 color;
+    };
+
     std::vector<DrawItem> m_Queue;
     std::vector<PointLightDraw> m_PointLights;
-    std::optional<std::pair<const Mesh*, mat4>> m_Outline;
+    std::vector<OutlineItem> m_Outlines;
 };
 
 } // namespace forge

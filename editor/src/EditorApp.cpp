@@ -177,8 +177,16 @@ void EditorApp::RenderScene()
         // Light gizmo meshes don't cast shadows (a light casting its own shadow looks broken).
         m_Renderer.Submit(*e.mesh, world, e.material, !e.light.enabled);
     }
-    if (Entity* sel = m_Scene.Find(m_Selected); sel && sel->mesh && !m_Sculpt.Active())
-        m_Renderer.SetOutline(*sel->mesh, m_Scene.WorldTransform(sel->id));
+    // Every selected entity gets an outline (primary brighter); selecting a
+    // group highlights its whole subtree, since the group node has no mesh.
+    if (!m_Sculpt.Active()) {
+        for (UUID id : m_Selection) {
+            vec3 color = id == m_Selected ? vec3(1.0f, 0.6f, 0.1f) : vec3(0.95f, 0.78f, 0.4f);
+            for (UUID node : SubtreeOf(id))
+                if (Entity* e = m_Scene.Find(node); e && e->mesh)
+                    m_Renderer.AddOutline(*e->mesh, m_Scene.WorldTransform(node), color);
+        }
+    }
     m_Renderer.EndScene(m_Framebuffer); // shadow pass + main pass
     m_Framebuffer.Unbind();
 
@@ -390,6 +398,37 @@ void EditorApp::ToggleSelection(UUID id)
         m_Selection.push_back(id);
         m_Selected = id;
     }
+}
+
+void EditorApp::ApplyBoxSelect(const RectUV& rect, bool additive)
+{
+    std::vector<UUID> picked;
+    mat4 vp = m_Camera.ViewProjection();
+    for (const Entity& e : m_Scene.Entities()) {
+        if (!e.mesh)
+            continue; // group nodes get picked through their children's root
+        mat4 world = m_Scene.WorldTransform(e.id);
+        const AABB& lb = e.mesh->Bounds();
+        AABB wb;
+        for (int c = 0; c < 8; ++c) {
+            vec3 corner{(c & 1) ? lb.max.x : lb.min.x, (c & 2) ? lb.max.y : lb.min.y,
+                        (c & 4) ? lb.max.z : lb.min.z};
+            wb.Expand(vec3(world * vec4(corner, 1.0f)));
+        }
+        auto screenRect = ProjectAABBToScreen(vp, wb);
+        if (!screenRect || !RectsOverlap(*screenRect, rect))
+            continue;
+        UUID pick = m_Scene.RootAncestor(e.id);
+        if (std::find(picked.begin(), picked.end(), pick) == picked.end())
+            picked.push_back(pick);
+    }
+
+    if (!additive)
+        m_Selection.clear();
+    for (UUID id : picked)
+        if (std::find(m_Selection.begin(), m_Selection.end(), id) == m_Selection.end())
+            m_Selection.push_back(id);
+    m_Selected = m_Selection.empty() ? 0 : m_Selection.back();
 }
 
 bool EditorApp::IsSelected(UUID id) const
@@ -1941,6 +1980,47 @@ void EditorApp::DrawViewport()
                         SelectOnly(pick);
                 }
             }
+
+            // --- Marquee box select (drag that started on empty space) -----------
+            if (!m_BoxSelecting && ImGui::IsItemHovered() &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.KeyAlt &&
+                !ImGuizmo::IsUsing() && !ImGuizmo::IsOver()) {
+                ImVec2 mouse = ImGui::GetMousePos();
+                vec2 uv{(mouse.x - m_ViewportPos.x) / m_ViewportSize.x,
+                        (mouse.y - m_ViewportPos.y) / m_ViewportSize.y};
+                if (!m_Scene.Raycast(ViewportRay(uv))) { // pressed on empty space
+                    m_BoxSelecting = true;
+                    m_BoxStartUV = uv;
+                }
+            }
+            if (m_BoxSelecting) {
+                // Same 5px threshold as click-to-select, so the two paths are
+                // mutually exclusive: a tiny drag stays a click (deselect).
+                bool dragged = io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] >= 25.0f;
+                if (io.KeyAlt) {
+                    m_BoxSelecting = false; // camera claimed the drag
+                } else if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    if (dragged) {
+                        ImVec2 a{m_ViewportPos.x + m_BoxStartUV.x * m_ViewportSize.x,
+                                 m_ViewportPos.y + m_BoxStartUV.y * m_ViewportSize.y};
+                        ImVec2 b = ImGui::GetMousePos();
+                        ImVec2 mn{std::min(a.x, b.x), std::min(a.y, b.y)};
+                        ImVec2 mx{std::max(a.x, b.x), std::max(a.y, b.y)};
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        dl->AddRectFilled(mn, mx, IM_COL32(86, 156, 214, 30));
+                        dl->AddRect(mn, mx, IM_COL32(86, 156, 214, 200), 0.0f, 0, 1.5f);
+                    }
+                } else { // released
+                    if (dragged) {
+                        ImVec2 mouse = ImGui::GetMousePos();
+                        vec2 endUV{(mouse.x - m_ViewportPos.x) / m_ViewportSize.x,
+                                   (mouse.y - m_ViewportPos.y) / m_ViewportSize.y};
+                        ApplyBoxSelect({glm::min(m_BoxStartUV, endUV), glm::max(m_BoxStartUV, endUV)},
+                                       io.KeyCtrl);
+                    }
+                    m_BoxSelecting = false;
+                }
+            }
         }
 
         // --- Gizmo mode toolbar (top-left overlay; hidden while sculpting) ---
@@ -1981,7 +2061,8 @@ void EditorApp::DrawViewport()
                                 ? "Drag to sculpt   Ctrl inverts   Shift smooths   Tab exits"
                             : m_Extrude.Busy()
                                 ? "Press a flat face and drag to extrude   Esc cancels"
-                                : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select");
+                                : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select   "
+                                  "Drag: box select   Ctrl+Click: add");
         ImGui::End();
     }
 

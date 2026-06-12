@@ -8,7 +8,9 @@ add_executable(forge_tests
     test_geometry.cpp
     test_uuid.cpp
     test_sceneformat.cpp
-    ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp)
+    test_boxselect.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/BoxSelect.cpp)
 
 target_include_directories(forge_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/src

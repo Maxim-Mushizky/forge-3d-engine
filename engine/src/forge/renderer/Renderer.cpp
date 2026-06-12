@@ -54,7 +54,7 @@ void Renderer::BeginScene(const mat4& viewProjection, const vec3& cameraPosition
     m_Light = light;
     m_Queue.clear();
     m_PointLights.clear();
-    m_Outline.reset();
+    m_Outlines.clear();
 }
 
 void Renderer::Submit(const Mesh& mesh, const mat4& transform, const Material& material, bool castShadow)
@@ -68,9 +68,9 @@ void Renderer::SubmitLight(const vec3& position, const vec3& color, float intens
         m_PointLights.push_back({position, color * intensity, range});
 }
 
-void Renderer::SetOutline(const Mesh& mesh, const mat4& transform)
+void Renderer::AddOutline(const Mesh& mesh, const mat4& transform, const vec3& color)
 {
-    m_Outline = {&mesh, transform};
+    m_Outlines.push_back({&mesh, transform, color});
 }
 
 AABB Renderer::SceneBounds() const
@@ -213,16 +213,18 @@ void Renderer::EndScene(const Framebuffer& target)
     if (m_Environment && m_Environment->Valid())
         SkyPass(); // after opaques: fills only background pixels (depth = 1)
 
-    if (m_Outline) {
+    if (!m_Outlines.empty()) {
         m_Flat->Bind();
         m_Flat->SetMat4("u_ViewProj", m_ViewProjection);
-        m_Flat->SetMat4("u_Model", m_Outline->second);
-        m_Flat->SetVec3("u_Color", vec3(1.0f, 0.6f, 0.1f));
         m_Flat->SetInt("u_HasAlbedoMap", 0);
         glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
         glEnable(GL_POLYGON_OFFSET_LINE);
         glPolygonOffset(-1.0f, -1.0f); // pull lines toward the camera so they win the depth test
-        m_Outline->first->Draw();
+        for (const OutlineItem& o : m_Outlines) {
+            m_Flat->SetMat4("u_Model", o.transform);
+            m_Flat->SetVec3("u_Color", o.color);
+            o.mesh->Draw();
+        }
         glDisable(GL_POLYGON_OFFSET_LINE);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     }

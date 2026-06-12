@@ -7,6 +7,7 @@
 
 #include <forge/geometry/MeshBoolean.h>
 #include <forge/platform/Window.h>
+#include <forge/scene/BoxSelect.h>
 #include <forge/raytrace/PathTracer.h>
 #include <forge/renderer/Framebuffer.h>
 #include <forge/renderer/PostProcess.h>
@@ -59,6 +60,9 @@ private:
     void SelectOnly(UUID id);
     void ToggleSelection(UUID id);
     bool IsSelected(UUID id) const;
+    // Marquee: select every entity whose projected bounds overlap rect (viewport
+    // UV). Parts of groups resolve to the root, matching click behavior.
+    void ApplyBoxSelect(const RectUV& rect, bool additive);
 
     // hierarchy ops
     std::vector<UUID> SubtreeOf(UUID root) const; // root first
@@ -180,6 +184,9 @@ private:
 
     std::shared_ptr<Mesh> m_CubeMesh, m_SphereMesh, m_PlaneMesh, m_CylinderMesh, m_ConeMesh, m_TorusMesh;
     std::shared_ptr<Mesh> m_SculptSphereMesh, m_TerrainMesh; // high-res, sculpt-ready
+
+    bool m_BoxSelecting = false; // LMB went down on empty space; drag = marquee
+    vec2 m_BoxStartUV{0.0f};
 
     bool m_ViewportHovered = false;
     vec2 m_ViewportPos{0.0f};  // screen-space top-left of the viewport image
