@@ -27,6 +27,8 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
         se.roughness = e.material.roughness;
         se.emissive = e.material.emissive;
         se.emissiveStrength = e.material.emissiveStrength;
+        se.transmission = e.material.transmission;
+        se.ior = e.material.ior;
         se.lightEnabled = e.light.enabled;
         se.lightColor = e.light.color;
         se.lightIntensity = e.light.intensity;
@@ -86,6 +88,8 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         e.material.roughness = se.roughness;
         e.material.emissive = se.emissive;
         e.material.emissiveStrength = se.emissiveStrength;
+        e.material.transmission = se.transmission;
+        e.material.ior = se.ior;
         e.light.enabled = se.lightEnabled;
         if (se.lightEnabled) {
             e.light.color = se.lightColor;

@@ -84,6 +84,8 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
         je["roughness"] = e.roughness;
         je["emissive"] = Vec3ToJson(e.emissive);
         je["emissiveStrength"] = e.emissiveStrength;
+        je["transmission"] = e.transmission;
+        je["ior"] = e.ior;
         if (e.lightEnabled) {
             je["light"] = {{"color", Vec3ToJson(e.lightColor)},
                            {"intensity", e.lightIntensity},
@@ -188,6 +190,8 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
             e.roughness = GetOr<float>(je, "roughness", 0.5f);
             e.emissive = JsonToVec3(je.value("emissive", json()), vec3(0.0f));
             e.emissiveStrength = GetOr<float>(je, "emissiveStrength", 0.0f);
+            e.transmission = GetOr<float>(je, "transmission", 0.0f); // pre-transmission files stay solid
+            e.ior = GetOr<float>(je, "ior", 1.5f);
             if (auto lt = je.find("light"); lt != je.end() && lt->is_object()) {
                 e.lightEnabled = true;
                 e.lightColor = JsonToVec3(lt->value("color", json()), vec3(1.0f));

@@ -21,6 +21,7 @@ uniform PointLight u_PointLights[8];
 uniform vec3 u_Albedo;
 uniform float u_Metallic;
 uniform float u_Roughness;
+uniform float u_Transmission; // 0 = solid; >0 fades diffuse and drives Fresnel alpha
 uniform vec3 u_Emissive; // premultiplied by strength
 uniform sampler2D u_AlbedoMap;
 uniform int u_HasAlbedoMap;
@@ -114,7 +115,7 @@ vec3 BRDF(vec3 N, vec3 V, vec3 L, vec3 albedo, float metallic, float roughness, 
     float G = GeometrySmith(N, V, L, roughness);
     vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
     vec3 specular = (NDF * G * F) / (4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001);
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic) * (1.0 - u_Transmission); // transmitted light isn't diffused
     return (kD * albedo / PI + specular) * radiance * NdotL;
 }
 
@@ -149,6 +150,8 @@ void main()
         Lo += BRDF(N, V, normalize(toLight), albedo, metallic, roughness, u_PointLights[i].color * atten);
     }
 
+    float fres = 0.04 + 0.96 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 5.0);
+
     // Ambient: image-based when an HDRI is loaded, constant otherwise.
     vec3 ambient;
     if (u_HasEnv == 1) {
@@ -158,11 +161,18 @@ void main()
         vec3 R = reflect(-V, N);
         vec3 prefiltered = textureLod(u_EnvPrefiltered, dirToEnvUV(R), roughness * 5.0).rgb;
         vec3 specular = prefiltered * EnvBRDFApprox(F0, roughness, max(dot(N, V), 0.0));
-        ambient = (kD * irradiance * albedo + specular) * u_EnvIntensity;
+        ambient = (kD * irradiance * albedo * (1.0 - u_Transmission) + specular) * u_EnvIntensity;
     } else {
-        ambient = 0.10 * albedo;
+        ambient = 0.10 * albedo * (1.0 - u_Transmission);
+        ambient += vec3(0.3) * fres * u_Transmission; // Fresnel rim: keeps glass readable without an HDRI
     }
 
+    // See-through preview: opacity rises toward grazing angles (Fresnel), so
+    // water/glass read correctly without raster refraction — the path tracer
+    // is ground truth. Opaque materials keep alpha 1 (their pass doesn't blend).
+    float alpha = 1.0 - u_Transmission * (1.0 - fres);
+    alpha = max(alpha, 0.12); // faint shell even without an HDRI, so glass stays visible/selectable
+
     // Linear HDR out — the post stack tonemaps and gamma-encodes.
-    FragColor = vec4(ambient + Lo + u_Emissive, 1.0);
+    FragColor = vec4(ambient + Lo + u_Emissive, alpha);
 }

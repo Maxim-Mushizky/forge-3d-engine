@@ -27,7 +27,7 @@ struct GPUNode {
 
 struct GPUMaterial {
     vec4 albedoMetallic; // rgb = albedo, w = metallic
-    vec4 roughness;      // x = roughness
+    vec4 roughness;      // x = roughness, y = transmission, z = ior
     vec4 emissive;       // rgb premultiplied by strength
 };
 
@@ -99,7 +99,7 @@ void PathTracer::Upload(const Scene& scene)
         int matIndex = (int)materials.size();
         GPUMaterial gm;
         gm.albedoMetallic = vec4(e.material.albedo, e.material.metallic);
-        gm.roughness = vec4(e.material.roughness, 0, 0, 0);
+        gm.roughness = vec4(e.material.roughness, e.material.transmission, e.material.ior, 0);
         gm.emissive = vec4(e.material.emissive * e.material.emissiveStrength, 0);
         materials.push_back(gm);
 
@@ -128,7 +128,7 @@ void PathTracer::Upload(const Scene& scene)
         int matIndex = (int)materials.size();
         GPUMaterial floorMat;
         floorMat.albedoMetallic = vec4(0.42f, 0.43f, 0.45f, 0.0f);
-        floorMat.roughness = vec4(1.0f, 0, 0, 0);
+        floorMat.roughness = vec4(1.0f, 0.0f, 1.5f, 0); // opaque; ior unread when transmission = 0
         floorMat.emissive = vec4(0.0f);
         materials.push_back(floorMat);
 

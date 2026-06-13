@@ -89,6 +89,9 @@ Strict downward dependencies — a layer may only include layers above it in thi
 - `Texture2D` — from file (stb) or empty (render targets, accumulation buffer).
 - `Framebuffer` — color (+entity-id attachment for pixel-perfect picking later) + depth; resizable. The viewport panel displays its color texture.
 - `Material` — shading model enum (`Flat | BlinnPhong | PBR`), albedo/metallic/roughness/emissive params + optional textures.
+  Dielectrics: `transmission` (0 = solid, 1 = clear) + `ior` give water/glass — Fresnel reflect/refract lobes in the path
+  tracer, Fresnel-alpha blended preview in raster (no raster refraction; the path tracer is ground truth). Mirrors are
+  metallic 1 / roughness 0. v1 limits: glass casts opaque shadows; point lights invisible in specular reflections.
 - `Renderer` — the only class that issues draw calls. API:
   ```
   Renderer::BeginScene(camera, lights);   // upload per-frame UBO
