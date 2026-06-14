@@ -10,6 +10,7 @@ void RunBoxSelectTests();
 void RunDropToGroundTests();
 void RunBvhTests();
 void RunSnapTests();
+void RunEditMeshTests();
 } // namespace forge::test
 
 int main()
@@ -23,6 +24,7 @@ int main()
     RunDropToGroundTests();
     RunBvhTests();
     RunSnapTests();
+    RunEditMeshTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

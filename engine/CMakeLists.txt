@@ -16,6 +16,7 @@ add_library(forge STATIC
     src/forge/scene/BoxSelect.cpp
     src/forge/scene/DropToGround.cpp
     src/forge/scene/TransformSnap.cpp
+    src/forge/geometry/EditMesh.cpp
     src/forge/geometry/MeshEdit.cpp
     src/forge/geometry/MeshBoolean.cpp
     src/forge/geometry/MeshRemesh.cpp
