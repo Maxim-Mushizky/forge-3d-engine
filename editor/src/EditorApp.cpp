@@ -139,7 +139,7 @@ void EditorApp::Run()
         // Raster while sculpting: mid-stroke mesh edits would otherwise trigger a
         // BVH rebuild every frame. Same for geometry edits in RT mode: raster
         // preview until the scene settles (m_RTUploadPending).
-        bool rtActive = (m_RayTracing && !m_Sculpt.Active()) || m_Turntable.active;
+        bool rtActive = (m_RayTracing && !m_Sculpt.Active() && !m_Edit.Active()) || m_Turntable.active;
         if (m_Turntable.active)
             UpdateTurntable(); // drives the path tracer directly, bypasses settle logic
         else if (rtActive)
@@ -180,7 +180,8 @@ void EditorApp::RenderScene()
     }
     // Every selected entity gets an outline (primary brighter); selecting a
     // group highlights its whole subtree, since the group node has no mesh.
-    if (!m_Sculpt.Active()) {
+    // Edit mode draws its own element overlay, so the object outline is hidden.
+    if (!m_Sculpt.Active() && !m_Edit.Active()) {
         for (UUID id : m_Selection) {
             vec3 color = id == m_Selected ? vec3(1.0f, 0.6f, 0.1f) : vec3(0.95f, 0.78f, 0.4f);
             for (UUID node : SubtreeOf(id))
@@ -401,6 +402,8 @@ void EditorApp::HandleShortcuts()
         ToggleSculptMode();
     if (m_Sculpt.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape))
         m_Sculpt.Exit();
+    if (m_Edit.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape))
+        m_Edit.Exit();
 }
 
 void EditorApp::SelectOnly(UUID id)
@@ -502,9 +505,24 @@ void EditorApp::ToggleSculptMode()
         m_Sculpt.Exit();
         return;
     }
+    m_Edit.Exit(); // sculpt and edit are mutually exclusive mesh modes
     Entity* e = m_Scene.Find(m_Selected);
     if (e && e->mesh)
         m_Sculpt.Enter(m_Scene, e->id);
+}
+
+void EditorApp::ToggleEditMode()
+{
+    if (m_Edit.Active()) {
+        m_Edit.Exit();
+        return;
+    }
+    if (m_Sculpt.Active()) // mutually exclusive mesh modes
+        m_Sculpt.Exit();
+    m_Extrude.Disarm();
+    Entity* e = m_Scene.Find(m_Selected);
+    if (e && e->mesh)
+        m_Edit.Enter(m_Scene, e->id);
 }
 
 void EditorApp::LoadHDRI()
@@ -1546,6 +1564,23 @@ void EditorApp::DrawSidebar()
             m_Sculpt.DrawSettingsUI();
     }
 
+    if (Section(m_HeaderFont, "Edit", false)) {
+        Entity* selEntity = m_Scene.Find(m_Selected);
+        bool canEdit = (selEntity && selEntity->mesh) || m_Edit.Active();
+        ImGui::BeginDisabled(!canEdit);
+        if (m_Edit.Active()) {
+            ui::PushAccentButton();
+            if (ImGui::Button("Exit Edit Mode (Esc)", ImVec2(-1, 32)))
+                ToggleEditMode();
+            ui::PopAccentButton();
+        } else {
+            if (ImGui::Button("Edit Mode", ImVec2(-1, 32)))
+                ToggleEditMode();
+            ImGui::SetItemTooltip("Edit the selected mesh by vertices, edges and faces");
+        }
+        ImGui::EndDisabled();
+    }
+
     if (Section(m_HeaderFont, "Modify", false)) {
         Entity* sel = m_Scene.Find(m_Selected);
         bool canModify = sel && sel->mesh && !sel->light.enabled;
@@ -2041,7 +2076,8 @@ void EditorApp::DrawViewport()
         m_Camera.SetViewportSize(avail.x, avail.y);
         // Sculpt mode and pending BVH rebuilds force raster rendering — show the
         // raster output too, not a stale path-traced frame.
-        bool showRT = (m_RayTracing || m_Turntable.active) && !m_Sculpt.Active() && !m_RTUploadPending;
+        bool showRT = (m_RayTracing || m_Turntable.active) && !m_Sculpt.Active() && !m_Edit.Active() &&
+                      !m_RTUploadPending;
         uint32_t texture = showRT ? m_PathTracer.DisplayTexture() : m_DisplayTex;
         if (texture == 0)
             texture = m_Framebuffer.ColorAttachment(); // first frame before post runs
@@ -2067,6 +2103,12 @@ void EditorApp::DrawViewport()
                 m_Commands.Push(std::move(cmd));
             ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
                                                 IM_COL32(86, 156, 214, 255), 0.0f, 0, 2.0f);
+        } else if (m_Edit.Active()) {
+            // Edit mode owns the viewport: gizmo + click/box select are suppressed
+            // (T1c adds element selection here). Green border distinguishes it.
+            m_Edit.DrawOverlay(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize);
+            ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
+                                                IM_COL32(120, 200, 140, 255), 0.0f, 0, 2.0f);
         } else {
             // --- Gizmo (manipulates the primary selection through its parent chain) ---
             Entity* sel = m_Scene.Find(m_Selected);
@@ -2182,8 +2224,8 @@ void EditorApp::DrawViewport()
             }
         }
 
-        // --- Gizmo mode toolbar (top-left overlay; hidden while sculpting) ---
-        if (!m_Sculpt.Active()) {
+        // --- Gizmo mode toolbar (top-left overlay; hidden while sculpting/editing) ---
+        if (!m_Sculpt.Active() && !m_Edit.Active()) {
             ImGui::SetNextWindowPos(ImVec2(imgMin.x + 10, imgMin.y + 10));
             ImGui::SetNextWindowBgAlpha(0.70f);
             ImGui::Begin("##vp_toolbar", nullptr,
@@ -2222,6 +2264,32 @@ void EditorApp::DrawViewport()
             ImGui::End();
         }
 
+        // --- Edit-mode element toolbar (replaces the gizmo toolbar) ----------
+        if (m_Edit.Active()) {
+            ImGui::SetNextWindowPos(ImVec2(imgMin.x + 10, imgMin.y + 10));
+            ImGui::SetNextWindowBgAlpha(0.70f);
+            ImGui::Begin("##vp_edit_toolbar", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoDocking);
+            auto elemBtn = [&](const char* label, EditTool::Element elem, const char* tip) {
+                bool active = m_Edit.Mode() == elem;
+                if (active)
+                    ui::PushAccentButton();
+                if (ImGui::Button(label))
+                    m_Edit.SetMode(elem);
+                if (active)
+                    ui::PopAccentButton();
+                ImGui::SetItemTooltip("%s", tip);
+            };
+            elemBtn("Vertex", EditTool::Element::Vertex, "Select and edit vertices");
+            ImGui::SameLine();
+            elemBtn("Edge", EditTool::Element::Edge, "Select and edit edges");
+            ImGui::SameLine();
+            elemBtn("Face", EditTool::Element::Face, "Select and edit faces");
+            ImGui::End();
+        }
+
         // --- Contextual status bar (bottom-left overlay, both modes) ---------
         ImGui::SetNextWindowPos(ImVec2(imgMin.x + 10, imgMin.y + avail.y - 34));
         ImGui::SetNextWindowBgAlpha(0.55f);
@@ -2232,6 +2300,8 @@ void EditorApp::DrawViewport()
                          ImGuiWindowFlags_NoInputs);
         ImGui::TextDisabled(m_Sculpt.Active()
                                 ? "Drag to sculpt   Ctrl inverts   Shift smooths   Tab exits"
+                            : m_Edit.Active()
+                                ? "Edit mode: pick Vertex / Edge / Face in the toolbar   Esc exits"
                             : m_Extrude.Busy()
                                 ? "Press a flat face and drag to extrude   Esc cancels"
                                 : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select   "
