@@ -126,6 +126,33 @@ void RunEditMeshTests()
             CHECK(IsCreaseEdge(e, glm::radians(30.0f))); // boundary always drawn
         }
     }
+
+    // --- DistancePointSegment2D: projection, clamping, degenerate -------------
+    {
+        CHECK(ApproxEq(DistancePointSegment2D({5.0f, 3.0f}, {0.0f, 0.0f}, {10.0f, 0.0f}), 3.0f)); // foot inside
+        CHECK(ApproxEq(DistancePointSegment2D({-4.0f, 0.0f}, {0.0f, 0.0f}, {10.0f, 0.0f}), 4.0f)); // past 'a'
+        CHECK(ApproxEq(DistancePointSegment2D({13.0f, 4.0f}, {0.0f, 0.0f}, {10.0f, 0.0f}), 5.0f)); // past 'b' (3-4-5)
+        CHECK(ApproxEq(DistancePointSegment2D({3.0f, 4.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}), 5.0f));    // degenerate
+    }
+
+    // --- PointInTriangle2D: inside / outside / on-edge, both windings ---------
+    {
+        vec2 a{0.0f, 0.0f}, b{4.0f, 0.0f}, c{0.0f, 4.0f};
+        CHECK(PointInTriangle2D({1.0f, 1.0f}, a, b, c));      // inside
+        CHECK(!PointInTriangle2D({3.0f, 3.0f}, a, b, c));     // outside (beyond hypotenuse)
+        CHECK(PointInTriangle2D({2.0f, 0.0f}, a, b, c));      // on an edge
+        CHECK(PointInTriangle2D({1.0f, 1.0f}, a, c, b));      // reversed winding, same result
+        CHECK(!PointInTriangle2D({-1.0f, 1.0f}, a, b, c));    // outside
+    }
+
+    // --- PointInRect2D --------------------------------------------------------
+    {
+        vec2 mn{1.0f, 2.0f}, mx{5.0f, 6.0f};
+        CHECK(PointInRect2D({3.0f, 4.0f}, mn, mx));
+        CHECK(PointInRect2D({1.0f, 2.0f}, mn, mx)); // corner inclusive
+        CHECK(!PointInRect2D({0.0f, 4.0f}, mn, mx));
+        CHECK(!PointInRect2D({3.0f, 7.0f}, mn, mx));
+    }
 }
 
 } // namespace forge::test
