@@ -13,9 +13,15 @@ namespace {
 // triangulation diagonals fall below it and stay hidden (see EditMesh).
 constexpr float kCreaseThreshold = 0.5236f; // 30 degrees in radians
 
-constexpr ImU32 kEdgeBase = IM_COL32(210, 214, 224, 150);
-constexpr ImU32 kAccent = IM_COL32(240, 148, 56, 255); // matches the edit-mode border
-constexpr ImU32 kVertBase = IM_COL32(150, 160, 175, 180);
+// High-contrast palette: meshes are often warm/orange, so verts use a
+// white fill with a dark ring (legible on any albedo or against the grid),
+// edges use cyan, and the emphasised element switches to a saturated colour.
+constexpr ImU32 kEdge = IM_COL32(50, 190, 255, 220);    // cyan wireframe
+constexpr ImU32 kEdgeHot = IM_COL32(130, 220, 255, 255); // emphasised in Edge mode
+constexpr ImU32 kVertFill = IM_COL32(245, 246, 250, 255);
+constexpr ImU32 kVertHot = IM_COL32(90, 150, 255, 255);  // emphasised in Vertex mode
+constexpr ImU32 kOutline = IM_COL32(15, 16, 22, 255);    // dark ring for contrast
+constexpr ImU32 kFaceHot = IM_COL32(255, 210, 40, 255);  // amber face dots
 } // namespace
 
 void EditTool::Enter(Scene& scene, UUID entity)
@@ -85,22 +91,28 @@ void EditTool::DrawOverlay(Scene& scene, const EditorCamera& camera, const vec2&
         ImVec2 a, b;
         if (project(m_EditMesh.vertices[edge.v0].position, a) &&
             project(m_EditMesh.vertices[edge.v1].position, b))
-            dl->AddLine(a, b, edgeMode ? kAccent : kEdgeBase, edgeMode ? 2.0f : 1.3f);
+            dl->AddLine(a, b, edgeMode ? kEdgeHot : kEdge, edgeMode ? 2.4f : 1.5f);
     }
 
     // Vertices: always shown so the cage is legible, emphasised in Vertex mode.
+    // White fill + dark ring stays visible on any mesh colour or the grid.
     for (const EditVertex& vert : m_EditMesh.vertices) {
         ImVec2 s;
-        if (project(vert.position, s))
-            dl->AddCircleFilled(s, vertMode ? 4.0f : 2.0f, vertMode ? kAccent : kVertBase);
+        if (!project(vert.position, s))
+            continue;
+        float r = vertMode ? 5.0f : 3.0f;
+        dl->AddCircleFilled(s, r, vertMode ? kVertHot : kVertFill);
+        dl->AddCircle(s, r, kOutline, 0, 1.5f);
     }
 
     // Face centroids: only marked in Face mode (where faces are the target).
     if (faceMode) {
         for (const EditFace& face : m_EditMesh.faces) {
             ImVec2 s;
-            if (project(face.centroid, s))
-                dl->AddCircleFilled(s, 3.5f, kAccent);
+            if (!project(face.centroid, s))
+                continue;
+            dl->AddCircleFilled(s, 4.0f, kFaceHot);
+            dl->AddCircle(s, 4.0f, kOutline, 0, 1.5f);
         }
     }
 }
