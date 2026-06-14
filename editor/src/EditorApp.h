@@ -2,6 +2,7 @@
 
 #include "CommandStack.h"
 #include "EditorCamera.h"
+#include "EditTool.h"
 #include "ExtrudeTool.h"
 #include "SculptTool.h"
 
@@ -79,6 +80,7 @@ public:
     void SetRayTracing(bool enabled) { m_RayTracing = enabled; }
     bool LoadHDRIFile(const std::string& path);
     void ToggleSculptMode();
+    void ToggleEditMode();
     void OpenSceneFile(const std::string& path); // CLI arg / recents / drag-drop
 private:
     // --- scene file lifecycle (#1) ---------------------------------------
@@ -123,6 +125,7 @@ private:
     ImFont* m_BodyFont = nullptr;
     ImFont* m_HeaderFont = nullptr;
     SculptTool m_Sculpt;
+    EditTool m_Edit;
     ExtrudeTool m_Extrude;
     GizmoOp m_GizmoOp = GizmoOp::Translate;
     bool m_GizmoWasUsing = false;
