@@ -7,6 +7,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cstring>
 
 namespace forge {
 
@@ -65,11 +66,16 @@ void EditTool::Enter(Scene& scene, UUID entity)
     Entity* e = scene.Find(entity);
     if (!e || !e->mesh)
         return;
-    // Read-only in T1b/T1c — no copy-on-write clone yet (that arrives with
-    // element transforms in T2). Just snapshot the topology for display.
+    // Copy-on-write: primitives are shared between entities AND undo snapshots
+    // hold the same shared_ptr — editing in place would corrupt siblings/history.
+    if (e->mesh.use_count() > 1)
+        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+
     m_EditMesh = BuildEditMesh(*e->mesh);
+    m_Topology = MeshTopology::Build(*e->mesh); // welded-normal recompute after edits
     m_Target = entity;
     m_MeshAtEnter = e->mesh.get();
+    m_MeshVersionSeen = e->mesh->Version();
     m_Active = true;
     m_Selected.clear();
     FORGE_INFO("Edit mode: %s (%zu verts, %zu edges, %zu faces)", e->name.c_str(),
@@ -84,7 +90,11 @@ void EditTool::Exit()
     m_Target = 0;
     m_MeshAtEnter = nullptr;
     m_EditMesh = {};
+    m_Topology = {};
     m_Selected.clear();
+    m_DragVerts.clear();
+    m_DragStartPos.clear();
+    m_MeshBefore.clear();
 }
 
 void EditTool::DrawOverlay(Scene& scene, const EditorCamera& camera, const vec2& viewportPos,
@@ -100,6 +110,12 @@ void EditTool::DrawOverlay(Scene& scene, const EditorCamera& camera, const vec2&
     if (e->mesh.get() != m_MeshAtEnter) {
         Exit(); // mesh swapped (topology op / undo) — the snapshot is stale
         return;
+    }
+    // An in-place edit we didn't make (undo/redo of a transform) bumps Version
+    // without swapping the pointer — resync the snapshot so the overlay tracks.
+    if (e->mesh->Version() != m_MeshVersionSeen) {
+        m_EditMesh = BuildEditMesh(*e->mesh);
+        m_MeshVersionSeen = e->mesh->Version();
     }
 
     mat4 mvp = camera.ViewProjection() * scene.WorldTransform(m_Target); // object -> clip
@@ -277,6 +293,67 @@ void EditTool::BoxPick(Scene& scene, const EditorCamera& camera, const vec2& vie
                 add(i);
         }
     }
+}
+
+vec3 EditTool::SelectionCentroidObject() const
+{
+    return SelectionCentroid(m_EditMesh, ResolveVertexSet(m_EditMesh, m_Mode, m_Selected));
+}
+
+void EditTool::BeginTransform(Scene& scene)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh)
+        return;
+    m_DragVerts = ResolveVertexSet(m_EditMesh, m_Mode, m_Selected);
+    m_DragStartPos.clear();
+    m_DragStartPos.reserve(m_DragVerts.size());
+    for (uint32_t v : m_DragVerts)
+        m_DragStartPos.push_back(m_EditMesh.vertices[v].position);
+    m_MeshBefore = e->mesh->Vertices(); // full snapshot for the sparse undo diff
+}
+
+void EditTool::ApplyTransform(Scene& scene, const mat4& objectXform)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh || m_DragVerts.empty())
+        return;
+    // Bake into the mesh (all welded raw verts), then refresh the overlay's
+    // representative positions so the dots/edges track the gizmo live.
+    ApplyVertexTransform(e->mesh->MutableVertices(), m_EditMesh, m_DragVerts, m_DragStartPos, objectXform);
+    for (size_t i = 0; i < m_DragVerts.size(); ++i)
+        m_EditMesh.vertices[m_DragVerts[i]].position = vec3(objectXform * vec4(m_DragStartPos[i], 1.0f));
+    RecomputeNormalsWelded(*e->mesh, m_Topology);
+    e->mesh->RecomputeBounds();
+    e->mesh->UploadVertices();
+    m_MeshVersionSeen = e->mesh->Version(); // our own edit — don't trigger a resync
+}
+
+std::unique_ptr<Command> EditTool::EndTransform(Scene& scene)
+{
+    Entity* e = scene.Find(m_Target);
+    m_DragVerts.clear();
+    m_DragStartPos.clear();
+    if (!e || !e->mesh || m_MeshBefore.empty()) {
+        m_MeshBefore.clear();
+        return nullptr;
+    }
+    // Sparse diff vs the drag-start snapshot — only changed verts hit the stack.
+    const auto& after = e->mesh->Vertices();
+    std::vector<uint32_t> indices;
+    std::vector<Vertex> before, now;
+    for (uint32_t i = 0; i < (uint32_t)after.size() && i < (uint32_t)m_MeshBefore.size(); ++i) {
+        if (std::memcmp(&after[i], &m_MeshBefore[i], sizeof(Vertex)) != 0) {
+            indices.push_back(i);
+            before.push_back(m_MeshBefore[i]);
+            now.push_back(after[i]);
+        }
+    }
+    m_MeshBefore.clear();
+    if (indices.empty())
+        return nullptr;
+    return std::make_unique<SculptStrokeCommand>(m_Target, std::move(indices), std::move(before),
+                                                 std::move(now));
 }
 
 } // namespace forge

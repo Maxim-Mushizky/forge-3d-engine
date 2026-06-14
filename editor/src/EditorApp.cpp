@@ -2109,9 +2109,51 @@ void EditorApp::DrawViewport()
             m_Edit.DrawOverlay(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize);
 
             ImGuiIO& io = ImGui::GetIO();
+
+            // Transform gizmo on the selection (T2): anchored at the selection
+            // centroid, it moves/rotates/scales the chosen verts/edges/faces.
+            bool gizmoActive = false;
+            if (m_Edit.HasSelection()) {
+                ImGuizmo::SetOrthographic(m_Camera.IsOrthographic());
+                ImGuizmo::SetDrawlist();
+                ImGuizmo::SetRect(m_ViewportPos.x, m_ViewportPos.y, m_ViewportSize.x, m_ViewportSize.y);
+                ImGuizmo::OPERATION op = m_GizmoOp == GizmoOp::Translate ? ImGuizmo::TRANSLATE
+                                       : m_GizmoOp == GizmoOp::Rotate    ? ImGuizmo::ROTATE
+                                                                         : ImGuizmo::SCALE;
+                mat4 world = m_Scene.WorldTransform(m_Edit.Target());
+                if (!m_EditGizmoUsing) // re-anchor to the live centroid until a drag starts
+                    m_EditGizmo = world * glm::translate(mat4(1.0f), m_Edit.SelectionCentroidObject());
+
+                bool snapActive = m_SnapEnabled != io.KeyCtrl;
+                float step = m_GizmoOp == GizmoOp::Translate ? m_SnapTranslate
+                           : m_GizmoOp == GizmoOp::Rotate    ? m_SnapRotateDeg
+                                                             : m_SnapScale;
+                float snap[3] = {step, step, step};
+                ImGuizmo::Manipulate(glm::value_ptr(m_Camera.View()), glm::value_ptr(m_Camera.Projection()),
+                                     op, ImGuizmo::LOCAL, glm::value_ptr(m_EditGizmo), nullptr,
+                                     snapActive ? snap : nullptr);
+
+                if (ImGuizmo::IsUsing()) {
+                    if (!m_EditGizmoUsing) {
+                        m_EditGizmoUsing = true;
+                        m_EditGizmoStart = world * glm::translate(mat4(1.0f), m_Edit.SelectionCentroidObject());
+                        m_Edit.BeginTransform(m_Scene);
+                    }
+                    // World delta from the drag, mapped into the mesh's object space.
+                    mat4 delta = m_EditGizmo * glm::inverse(m_EditGizmoStart);
+                    m_Edit.ApplyTransform(m_Scene, glm::inverse(world) * delta * world);
+                } else if (m_EditGizmoUsing) {
+                    m_EditGizmoUsing = false;
+                    if (auto cmd = m_Edit.EndTransform(m_Scene))
+                        m_Commands.Push(std::move(cmd));
+                }
+                gizmoActive = ImGuizmo::IsUsing() || ImGuizmo::IsOver();
+            }
+
             // Click-pick: release with negligible drag = click, not a camera orbit.
-            bool clicked = ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
-                           !io.KeyAlt && io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < 25.0f;
+            bool clicked = !gizmoActive && ImGui::IsItemHovered() &&
+                           ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !io.KeyAlt &&
+                           io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < 25.0f;
             if (clicked) {
                 ImVec2 m = ImGui::GetMousePos();
                 m_Edit.Pick(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize, vec2(m.x, m.y), io.KeyCtrl);
@@ -2119,7 +2161,7 @@ void EditorApp::DrawViewport()
 
             // Marquee box-select (reuses the object-mode marquee state, idle in
             // edit mode). The 5px drag threshold keeps click and box exclusive.
-            if (!m_BoxSelecting && ImGui::IsItemHovered() &&
+            if (!m_BoxSelecting && !gizmoActive && ImGui::IsItemHovered() &&
                 ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.KeyAlt) {
                 ImVec2 m = ImGui::GetMousePos();
                 m_BoxSelecting = true;
@@ -2346,8 +2388,8 @@ void EditorApp::DrawViewport()
         ImGui::TextDisabled(m_Sculpt.Active()
                                 ? "Drag to sculpt   Ctrl inverts   Shift smooths   Tab exits"
                             : m_Edit.Active()
-                                ? "Edit: Vertex/Edge/Face toolbar   Click select   Ctrl+Click add   "
-                                  "Drag box   Esc exits"
+                                ? "Edit: click select   Ctrl+Click add   drag box   "
+                                  "W/E/R + gizmo to move selection   Esc exits"
                             : m_Extrude.Busy()
                                 ? "Press a flat face and drag to extrude   Esc cancels"
                                 : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select   "

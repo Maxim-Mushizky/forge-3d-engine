@@ -136,6 +136,11 @@ private:
     float m_SnapTranslate = 0.25f; // world units per grid step
     float m_SnapRotateDeg = 15.0f; // degrees per angle step
     float m_SnapScale = 0.1f;      // scale-factor step
+    // Edit-mode element gizmo: the matrix ImGuizmo manipulates, the frame it
+    // started at (for the world delta), and whether a drag is in progress.
+    mat4 m_EditGizmo{1.0f};
+    mat4 m_EditGizmoStart{1.0f};
+    bool m_EditGizmoUsing = false;
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
     bool m_FirstDockLayout = false;
 

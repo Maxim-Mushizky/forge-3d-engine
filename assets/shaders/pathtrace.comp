@@ -601,8 +601,17 @@ void main()
         }
     }
 
+    // Stop-NaN: a single non-finite sample (e.g. a degenerate-triangle normal)
+    // would poison this pixel to black for the whole accumulation (#61). Drop it
+    // AND drop its sample count, or the zeroed contribution biases convergence dark.
+    int validSamples = u_SamplesPerPass;
+    if (!all(equal(sum, sum)) || any(isinf(sum))) {
+        sum = vec3(0.0);
+        validSamples = 0;
+    }
+
     vec4 prev = u_SampleIndex > 0 ? imageLoad(u_Accum, px) : vec4(0.0);
-    vec4 acc = prev + vec4(sum, float(u_SamplesPerPass));
+    vec4 acc = prev + vec4(sum, float(validSamples));
     imageStore(u_Accum, px, acc);
 
     imageStore(u_GuideAlbedo, px, vec4(guideAlbedo, 1.0));
