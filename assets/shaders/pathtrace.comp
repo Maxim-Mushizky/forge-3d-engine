@@ -601,6 +601,11 @@ void main()
         }
     }
 
+    // Stop-NaN: a single non-finite sample (e.g. a degenerate-triangle normal)
+    // would poison this pixel to black for the whole accumulation (#61). Drop it.
+    if (!all(equal(sum, sum)) || any(isinf(sum)))
+        sum = vec3(0.0);
+
     vec4 prev = u_SampleIndex > 0 ? imageLoad(u_Accum, px) : vec4(0.0);
     vec4 acc = prev + vec4(sum, float(u_SamplesPerPass));
     imageStore(u_Accum, px, acc);

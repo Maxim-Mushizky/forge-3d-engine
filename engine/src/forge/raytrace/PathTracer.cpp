@@ -113,9 +113,24 @@ void PathTracer::Upload(const Scene& scene)
             t.v0 = vec3(world * vec4(verts[idx[i]].position, 1.0f));
             t.v1 = vec3(world * vec4(verts[idx[i + 1]].position, 1.0f));
             t.v2 = vec3(world * vec4(verts[idx[i + 2]].position, 1.0f));
-            t.n0 = glm::normalize(normalMat * verts[idx[i]].normal);
-            t.n1 = glm::normalize(normalMat * verts[idx[i + 1]].normal);
-            t.n2 = glm::normalize(normalMat * verts[idx[i + 2]].normal);
+            // Skip degenerate (zero-area) triangles — a mesh edit can collapse one,
+            // and the shader's normalize(cross(e1,e2)) would yield NaN and render
+            // black (#61). A zero-area tri carries no surface, so drop it.
+            vec3 faceN = glm::cross(t.v1 - t.v0, t.v2 - t.v0);
+            float faceLen = glm::length(faceN);
+            if (faceLen < 1e-12f)
+                continue;
+            faceN /= faceLen; // geometric normal, used as a fallback below
+            // A welded vertex whose adjacent faces cancelled has a ~zero normal;
+            // normalize would give NaN, so fall back to the geometric normal.
+            auto safeNormal = [&](const vec3& n) {
+                vec3 m = normalMat * n;
+                float l = glm::length(m);
+                return l > 1e-8f ? m / l : faceN;
+            };
+            t.n0 = safeNormal(verts[idx[i]].normal);
+            t.n1 = safeNormal(verts[idx[i + 1]].normal);
+            t.n2 = safeNormal(verts[idx[i + 2]].normal);
             t.material = matIndex;
             t.centroid = (t.v0 + t.v1 + t.v2) / 3.0f;
             tris.push_back(t);
