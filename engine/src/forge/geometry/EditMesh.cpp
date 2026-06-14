@@ -1,5 +1,7 @@
 #include "EditMesh.h"
 
+#include "forge/core/Log.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -39,6 +41,11 @@ EditMesh BuildEditMesh(const std::vector<Vertex>& vertices, const std::vector<ui
 {
     EditMesh em;
 
+    // Triangle index data is an invariant of every mesh the engine builds; a
+    // ragged or out-of-range index buffer is a bug at the call site, not a
+    // runtime condition — assert per the no-exceptions house rule.
+    FORGE_ASSERT(indices.size() % 3 == 0, "EditMesh needs triangle indices, got %zu", indices.size());
+
     // 1. Weld co-located raw verts into groups (the EditMesh vertices).
     std::unordered_map<Cell, uint32_t, CellHash> cellToVert;
     std::vector<uint32_t> rawToVert(vertices.size(), 0);
@@ -49,12 +56,21 @@ EditMesh BuildEditMesh(const std::vector<Vertex>& vertices, const std::vector<ui
         if (it == cellToVert.end()) {
             v = (uint32_t)em.vertices.size();
             cellToVert.emplace(key, v);
-            em.vertices.push_back(EditVertex{vertices[i].position, {}, {}, {}});
+            em.vertices.push_back(EditVertex{vec3(0.0f), {}, {}, {}});
         } else {
             v = it->second;
         }
         rawToVert[i] = v;
         em.vertices[v].rawVerts.push_back(i);
+    }
+    // Representative position = centroid of the welded raw verts. They quantize
+    // to the same 1e-4 cell so this only averages out sub-epsilon float noise,
+    // but it keeps the group's position independent of raw-vertex ordering.
+    for (EditVertex& vert : em.vertices) {
+        vec3 acc(0.0f);
+        for (uint32_t raw : vert.rawVerts)
+            acc += vertices[raw].position;
+        vert.position = acc / (float)vert.rawVerts.size();
     }
 
     // 2. Faces (triangles) with object-space normal + centroid.
@@ -62,6 +78,8 @@ EditMesh BuildEditMesh(const std::vector<Vertex>& vertices, const std::vector<ui
     em.faces.reserve(triCount);
     for (uint32_t t = 0; t < triCount; ++t) {
         uint32_t i0 = indices[t * 3], i1 = indices[t * 3 + 1], i2 = indices[t * 3 + 2];
+        FORGE_ASSERT(i0 < vertices.size() && i1 < vertices.size() && i2 < vertices.size(),
+                     "EditMesh index out of range (%u verts)", (uint32_t)vertices.size());
         const vec3& p0 = vertices[i0].position;
         const vec3& p1 = vertices[i1].position;
         const vec3& p2 = vertices[i2].position;
