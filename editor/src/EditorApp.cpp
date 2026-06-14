@@ -2206,14 +2206,17 @@ void EditorApp::DrawViewport()
             ImGui::SameLine();
             modeBtn("Scale (R)", GizmoOp::Scale, "Drag the handles to resize");
             ImGui::SameLine();
-            if (m_SnapEnabled)
+            // Latch the active state before drawing: the click below toggles
+            // m_SnapEnabled, and Push/Pop must be balanced on the same value.
+            bool snapActive = m_SnapEnabled;
+            if (snapActive)
                 ui::PushAccentButton();
             if (ImGui::Button("Snap")) {
                 m_SnapEnabled = !m_SnapEnabled;
                 FORGE_INFO("Snapping %s (grid %.2f, angle %.0f deg)", m_SnapEnabled ? "on" : "off",
                            m_SnapTranslate, m_SnapRotateDeg);
             }
-            if (m_SnapEnabled)
+            if (snapActive)
                 ui::PopAccentButton();
             ImGui::SetItemTooltip("Snap moves/rotations to fixed steps.\nHold Ctrl to flip it for one drag");
             ImGui::End();
