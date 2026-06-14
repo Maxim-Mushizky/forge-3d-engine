@@ -173,4 +173,32 @@ bool IsCreaseEdge(const EditEdge& edge, float angleThresholdRad)
     return edge.dihedral > angleThresholdRad;
 }
 
+float DistancePointSegment2D(const vec2& p, const vec2& a, const vec2& b)
+{
+    vec2 ab = b - a;
+    float len2 = glm::dot(ab, ab);
+    if (len2 <= 0.0f)
+        return glm::length(p - a); // degenerate segment
+    float t = glm::clamp(glm::dot(p - a, ab) / len2, 0.0f, 1.0f);
+    return glm::length(p - (a + t * ab));
+}
+
+bool PointInTriangle2D(const vec2& p, const vec2& a, const vec2& b, const vec2& c)
+{
+    // Sign of the 2D cross product for each edge; p is inside when all three
+    // agree (or are zero, i.e. on an edge). Winding-independent.
+    auto edge = [](const vec2& u, const vec2& v, const vec2& q) {
+        return (v.x - u.x) * (q.y - u.y) - (v.y - u.y) * (q.x - u.x);
+    };
+    float d0 = edge(a, b, p), d1 = edge(b, c, p), d2 = edge(c, a, p);
+    bool neg = d0 < 0.0f || d1 < 0.0f || d2 < 0.0f;
+    bool pos = d0 > 0.0f || d1 > 0.0f || d2 > 0.0f;
+    return !(neg && pos);
+}
+
+bool PointInRect2D(const vec2& p, const vec2& mn, const vec2& mx)
+{
+    return p.x >= mn.x && p.x <= mx.x && p.y >= mn.y && p.y <= mx.y;
+}
+
 } // namespace forge

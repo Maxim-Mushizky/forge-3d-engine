@@ -71,4 +71,20 @@ const EditEdge* FindEdge(const EditMesh& mesh, uint32_t a, uint32_t b);
 // quad face (its two triangles are coplanar, dihedral ~0).
 bool IsCreaseEdge(const EditEdge& edge, float angleThresholdRad);
 
+// --- screen-space pick kernels (#54) -------------------------------------
+// Pure 2D math on already-projected points (the editor handles the
+// camera/world->screen projection, which needs GL state; these stay GL-free
+// so element picking is unit tested headless). Coordinates are viewport
+// pixels, but any consistent 2D space works.
+
+// Shortest distance from point p to segment a-b. Degenerate (a == b) returns
+// the distance to that point.
+float DistancePointSegment2D(const vec2& p, const vec2& a, const vec2& b);
+
+// Whether p lies inside triangle a-b-c (winding-independent; edges inclusive).
+bool PointInTriangle2D(const vec2& p, const vec2& a, const vec2& b, const vec2& c);
+
+// Whether p lies within the axis-aligned rect [mn, mx] (inclusive).
+bool PointInRect2D(const vec2& p, const vec2& mn, const vec2& mx);
+
 } // namespace forge

@@ -2104,9 +2104,54 @@ void EditorApp::DrawViewport()
             ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
                                                 IM_COL32(86, 156, 214, 255), 0.0f, 0, 2.0f);
         } else if (m_Edit.Active()) {
-            // Edit mode owns the viewport: gizmo + click/box select are suppressed
-            // (T1c adds element selection here). Green border distinguishes it.
+            // Edit mode owns the viewport: the gizmo is suppressed; clicks and
+            // marquee select mesh elements instead of objects. Green border.
             m_Edit.DrawOverlay(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize);
+
+            ImGuiIO& io = ImGui::GetIO();
+            // Click-pick: release with negligible drag = click, not a camera orbit.
+            bool clicked = ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                           !io.KeyAlt && io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < 25.0f;
+            if (clicked) {
+                ImVec2 m = ImGui::GetMousePos();
+                m_Edit.Pick(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize, vec2(m.x, m.y), io.KeyCtrl);
+            }
+
+            // Marquee box-select (reuses the object-mode marquee state, idle in
+            // edit mode). The 5px drag threshold keeps click and box exclusive.
+            if (!m_BoxSelecting && ImGui::IsItemHovered() &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.KeyAlt) {
+                ImVec2 m = ImGui::GetMousePos();
+                m_BoxSelecting = true;
+                m_BoxStartUV = {(m.x - m_ViewportPos.x) / m_ViewportSize.x,
+                                (m.y - m_ViewportPos.y) / m_ViewportSize.y};
+            }
+            if (m_BoxSelecting) {
+                bool dragged = io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] >= 25.0f;
+                ImVec2 a{m_ViewportPos.x + m_BoxStartUV.x * m_ViewportSize.x,
+                         m_ViewportPos.y + m_BoxStartUV.y * m_ViewportSize.y};
+                if (io.KeyAlt) {
+                    m_BoxSelecting = false; // camera claimed the drag
+                } else if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    if (dragged) {
+                        ImVec2 b = ImGui::GetMousePos();
+                        ImVec2 mn{std::min(a.x, b.x), std::min(a.y, b.y)};
+                        ImVec2 mx{std::max(a.x, b.x), std::max(a.y, b.y)};
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        dl->AddRectFilled(mn, mx, IM_COL32(86, 156, 214, 30));
+                        dl->AddRect(mn, mx, IM_COL32(86, 156, 214, 200), 0.0f, 0, 1.5f);
+                    }
+                } else { // released
+                    if (dragged) {
+                        ImVec2 b = ImGui::GetMousePos();
+                        m_Edit.BoxPick(m_Scene, m_Camera, m_ViewportPos, m_ViewportSize,
+                                       vec2(std::min(a.x, b.x), std::min(a.y, b.y)),
+                                       vec2(std::max(a.x, b.x), std::max(a.y, b.y)), io.KeyCtrl);
+                    }
+                    m_BoxSelecting = false;
+                }
+            }
+
             ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
                                                 IM_COL32(120, 200, 140, 255), 0.0f, 0, 2.0f);
         } else {
@@ -2301,7 +2346,8 @@ void EditorApp::DrawViewport()
         ImGui::TextDisabled(m_Sculpt.Active()
                                 ? "Drag to sculpt   Ctrl inverts   Shift smooths   Tab exits"
                             : m_Edit.Active()
-                                ? "Edit mode: pick Vertex / Edge / Face in the toolbar   Esc exits"
+                                ? "Edit: Vertex/Edge/Face toolbar   Click select   Ctrl+Click add   "
+                                  "Drag box   Esc exits"
                             : m_Extrude.Busy()
                                 ? "Press a flat face and drag to extrude   Esc cancels"
                                 : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select   "
