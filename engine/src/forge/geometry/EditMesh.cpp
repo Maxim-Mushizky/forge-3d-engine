@@ -233,7 +233,8 @@ vec3 SelectionCentroid(const EditMesh& mesh, const std::vector<uint32_t>& vertex
         return vec3(0.0f);
     vec3 acc(0.0f);
     for (uint32_t v : vertexIds)
-        acc += mesh.vertices[v].position;
+        if (v < mesh.vertices.size())
+            acc += mesh.vertices[v].position;
     return acc / (float)vertexIds.size();
 }
 
@@ -242,6 +243,8 @@ void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mes
                           const mat4& xform)
 {
     for (size_t i = 0; i < vertexIds.size() && i < startPositions.size(); ++i) {
+        if (vertexIds[i] >= mesh.vertices.size())
+            continue;
         vec3 p = vec3(xform * vec4(startPositions[i], 1.0f));
         for (uint32_t raw : mesh.vertices[vertexIds[i]].rawVerts)
             if (raw < meshVertices.size())
