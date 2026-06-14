@@ -1653,7 +1653,7 @@ void EditorApp::DrawSidebar()
         if (ImGui::Button(armed ? "Extrude: drag a face..." : "Extrude (push/pull)", ImVec2(-1, 30))) {
             if (armed)
                 m_Extrude.Disarm();
-            else if (!m_Sculpt.Active())
+            else if (!m_Sculpt.Active() && !m_Edit.Active())
                 m_Extrude.Arm();
         }
         if (armed)
