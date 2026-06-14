@@ -11,10 +11,12 @@ add_executable(forge_tests
     test_boxselect.cpp
     test_droptoground.cpp
     test_bvh.cpp
+    test_snap.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/raytrace/BVH.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/BoxSelect.cpp
-    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/DropToGround.cpp)
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/DropToGround.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/TransformSnap.cpp)
 
 target_include_directories(forge_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/src

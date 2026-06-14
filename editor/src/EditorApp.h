@@ -8,6 +8,7 @@
 #include <forge/geometry/MeshBoolean.h>
 #include <forge/platform/Window.h>
 #include <forge/scene/BoxSelect.h>
+#include <forge/scene/TransformSnap.h>
 #include <forge/raytrace/PathTracer.h>
 #include <forge/renderer/Framebuffer.h>
 #include <forge/renderer/PostProcess.h>
@@ -125,6 +126,13 @@ private:
     ExtrudeTool m_Extrude;
     GizmoOp m_GizmoOp = GizmoOp::Translate;
     bool m_GizmoWasUsing = false;
+    // Transform snapping (#5): quantize gizmo drags and inspector fields to
+    // fixed increments. The toggle persists; holding Ctrl flips it for a single
+    // gesture (industry standard). Session-only until the settings file lands.
+    bool m_SnapEnabled = false;
+    float m_SnapTranslate = 0.25f; // world units per grid step
+    float m_SnapRotateDeg = 15.0f; // degrees per angle step
+    float m_SnapScale = 0.1f;      // scale-factor step
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
     bool m_FirstDockLayout = false;
 

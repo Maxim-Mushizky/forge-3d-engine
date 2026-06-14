@@ -1666,6 +1666,23 @@ void EditorApp::DrawSidebar()
         if (ImGui::Checkbox("Orthographic", &ortho))
             m_Camera.SetOrthographic(ortho);
         ImGui::SetItemTooltip("Parallel projection - no perspective, like a blueprint.\nGreat with the 1/3/7 view keys");
+
+        // Transform snapping (#5): mirrors the viewport's Snap button; the step
+        // pickers appear only when snapping is on to keep the panel uncluttered.
+        if (ImGui::Checkbox("Snapping", &m_SnapEnabled))
+            FORGE_INFO("Snapping %s (grid %.2f, angle %.0f deg)", m_SnapEnabled ? "on" : "off",
+                       m_SnapTranslate, m_SnapRotateDeg);
+        ImGui::SetItemTooltip("Snap gizmo drags and inspector fields to fixed steps.\nHold Ctrl to flip it for one drag");
+        if (m_SnapEnabled) {
+            static const float kGrid[] = {0.1f, 0.25f, 0.5f, 1.0f};
+            int gi = m_SnapTranslate <= 0.15f ? 0 : m_SnapTranslate <= 0.35f ? 1 : m_SnapTranslate <= 0.75f ? 2 : 3;
+            if (ImGui::Combo("Move step", &gi, "0.1\0" "0.25\0" "0.5\0" "1.0\0"))
+                m_SnapTranslate = kGrid[gi];
+            static const float kAngle[] = {5.0f, 15.0f, 45.0f};
+            int ai = m_SnapRotateDeg <= 7.5f ? 0 : m_SnapRotateDeg <= 30.0f ? 1 : 2;
+            if (ImGui::Combo("Rotate step", &ai, "5 deg\0" "15 deg\0" "45 deg\0"))
+                m_SnapRotateDeg = kAngle[ai];
+        }
     }
 
     if (Section(m_HeaderFont, "Ray Tracing (photoreal)", false)) {
@@ -1874,7 +1891,8 @@ void EditorApp::DrawInspector()
 
     sepText("Transform");
     // Row of X/Y/Z colored badges (click = reset) + drag fields.
-    auto vec3Row = [&](const char* label, vec3& v, float speed, float resetVal, bool* changed) {
+    auto vec3Row = [&](const char* label, vec3& v, float speed, float resetVal, bool* changed,
+                       float snapStep) {
         static const ImVec4 axisColor[3] = {{0.757f, 0.27f, 0.24f, 1}, {0.37f, 0.63f, 0.23f, 1},
                                             {0.24f, 0.47f, 0.76f, 1}};
         static const char* axisName[3] = {"X", "Y", "Z"};
@@ -1901,21 +1919,27 @@ void EditorApp::DrawInspector()
             ImGui::SetItemTooltip("Click to reset");
             ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
             ImGui::SetNextItemWidth(fieldW);
-            if (ImGui::DragFloat("##v", &(&v.x)[a], speed, 0.0f, 0.0f, "%.2f") && changed)
-                *changed = true;
+            float* comp = &(&v.x)[a];
+            if (ImGui::DragFloat("##v", comp, speed, 0.0f, 0.0f, "%.2f")) {
+                if (snapStep > 0.0f) // snapping on: clean numbers in the field too
+                    *comp = SnapToStep(*comp, snapStep);
+                if (changed)
+                    *changed = true;
+            }
             track();
             ImGui::PopID();
         }
         ImGui::PopID();
     };
 
-    vec3Row("Position", e->transform.translation, 0.05f, 0.0f, nullptr);
+    vec3Row("Position", e->transform.translation, 0.05f, 0.0f, nullptr,
+            m_SnapEnabled ? m_SnapTranslate : 0.0f);
     vec3 deg = glm::degrees(e->transform.rotation);
     bool rotChanged = false;
-    vec3Row("Rotation", deg, 0.5f, 0.0f, &rotChanged);
+    vec3Row("Rotation", deg, 0.5f, 0.0f, &rotChanged, m_SnapEnabled ? m_SnapRotateDeg : 0.0f);
     if (rotChanged)
         e->transform.rotation = glm::radians(deg);
-    vec3Row("Scale", e->transform.scale, 0.02f, 1.0f, nullptr);
+    vec3Row("Scale", e->transform.scale, 0.02f, 1.0f, nullptr, m_SnapEnabled ? m_SnapScale : 0.0f);
 
     sepText("Material");
     ImGui::ColorEdit3("Albedo", &e->material.albedo.x);
@@ -2056,8 +2080,17 @@ void EditorApp::DrawViewport()
                                                                          : ImGuizmo::SCALE;
                 mat4 parentWorld = m_Scene.WorldTransform(sel->parent);
                 mat4 model = parentWorld * sel->transform.World();
+                // Snapping: the toggle persists, holding Ctrl flips it for one
+                // drag. ImGuizmo reads a per-axis step vector; the active step
+                // depends on the operation (grid / angle / scale factor).
+                bool snapActive = m_SnapEnabled != ImGui::GetIO().KeyCtrl;
+                float step = m_GizmoOp == GizmoOp::Translate ? m_SnapTranslate
+                           : m_GizmoOp == GizmoOp::Rotate    ? m_SnapRotateDeg
+                                                             : m_SnapScale;
+                float snap[3] = {step, step, step};
                 ImGuizmo::Manipulate(glm::value_ptr(m_Camera.View()), glm::value_ptr(m_Camera.Projection()),
-                                     op, ImGuizmo::LOCAL, glm::value_ptr(model));
+                                     op, ImGuizmo::LOCAL, glm::value_ptr(model), nullptr,
+                                     snapActive ? snap : nullptr);
 
                 if (ImGuizmo::IsUsing()) {
                     if (!m_GizmoWasUsing) {
@@ -2172,6 +2205,17 @@ void EditorApp::DrawViewport()
             modeBtn("Rotate (E)", GizmoOp::Rotate, "Drag the rings to rotate");
             ImGui::SameLine();
             modeBtn("Scale (R)", GizmoOp::Scale, "Drag the handles to resize");
+            ImGui::SameLine();
+            if (m_SnapEnabled)
+                ui::PushAccentButton();
+            if (ImGui::Button("Snap")) {
+                m_SnapEnabled = !m_SnapEnabled;
+                FORGE_INFO("Snapping %s (grid %.2f, angle %.0f deg)", m_SnapEnabled ? "on" : "off",
+                           m_SnapTranslate, m_SnapRotateDeg);
+            }
+            if (m_SnapEnabled)
+                ui::PopAccentButton();
+            ImGui::SetItemTooltip("Snap moves/rotations to fixed steps.\nHold Ctrl to flip it for one drag");
             ImGui::End();
         }
 
