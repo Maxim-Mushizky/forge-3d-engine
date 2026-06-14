@@ -12,6 +12,8 @@ add_executable(forge_tests
     test_droptoground.cpp
     test_bvh.cpp
     test_snap.cpp
+    test_editmesh.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/raytrace/BVH.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/BoxSelect.cpp
