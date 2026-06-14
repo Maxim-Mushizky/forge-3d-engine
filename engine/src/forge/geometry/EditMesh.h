@@ -25,6 +25,9 @@ enum class EdgeKind : uint8_t {
     NonManifold, // >2 incident faces — dihedral undefined
 };
 
+// Which element type a selection refers to (shared by the editor's edit mode).
+enum class ElementKind : uint8_t { Vertex, Edge, Face };
+
 struct EditVertex {
     vec3 position;                  // object-space group representative
     std::vector<uint32_t> rawVerts; // raw mesh vertex indices welded into this group (bake-back, T2+)
@@ -86,5 +89,24 @@ bool PointInTriangle2D(const vec2& p, const vec2& a, const vec2& b, const vec2& 
 
 // Whether p lies within the axis-aligned rect [mn, mx] (inclusive).
 bool PointInRect2D(const vec2& p, const vec2& mn, const vec2& mx);
+
+// --- element transform helpers (#59) -------------------------------------
+// Pure, GL-free so they unit-test headless; the editor owns the gizmo.
+
+// Deduplicated EditVertex ids that `selected` (ids of `kind` elements) touches:
+// vertices as-is, an edge's two endpoints, or a face's three corners.
+std::vector<uint32_t> ResolveVertexSet(const EditMesh& mesh, ElementKind kind,
+                                       const std::vector<uint32_t>& selected);
+
+// Mean object-space position of the given EditVertex ids (origin if empty).
+vec3 SelectionCentroid(const EditMesh& mesh, const std::vector<uint32_t>& vertexIds);
+
+// Bake a transform into raw mesh vertices: for each EditVertex id, map its
+// startPositions entry by xform and write the result to ALL of that group's
+// rawVerts (so welded seam copies move together). vertexIds and startPositions
+// are parallel. Only positions are touched.
+void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mesh,
+                          const std::vector<uint32_t>& vertexIds, const std::vector<vec3>& startPositions,
+                          const mat4& xform);
 
 } // namespace forge

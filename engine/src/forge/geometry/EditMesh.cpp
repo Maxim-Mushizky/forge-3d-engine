@@ -201,4 +201,52 @@ bool PointInRect2D(const vec2& p, const vec2& mn, const vec2& mx)
     return p.x >= mn.x && p.x <= mx.x && p.y >= mn.y && p.y <= mx.y;
 }
 
+std::vector<uint32_t> ResolveVertexSet(const EditMesh& mesh, ElementKind kind,
+                                       const std::vector<uint32_t>& selected)
+{
+    std::vector<uint32_t> out;
+    auto push = [&](uint32_t v) {
+        if (std::find(out.begin(), out.end(), v) == out.end())
+            out.push_back(v);
+    };
+    for (uint32_t id : selected) {
+        if (kind == ElementKind::Vertex) {
+            if (id < mesh.vertices.size())
+                push(id);
+        } else if (kind == ElementKind::Edge) {
+            if (id < mesh.edges.size()) {
+                push(mesh.edges[id].v0);
+                push(mesh.edges[id].v1);
+            }
+        } else { // Face
+            if (id < mesh.faces.size())
+                for (uint32_t c = 0; c < 3; ++c)
+                    push(mesh.faces[id].v[c]);
+        }
+    }
+    return out;
+}
+
+vec3 SelectionCentroid(const EditMesh& mesh, const std::vector<uint32_t>& vertexIds)
+{
+    if (vertexIds.empty())
+        return vec3(0.0f);
+    vec3 acc(0.0f);
+    for (uint32_t v : vertexIds)
+        acc += mesh.vertices[v].position;
+    return acc / (float)vertexIds.size();
+}
+
+void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mesh,
+                          const std::vector<uint32_t>& vertexIds, const std::vector<vec3>& startPositions,
+                          const mat4& xform)
+{
+    for (size_t i = 0; i < vertexIds.size() && i < startPositions.size(); ++i) {
+        vec3 p = vec3(xform * vec4(startPositions[i], 1.0f));
+        for (uint32_t raw : mesh.vertices[vertexIds[i]].rawVerts)
+            if (raw < meshVertices.size())
+                meshVertices[raw].position = p;
+    }
+}
+
 } // namespace forge

@@ -1,9 +1,13 @@
 #pragma once
 
+#include "CommandStack.h"
+
 #include <forge/geometry/EditMesh.h>
+#include <forge/geometry/MeshEdit.h>
 #include <forge/scene/Scene.h>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace forge {
@@ -18,12 +22,13 @@ class EditorCamera;
 // undo/redo) or the entity is deleted — the same guard SculptTool uses.
 class EditTool {
 public:
-    enum class Element { Vertex, Edge, Face };
+    using Element = ElementKind; // shared with the engine helpers
 
     bool Active() const { return m_Active; }
     UUID Target() const { return m_Target; }
     Element Mode() const { return m_Mode; }
     void SetMode(Element mode); // switching element type clears the selection
+    bool HasSelection() const { return !m_Selected.empty(); }
 
     void Enter(Scene& scene, UUID entity);
     void Exit();
@@ -45,13 +50,30 @@ public:
 
     size_t SelectionCount() const { return m_Selected.size(); }
 
+    // --- element transform (T2) ----------------------------------------------
+    // Object-space centroid of the current selection (origin if empty).
+    vec3 SelectionCentroidObject() const;
+    // Begin a gizmo drag: snapshot the affected vertices + the whole mesh for
+    // the undo diff. ApplyTransform maps those start positions by an
+    // object-space delta each frame; EndTransform commits one undo step.
+    void BeginTransform(Scene& scene);
+    void ApplyTransform(Scene& scene, const mat4& objectXform);
+    std::unique_ptr<Command> EndTransform(Scene& scene);
+
 private:
     bool m_Active = false;
     UUID m_Target = 0;
-    Mesh* m_MeshAtEnter = nullptr; // staleness guard: mesh swapped under us -> exit
+    Mesh* m_MeshAtEnter = nullptr;     // staleness guard: mesh swapped under us -> exit
+    uint64_t m_MeshVersionSeen = 0;    // detect in-place edits (undo/redo) to refresh the snapshot
     Element m_Mode = Element::Vertex;
     EditMesh m_EditMesh;
+    MeshTopology m_Topology;          // for welded-normal recompute after edits
     std::vector<uint32_t> m_Selected; // ids into the active element vector (cleared on mode switch)
+
+    // drag state
+    std::vector<uint32_t> m_DragVerts;    // affected EditVertex ids
+    std::vector<vec3> m_DragStartPos;     // their object-space positions at drag start (parallel)
+    std::vector<Vertex> m_MeshBefore;     // full vertex snapshot for the sparse undo diff
 };
 
 } // namespace forge

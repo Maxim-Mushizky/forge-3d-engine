@@ -153,6 +153,72 @@ void RunEditMeshTests()
         CHECK(!PointInRect2D({0.0f, 4.0f}, mn, mx));
         CHECK(!PointInRect2D({3.0f, 7.0f}, mn, mx));
     }
+
+    // --- ResolveVertexSet: per-kind expansion + dedup -------------------------
+    {
+        EditMesh m = BuildCube();
+        // Vertex: ids pass through, deduped.
+        auto vs = ResolveVertexSet(m, ElementKind::Vertex, {2, 2, 5});
+        CHECK(vs.size() == 2);
+        // Edge: two endpoints; a shared vertex across two edges dedups.
+        const EditEdge& e0 = m.edges[0];
+        auto es = ResolveVertexSet(m, ElementKind::Edge, {0});
+        CHECK(es.size() == 2);
+        CHECK((es[0] == e0.v0 || es[1] == e0.v0));
+        // Face: three corners.
+        auto fs = ResolveVertexSet(m, ElementKind::Face, {0});
+        CHECK(fs.size() == 3);
+        // All faces together cover all 8 cube vertices.
+        std::vector<uint32_t> allFaces(m.faces.size());
+        for (uint32_t i = 0; i < m.faces.size(); ++i) allFaces[i] = i;
+        CHECK(ResolveVertexSet(m, ElementKind::Face, allFaces).size() == 8);
+    }
+
+    // --- SelectionCentroid ----------------------------------------------------
+    {
+        EditMesh m = BuildCube();
+        std::vector<uint32_t> all(m.vertices.size());
+        for (uint32_t i = 0; i < m.vertices.size(); ++i) all[i] = i;
+        vec3 c = SelectionCentroid(m, all);
+        CHECK(ApproxEq(c.x, 0.0f) && ApproxEq(c.y, 0.0f) && ApproxEq(c.z, 0.0f)); // unit cube centered
+        CHECK(ApproxEq(SelectionCentroid(m, {}).x, 0.0f)); // empty -> origin
+    }
+
+    // --- ApplyVertexTransform: writes all rawVerts of a group, leaves rest ----
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        const float h = 0.5f;
+        // reuse the cube builder's geometry by rebuilding raw data here
+        auto quad = [&](vec3 a, vec3 b, vec3 c, vec3 d) {
+            uint32_t base = (uint32_t)verts.size();
+            verts.push_back({a, vec3(0.0f), vec2(0.0f)});
+            verts.push_back({b, vec3(0.0f), vec2(0.0f)});
+            verts.push_back({c, vec3(0.0f), vec2(0.0f)});
+            verts.push_back({d, vec3(0.0f), vec2(0.0f)});
+            idx.insert(idx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+        };
+        quad({h, -h, -h}, {h, h, -h}, {h, h, h}, {h, -h, h});
+        quad({-h, -h, h}, {-h, h, h}, {-h, h, -h}, {-h, -h, -h});
+        quad({-h, h, -h}, {-h, h, h}, {h, h, h}, {h, h, -h});
+        quad({-h, -h, h}, {-h, -h, -h}, {h, -h, -h}, {h, -h, h});
+        quad({-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h});
+        quad({h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h});
+        EditMesh m = BuildEditMesh(verts, idx);
+
+        uint32_t v = 0;                         // move one welded corner group
+        vec3 start = m.vertices[v].position;
+        size_t raws = m.vertices[v].rawVerts.size();
+        CHECK(raws == 3);                       // cube corner shared by 3 faces
+        mat4 shift = glm::translate(mat4(1.0f), vec3(10.0f, 0.0f, 0.0f));
+        ApplyVertexTransform(verts, m, {v}, {start}, shift);
+        for (uint32_t raw : m.vertices[v].rawVerts)
+            CHECK(ApproxEq(verts[raw].position.x, start.x + 10.0f));
+        // a vertex NOT in the set is untouched.
+        uint32_t other = (v == 1) ? 2 : 1;
+        for (uint32_t raw : m.vertices[other].rawVerts)
+            CHECK(ApproxEq(verts[raw].position.x, m.vertices[other].position.x));
+    }
 }
 
 } // namespace forge::test
