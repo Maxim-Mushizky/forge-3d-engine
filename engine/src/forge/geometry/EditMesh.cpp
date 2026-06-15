@@ -232,10 +232,13 @@ vec3 SelectionCentroid(const EditMesh& mesh, const std::vector<uint32_t>& vertex
     if (vertexIds.empty())
         return vec3(0.0f);
     vec3 acc(0.0f);
+    uint32_t valid = 0; // skip stale ids in the divisor too, or the mean pulls toward origin
     for (uint32_t v : vertexIds)
-        if (v < mesh.vertices.size())
+        if (v < mesh.vertices.size()) {
             acc += mesh.vertices[v].position;
-    return acc / (float)vertexIds.size();
+            ++valid;
+        }
+    return valid ? acc / (float)valid : vec3(0.0f);
 }
 
 void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mesh,

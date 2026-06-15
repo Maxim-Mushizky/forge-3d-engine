@@ -350,6 +350,11 @@ std::unique_ptr<Command> EditTool::EndTransform(Scene& scene)
         }
     }
     m_MeshBefore.clear();
+    // ApplyTransform moved the overlay's vertex positions live but left per-face
+    // centroids and per-edge dihedrals stale; rebuild so picking/overlay use
+    // fresh metadata. Version is unchanged (no mesh swap), so DrawOverlay's
+    // watch won't redo this.
+    m_EditMesh = BuildEditMesh(*e->mesh);
     if (indices.empty())
         return nullptr;
     return std::make_unique<SculptStrokeCommand>(m_Target, std::move(indices), std::move(before),

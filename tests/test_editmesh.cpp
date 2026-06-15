@@ -182,6 +182,11 @@ void RunEditMeshTests()
         vec3 c = SelectionCentroid(m, all);
         CHECK(ApproxEq(c.x, 0.0f) && ApproxEq(c.y, 0.0f) && ApproxEq(c.z, 0.0f)); // unit cube centered
         CHECK(ApproxEq(SelectionCentroid(m, {}).x, 0.0f)); // empty -> origin
+        // Stale ids are skipped in the divisor too: {0, bogus} == just vertex 0.
+        vec3 v0 = m.vertices[0].position;
+        vec3 mixed = SelectionCentroid(m, {0, 999999});
+        CHECK(ApproxEq(mixed.x, v0.x) && ApproxEq(mixed.y, v0.y) && ApproxEq(mixed.z, v0.z));
+        CHECK(ApproxEq(SelectionCentroid(m, {999999}).x, 0.0f)); // all stale -> origin
     }
 
     // --- ApplyVertexTransform: writes all rawVerts of a group, leaves rest ----
