@@ -360,6 +360,87 @@ void RunEditMeshTests()
         CHECK(BuildEdgeExtrusion(m, verts, idx, {}).indices.empty());    // empty selection
         CHECK(BuildEdgeExtrusion(m, verts, idx, {999}).indices.empty()); // stale edge id
     }
+
+    // Closed + manifold check shared by the subdivision tests: a watertight result
+    // has no open borders and no edge shared by >2 faces (no T-junction crack).
+    auto isWatertight = [](const EditMesh& r) {
+        for (const EditEdge& e : r.edges)
+            if (e.kind != EdgeKind::Manifold)
+                return false;
+        return true;
+    };
+
+    // --- BuildFaceSubdivision: one cube face -> 4 tris/quad, neighbours kept --
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+
+        MeshSubdivision sd = BuildFaceSubdivision(m, verts, idx, {0, 1}); // the +X quad
+        CHECK(!sd.indices.empty());
+        CHECK(sd.newVerts.size() == 5);    // 4 outer edge midpoints + 1 shared diagonal
+        CHECK(sd.indices.size() == 66);    // 2 faces x4 + 4 neighbour splits + 6 untouched = 22 tris
+
+        // Every inserted midpoint lies on the +X plane; one sits at the face centre.
+        bool haveCenter = false;
+        for (uint32_t v : sd.newVerts) {
+            CHECK(ApproxEq(sd.vertices[v].position.x, 0.5f));
+            if (ApproxEq(sd.vertices[v].position.y, 0.0f) && ApproxEq(sd.vertices[v].position.z, 0.0f))
+                haveCenter = true;
+        }
+        CHECK(haveCenter);
+
+        // Rebuild: 8 cube groups + 5 midpoints; still a closed, manifold surface
+        // (the neighbour splits removed the T-junctions).
+        EditMesh r = BuildEditMesh(sd.vertices, sd.indices);
+        CHECK(r.vertices.size() == 13);
+        CHECK(r.faces.size() == 22);
+        CHECK(isWatertight(r));
+    }
+
+    // --- BuildEdgeSubdivision: split one cube edge, both incident faces split --
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+        auto groupAt = [&](vec3 p) {
+            for (uint32_t g = 0; g < m.vertices.size(); ++g)
+                if (ApproxEq(m.vertices[g].position.x, p.x) && ApproxEq(m.vertices[g].position.y, p.y) &&
+                    ApproxEq(m.vertices[g].position.z, p.z))
+                    return g;
+            return UINT32_MAX;
+        };
+        uint32_t ga = groupAt({0.5f, 0.5f, 0.5f}), gb = groupAt({0.5f, 0.5f, -0.5f});
+        const EditEdge* edge = FindEdge(m, ga, gb);
+        CHECK(edge != nullptr && edge->kind == EdgeKind::Manifold);
+        uint32_t eid = (uint32_t)(edge - m.edges.data());
+
+        MeshSubdivision sd = BuildEdgeSubdivision(m, verts, idx, {eid});
+        CHECK(sd.newVerts.size() == 1);
+        CHECK(sd.indices.size() == 42); // 2 incident tris -> 2 each, 10 untouched = 14 tris
+        CHECK(ApproxEq(sd.vertices[sd.newVerts[0]].position.x, 0.5f) &&
+              ApproxEq(sd.vertices[sd.newVerts[0]].position.y, 0.5f) &&
+              ApproxEq(sd.vertices[sd.newVerts[0]].position.z, 0.0f)); // edge midpoint
+
+        EditMesh r = BuildEditMesh(sd.vertices, sd.indices);
+        CHECK(r.vertices.size() == 9); // 8 + 1 midpoint
+        CHECK(r.faces.size() == 14);
+        CHECK(isWatertight(r));
+    }
+
+    // --- BuildFace/EdgeSubdivision: empty / stale selections return nothing ----
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+        CHECK(BuildFaceSubdivision(m, verts, idx, {}).indices.empty());
+        CHECK(BuildFaceSubdivision(m, verts, idx, {999}).indices.empty());
+        CHECK(BuildEdgeSubdivision(m, verts, idx, {}).indices.empty());
+        CHECK(BuildEdgeSubdivision(m, verts, idx, {999}).indices.empty());
+    }
 }
 
 } // namespace forge::test

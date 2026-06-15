@@ -429,4 +429,122 @@ EdgeExtrusion BuildEdgeExtrusion(const EditMesh& mesh, const std::vector<Vertex>
     return out;
 }
 
+namespace {
+
+uint64_t GroupEdgeKey(uint32_t ga, uint32_t gb)
+{
+    if (ga > gb)
+        std::swap(ga, gb);
+    return ((uint64_t)ga << 32) | gb;
+}
+
+// Re-triangulate one source triangle (a,b,c) given the midpoint vertex on each
+// edge (kNoEdge = that edge isn't split). Red-green refinement: 3 splits -> the
+// classic 1->4, 1 split -> bisect to the opposite corner, 2 splits -> a tip
+// triangle plus a split quad. Windings follow the source (a->b->c).
+void EmitSplitTriangle(std::vector<uint32_t>& out, uint32_t a, uint32_t b, uint32_t c,
+                       uint32_t mAB, uint32_t mBC, uint32_t mCA)
+{
+    int splits = (mAB != kNoEdge) + (mBC != kNoEdge) + (mCA != kNoEdge);
+    if (splits == 0) {
+        out.insert(out.end(), {a, b, c});
+    } else if (splits == 3) {
+        out.insert(out.end(), {a, mAB, mCA, mAB, b, mBC, mCA, mBC, c, mAB, mBC, mCA});
+    } else if (splits == 1) {
+        if (mAB != kNoEdge)
+            out.insert(out.end(), {a, mAB, c, mAB, b, c});
+        else if (mBC != kNoEdge)
+            out.insert(out.end(), {a, b, mBC, a, mBC, c});
+        else // mCA
+            out.insert(out.end(), {a, b, mCA, b, c, mCA});
+    } else { // 2 splits: a tip triangle at the shared corner + the split quad
+        if (mAB != kNoEdge && mBC != kNoEdge) // share b
+            out.insert(out.end(), {mAB, b, mBC, a, mAB, mBC, a, mBC, c});
+        else if (mBC != kNoEdge && mCA != kNoEdge) // share c
+            out.insert(out.end(), {mBC, c, mCA, a, b, mCA, b, mBC, mCA});
+        else // mCA && mAB, share a
+            out.insert(out.end(), {a, mAB, mCA, mAB, b, c, mAB, c, mCA});
+    }
+}
+
+// Shared core: split every group-edge in `splitEdges` at its midpoint and
+// re-triangulate every affected triangle. Midpoints are deduped by group-edge
+// key so the two faces across an edge share one vertex (watertight).
+MeshSubdivision SubdivideByEdgeSet(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                   const std::vector<uint32_t>& srcIndices,
+                                   const std::unordered_map<uint64_t, int>& splitEdges)
+{
+    MeshSubdivision out;
+    if (splitEdges.empty())
+        return out;
+    out.vertices = srcVertices;
+
+    // One midpoint vertex per split group-edge: position from the group reps,
+    // attributes averaged from a representative raw vert of each endpoint. The
+    // welded-normal recompute on commit fixes shading, so an approximate normal
+    // here is fine (mirrors LoopSubdivide).
+    std::unordered_map<uint64_t, uint32_t> midOf;
+    for (const auto& [key, count] : splitEdges) {
+        (void)count;
+        uint32_t ga = (uint32_t)(key >> 32), gb = (uint32_t)(key & 0xFFFFFFFFu);
+        const EditVertex& va = mesh.vertices[ga];
+        const EditVertex& vb = mesh.vertices[gb];
+        Vertex m = srcVertices[va.rawVerts[0]];
+        m.position = 0.5f * (va.position + vb.position);
+        m.uv = 0.5f * (srcVertices[va.rawVerts[0]].uv + srcVertices[vb.rawVerts[0]].uv);
+        vec3 n = srcVertices[va.rawVerts[0]].normal + srcVertices[vb.rawVerts[0]].normal;
+        float nl = glm::length(n);
+        m.normal = nl > 1e-8f ? n / nl : vec3(0.0f, 1.0f, 0.0f);
+        midOf[key] = (uint32_t)out.vertices.size();
+        out.newVerts.push_back(midOf[key]);
+        out.vertices.push_back(m);
+    }
+
+    out.indices.reserve(srcIndices.size());
+    uint32_t triCount = (uint32_t)(srcIndices.size() / 3);
+    auto midpoint = [&](uint32_t g0, uint32_t g1) {
+        auto it = midOf.find(GroupEdgeKey(g0, g1));
+        return it == midOf.end() ? kNoEdge : it->second;
+    };
+    for (uint32_t t = 0; t < triCount; ++t) {
+        uint32_t a = srcIndices[t * 3], b = srcIndices[t * 3 + 1], c = srcIndices[t * 3 + 2];
+        const uint32_t* gv = mesh.faces[t].v; // group ids of this triangle's corners
+        EmitSplitTriangle(out.indices, a, b, c, midpoint(gv[0], gv[1]), midpoint(gv[1], gv[2]),
+                          midpoint(gv[2], gv[0]));
+    }
+    return out;
+}
+
+} // namespace
+
+MeshSubdivision BuildFaceSubdivision(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                     const std::vector<uint32_t>& srcIndices,
+                                     const std::vector<uint32_t>& selectedFaces)
+{
+    uint32_t triCount = (uint32_t)(srcIndices.size() / 3);
+    std::unordered_map<uint64_t, int> splitEdges;
+    for (uint32_t f : selectedFaces) {
+        if (f >= triCount || f >= mesh.faces.size())
+            return {}; // stale selection id
+        const uint32_t* gv = mesh.faces[f].v;
+        for (int c = 0; c < 3; ++c)
+            splitEdges[GroupEdgeKey(gv[c], gv[(c + 1) % 3])] = 1;
+    }
+    return SubdivideByEdgeSet(mesh, srcVertices, srcIndices, splitEdges);
+}
+
+MeshSubdivision BuildEdgeSubdivision(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                     const std::vector<uint32_t>& srcIndices,
+                                     const std::vector<uint32_t>& selectedEdges)
+{
+    std::unordered_map<uint64_t, int> splitEdges;
+    for (uint32_t id : selectedEdges) {
+        if (id >= mesh.edges.size())
+            return {}; // stale selection id
+        const EditEdge& e = mesh.edges[id];
+        splitEdges[GroupEdgeKey(e.v0, e.v1)] = 1;
+    }
+    return SubdivideByEdgeSet(mesh, srcVertices, srcIndices, splitEdges);
+}
+
 } // namespace forge

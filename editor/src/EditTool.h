@@ -83,6 +83,18 @@ public:
     std::unique_ptr<Command> EndExtrude(Scene& scene);
     void CancelExtrude(Scene& scene);
 
+    // --- subdivide (T5, #62) -------------------------------------------------
+    // Add geometry locally: split the selected faces/edges and re-triangulate
+    // (one MeshSwapCommand). The inserted midpoint verts are left selected in
+    // Vertex mode so they can be moved straight away. Face or Edge mode with a
+    // live selection can subdivide (Vertex mode is a no-op).
+    bool CanSubdivide() const
+    {
+        return m_Active && (m_Mode == Element::Face || m_Mode == Element::Edge) && !m_Selected.empty() &&
+               !m_Extruding;
+    }
+    std::unique_ptr<Command> Subdivide(Scene& scene);
+
 private:
     bool m_Active = false;
     UUID m_Target = 0;
