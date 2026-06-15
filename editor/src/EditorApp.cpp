@@ -402,8 +402,12 @@ void EditorApp::HandleShortcuts()
         ToggleSculptMode();
     if (m_Sculpt.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape))
         m_Sculpt.Exit();
-    if (m_Edit.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape))
-        m_Edit.Exit();
+    if (m_Edit.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (m_Edit.Extruding())
+            m_Edit.CancelExtrude(m_Scene); // abort the in-progress push-pull, stay in edit mode
+        else
+            m_Edit.Exit();
+    }
 }
 
 void EditorApp::SelectOnly(UUID id)
@@ -505,7 +509,9 @@ void EditorApp::ToggleSculptMode()
         m_Sculpt.Exit();
         return;
     }
-    m_Edit.Exit(); // sculpt and edit are mutually exclusive mesh modes
+    if (m_Edit.Extruding())
+        m_Edit.CancelExtrude(m_Scene); // restore the original before leaving edit mode
+    m_Edit.Exit();                     // sculpt and edit are mutually exclusive mesh modes
     Entity* e = m_Scene.Find(m_Selected);
     if (e && e->mesh)
         m_Sculpt.Enter(m_Scene, e->id);
@@ -514,6 +520,8 @@ void EditorApp::ToggleSculptMode()
 void EditorApp::ToggleEditMode()
 {
     if (m_Edit.Active()) {
+        if (m_Edit.Extruding())
+            m_Edit.CancelExtrude(m_Scene); // restore the original before leaving
         m_Edit.Exit();
         return;
     }
@@ -2110,6 +2118,33 @@ void EditorApp::DrawViewport()
 
             ImGuiIO& io = ImGui::GetIO();
 
+            // Face extrude (T3): while armed it owns the viewport — the cursor
+            // slides the cap along its normal (closest point between the mouse
+            // ray and the extrusion line), LMB commits, Esc cancels. The gizmo,
+            // picking and marquee all wait until the drag resolves.
+            if (m_Edit.Extruding()) {
+                vec2 uv{(io.MousePos.x - m_ViewportPos.x) / m_ViewportSize.x,
+                        (io.MousePos.y - m_ViewportPos.y) / m_ViewportSize.y};
+                mat4 invVP = glm::inverse(m_Camera.ViewProjection());
+                vec4 pNear = invVP * vec4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, -1.0f, 1.0f);
+                vec4 pFar = invVP * vec4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 1.0f, 1.0f);
+                vec3 ro = vec3(pNear) / pNear.w;
+                vec3 rd = glm::normalize(vec3(pFar) / pFar.w - ro);
+
+                // Esc-to-cancel is handled in HandleShortcuts (runs first), so by
+                // here a cancel has already dropped us out of the extrude.
+                float b = glm::dot(rd, m_EditExtrudeLineD);
+                float denom = 1.0f - b * b;
+                if (std::abs(denom) > 1e-5f) {
+                    vec3 w0 = ro - m_EditExtrudeLineP;
+                    float s = (glm::dot(m_EditExtrudeLineD, w0) - b * glm::dot(rd, w0)) / denom;
+                    m_Edit.UpdateExtrude(m_Scene, s / m_EditExtrudeWorldPerLocal);
+                }
+                if (m_ViewportHovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+                    if (auto cmd = m_Edit.EndExtrude(m_Scene))
+                        m_Commands.Push(std::move(cmd));
+            } else {
+
             // Transform gizmo on the selection (T2): anchored at the selection
             // centroid, it moves/rotates/scales the chosen verts/edges/faces.
             bool gizmoActive = false;
@@ -2193,6 +2228,7 @@ void EditorApp::DrawViewport()
                     m_BoxSelecting = false;
                 }
             }
+            } // end !Extruding
 
             ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
                                                 IM_COL32(120, 200, 140, 255), 0.0f, 0, 2.0f);
@@ -2374,6 +2410,31 @@ void EditorApp::DrawViewport()
             elemBtn("Edge", EditTool::Element::Edge, "Select and edit edges");
             ImGui::SameLine();
             elemBtn("Face", EditTool::Element::Face, "Select and edit faces");
+            // Extrude (T3): push-pull the selected faces. Only in Face mode; armed
+            // it stays accented and owns the viewport until LMB commits / Esc cancels.
+            if (m_Edit.Mode() == EditTool::Element::Face) {
+                ImGui::SameLine();
+                bool extruding = m_Edit.Extruding();
+                if (extruding)
+                    ui::PushAccentButton();
+                ImGui::BeginDisabled(!m_Edit.CanExtrude() && !extruding);
+                if (ImGui::Button("Extrude") && m_Edit.BeginExtrude(m_Scene)) {
+                    // Map the object-space slide line to world for the drag. The
+                    // cap travels along the object-space normal, so its world
+                    // direction and the units-per-offset scale both come from the
+                    // same transformed displacement (consistent under any scale).
+                    mat4 world = m_Scene.WorldTransform(m_Edit.Target());
+                    vec3 worldDisp = mat3(world) * m_Edit.ExtrudeNormalObject();
+                    m_EditExtrudeLineP = vec3(world * vec4(m_Edit.ExtrudeAnchorObject(), 1.0f));
+                    m_EditExtrudeLineD = glm::normalize(worldDisp);
+                    m_EditExtrudeWorldPerLocal = std::max(glm::length(worldDisp), 1e-6f);
+                }
+                ImGui::EndDisabled();
+                if (extruding)
+                    ui::PopAccentButton();
+                ImGui::SetItemTooltip("Push/pull the selected faces along their normal\n"
+                                      "Move the cursor to set depth, click to commit, Esc cancels");
+            }
             ImGui::End();
         }
 
@@ -2387,9 +2448,11 @@ void EditorApp::DrawViewport()
                          ImGuiWindowFlags_NoInputs);
         ImGui::TextDisabled(m_Sculpt.Active()
                                 ? "Drag to sculpt   Ctrl inverts   Shift smooths   Tab exits"
+                            : m_Edit.Extruding()
+                                ? "Extrude: move the cursor to set depth   click commits   Esc cancels"
                             : m_Edit.Active()
                                 ? "Edit: click select   Ctrl+Click add   drag box   "
-                                  "W/E/R + gizmo to move selection   Esc exits"
+                                  "W/E/R + gizmo to move selection   Extrude pushes faces   Esc exits"
                             : m_Extrude.Busy()
                                 ? "Press a flat face and drag to extrude   Esc cancels"
                                 : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select   "

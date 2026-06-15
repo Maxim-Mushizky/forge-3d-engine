@@ -109,4 +109,29 @@ void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mes
                           const std::vector<uint32_t>& vertexIds, const std::vector<vec3>& startPositions,
                           const mat4& xform);
 
+// --- face extrude (#63) ---------------------------------------------------
+// Pure region->geometry math so it unit-tests headless; the editor owns the
+// interactive drag and the undo command.
+
+// New geometry for a face-extrude, built at zero offset (the cap coincides
+// with the original surface). The editor slides `capVerts` along `normal`.
+struct FaceExtrusion {
+    std::vector<Vertex> vertices;    // source verts + duplicated cap + wall verts
+    std::vector<uint32_t> indices;   // source tris (selection re-pointed to the cap) + walls
+    std::vector<uint32_t> capVerts;  // indices into `vertices` that slide: cap + wall tops
+    vec3 normal{0.0f, 1.0f, 0.0f};   // object-space slide direction (normalized)
+};
+
+// Build push-pull geometry for a face selection. The selected triangles become
+// a duplicated cap (the original surface stays as a floor referenced only by the
+// walls); each boundary edge of the region — an edge on exactly one selected
+// face — grows a wall quad, while shared interior edges get none, so a connected
+// region extrudes as a single cap. selectedFaces are EditFace ids (== triangle
+// ids). Returns an empty result (no indices) if the selection is empty, refers
+// to a stale id, or the area-weighted region normal is degenerate (e.g. opposite
+// faces that cancel).
+FaceExtrusion BuildFaceExtrusion(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                 const std::vector<uint32_t>& srcIndices,
+                                 const std::vector<uint32_t>& selectedFaces);
+
 } // namespace forge

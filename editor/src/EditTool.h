@@ -60,6 +60,23 @@ public:
     void ApplyTransform(Scene& scene, const mat4& objectXform);
     std::unique_ptr<Command> EndTransform(Scene& scene);
 
+    // --- face extrude (T3, #63) ----------------------------------------------
+    // Push-pull the selected faces along their averaged normal. The editor arms
+    // it with BeginExtrude (which swaps in the cap+wall geometry at zero offset
+    // and stays in edit mode), drives UpdateExtrude as the mouse slides, then
+    // commits with EndExtrude (one MeshSwapCommand, cap left selected) or aborts
+    // with CancelExtrude. Only Face mode with a live selection can extrude.
+    bool CanExtrude() const { return m_Active && m_Mode == Element::Face && !m_Selected.empty() && !m_Extruding; }
+    bool Extruding() const { return m_Extruding; }
+    // Object-space anchor (cap centroid at offset 0) and slide direction — the
+    // editor maps these to world space to build the drag line.
+    vec3 ExtrudeAnchorObject() const { return m_ExtrudeAnchor; }
+    vec3 ExtrudeNormalObject() const { return m_ExtrudeNormal; }
+    bool BeginExtrude(Scene& scene);
+    void UpdateExtrude(Scene& scene, float offset);
+    std::unique_ptr<Command> EndExtrude(Scene& scene);
+    void CancelExtrude(Scene& scene);
+
 private:
     bool m_Active = false;
     UUID m_Target = 0;
@@ -74,6 +91,15 @@ private:
     std::vector<uint32_t> m_DragVerts;    // affected EditVertex ids
     std::vector<vec3> m_DragStartPos;     // their object-space positions at drag start (parallel)
     std::vector<Vertex> m_MeshBefore;     // full vertex snapshot for the sparse undo diff
+
+    // extrude state
+    bool m_Extruding = false;
+    std::shared_ptr<Mesh> m_ExtrudeOriginal; // pre-extrude mesh, for undo + cancel
+    std::vector<uint32_t> m_ExtrudeMoving;   // raw vert indices that slide (cap + wall tops)
+    std::vector<vec3> m_ExtrudeBase;         // their object-space positions at offset 0 (parallel)
+    vec3 m_ExtrudeNormal{0.0f, 1.0f, 0.0f};  // object-space slide direction
+    vec3 m_ExtrudeAnchor{0.0f};              // cap centroid at offset 0 (drag-line anchor)
+    float m_ExtrudeLastOffset = 0.0f;
 };
 
 } // namespace forge

@@ -141,6 +141,12 @@ private:
     mat4 m_EditGizmo{1.0f};
     mat4 m_EditGizmoStart{1.0f};
     bool m_EditGizmoUsing = false;
+    // Edit-mode face extrude (#63): the world-space line the cap slides along
+    // (anchor + unit direction) and the world units per object-space unit, set
+    // when BeginExtrude arms the drag (see ExtrudeTool for the same mapping).
+    vec3 m_EditExtrudeLineP{0.0f};
+    vec3 m_EditExtrudeLineD{0.0f, 1.0f, 0.0f};
+    float m_EditExtrudeWorldPerLocal = 1.0f;
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
     bool m_FirstDockLayout = false;
 
