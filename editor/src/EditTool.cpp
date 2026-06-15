@@ -95,6 +95,10 @@ void EditTool::Exit()
     m_DragVerts.clear();
     m_DragStartPos.clear();
     m_MeshBefore.clear();
+    m_Extruding = false;
+    m_ExtrudeOriginal.reset();
+    m_ExtrudeMoving.clear();
+    m_ExtrudeBase.clear();
 }
 
 void EditTool::DrawOverlay(Scene& scene, const EditorCamera& camera, const vec2& viewportPos,
@@ -350,10 +354,126 @@ std::unique_ptr<Command> EditTool::EndTransform(Scene& scene)
         }
     }
     m_MeshBefore.clear();
+    // ApplyTransform moved the overlay's vertex positions live but left per-face
+    // centroids and per-edge dihedrals stale; rebuild so picking/overlay use
+    // fresh metadata. Version is unchanged (no mesh swap), so DrawOverlay's
+    // watch won't redo this.
+    m_EditMesh = BuildEditMesh(*e->mesh);
     if (indices.empty())
         return nullptr;
     return std::make_unique<SculptStrokeCommand>(m_Target, std::move(indices), std::move(before),
                                                  std::move(now));
+}
+
+// --- face extrude (T3, #63) --------------------------------------------------
+
+namespace {
+// Re-adopt a mesh we swapped in ourselves: refresh the staleness guard, snapshot
+// and topology so DrawOverlay tracks the new geometry instead of self-exiting.
+void Readopt(EditMesh& edit, MeshTopology& topo, Mesh*& guard, uint64_t& versionSeen, Mesh& mesh)
+{
+    guard = &mesh;
+    edit = BuildEditMesh(mesh);
+    topo = MeshTopology::Build(mesh);
+    versionSeen = mesh.Version();
+}
+} // namespace
+
+bool EditTool::BeginExtrude(Scene& scene)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh || !CanExtrude())
+        return false;
+
+    FaceExtrusion ex = BuildFaceExtrusion(m_EditMesh, e->mesh->Vertices(), e->mesh->Indices(), m_Selected);
+    if (ex.indices.empty() || ex.capVerts.empty())
+        return false; // empty/stale selection or degenerate region normal
+
+    m_ExtrudeOriginal = e->mesh;
+    m_ExtrudeNormal = ex.normal;
+    m_ExtrudeMoving = ex.capVerts;
+    m_ExtrudeBase.clear();
+    m_ExtrudeBase.reserve(ex.capVerts.size());
+    vec3 anchor(0.0f);
+    for (uint32_t v : ex.capVerts) {
+        m_ExtrudeBase.push_back(ex.vertices[v].position);
+        anchor += ex.vertices[v].position;
+    }
+    m_ExtrudeAnchor = anchor / (float)ex.capVerts.size();
+
+    // Swap in the zero-offset geometry and re-adopt it — the cap faces keep their
+    // triangle ids (walls are appended), so m_Selected still points at the cap.
+    e->mesh = std::make_shared<Mesh>(std::move(ex.vertices), std::move(ex.indices));
+    Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+    m_ExtrudeLastOffset = 0.0f;
+    m_Extruding = true;
+    return true;
+}
+
+void EditTool::UpdateExtrude(Scene& scene, float offset)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh || !m_Extruding)
+        return;
+    auto& verts = e->mesh->MutableVertices();
+    for (size_t i = 0; i < m_ExtrudeMoving.size(); ++i)
+        if (m_ExtrudeMoving[i] < verts.size())
+            verts[m_ExtrudeMoving[i]].position = m_ExtrudeBase[i] + m_ExtrudeNormal * offset;
+    // Once the cap clears the floor it welds into its own groups, so rebuild
+    // topology + the overlay snapshot from the live positions each frame.
+    m_Topology = MeshTopology::Build(*e->mesh);
+    RecomputeNormalsWelded(*e->mesh, m_Topology);
+    e->mesh->RecomputeBounds();
+    e->mesh->UploadVertices();
+    m_EditMesh = BuildEditMesh(*e->mesh);
+    m_MeshVersionSeen = e->mesh->Version(); // our own edit — don't trigger a resync
+    m_ExtrudeLastOffset = offset;
+}
+
+std::unique_ptr<Command> EditTool::EndExtrude(Scene& scene)
+{
+    if (!m_Extruding)
+        return nullptr;
+    m_Extruding = false;
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh) {
+        m_ExtrudeOriginal.reset();
+        return nullptr;
+    }
+
+    float minOffset = 1e-4f * glm::length(m_ExtrudeOriginal->Bounds().max - m_ExtrudeOriginal->Bounds().min);
+    if (std::abs(m_ExtrudeLastOffset) < minOffset) {
+        e->mesh = m_ExtrudeOriginal; // negligible drag: restore, no undo entry
+        Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+        m_ExtrudeOriginal.reset();
+        return nullptr;
+    }
+
+    // Fresh mesh so bounds/normals match the committed cap; one undo step.
+    auto finalMesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+    MeshTopology topo = MeshTopology::Build(*finalMesh);
+    RecomputeNormalsWelded(*finalMesh, topo);
+    finalMesh->RecomputeBounds();
+    finalMesh->UploadVertices();
+    e->mesh = finalMesh;
+    Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+
+    auto original = m_ExtrudeOriginal;
+    m_ExtrudeOriginal.reset();
+    return std::make_unique<MeshSwapCommand>(m_Target, original, finalMesh);
+}
+
+void EditTool::CancelExtrude(Scene& scene)
+{
+    if (!m_Extruding)
+        return;
+    m_Extruding = false;
+    Entity* e = scene.Find(m_Target);
+    if (e && e->mesh && m_ExtrudeOriginal) {
+        e->mesh = m_ExtrudeOriginal;
+        Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+    }
+    m_ExtrudeOriginal.reset();
 }
 
 } // namespace forge

@@ -232,10 +232,13 @@ vec3 SelectionCentroid(const EditMesh& mesh, const std::vector<uint32_t>& vertex
     if (vertexIds.empty())
         return vec3(0.0f);
     vec3 acc(0.0f);
+    uint32_t valid = 0; // skip stale ids in the divisor too, or the mean pulls toward origin
     for (uint32_t v : vertexIds)
-        if (v < mesh.vertices.size())
+        if (v < mesh.vertices.size()) {
             acc += mesh.vertices[v].position;
-    return acc / (float)vertexIds.size();
+            ++valid;
+        }
+    return valid ? acc / (float)valid : vec3(0.0f);
 }
 
 void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mesh,
@@ -250,6 +253,91 @@ void ApplyVertexTransform(std::vector<Vertex>& meshVertices, const EditMesh& mes
             if (raw < meshVertices.size())
                 meshVertices[raw].position = p;
     }
+}
+
+FaceExtrusion BuildFaceExtrusion(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                 const std::vector<uint32_t>& srcIndices,
+                                 const std::vector<uint32_t>& selectedFaces)
+{
+    FaceExtrusion out;
+    if (selectedFaces.empty())
+        return out;
+    uint32_t triCount = (uint32_t)(srcIndices.size() / 3);
+
+    // Region direction: area-weighted sum of the selected faces' raw normals
+    // (the unnormalized cross product is already proportional to area). A flat,
+    // connected selection averages to its plane normal; opposite faces cancel.
+    vec3 nSum(0.0f);
+    for (uint32_t f : selectedFaces) {
+        if (f >= triCount || f >= mesh.faces.size())
+            return {}; // stale selection id
+        const vec3& p0 = srcVertices[srcIndices[f * 3]].position;
+        const vec3& p1 = srcVertices[srcIndices[f * 3 + 1]].position;
+        const vec3& p2 = srcVertices[srcIndices[f * 3 + 2]].position;
+        nSum += glm::cross(p1 - p0, p2 - p0);
+    }
+    float nLen = glm::length(nSum);
+    if (nLen < 1e-12f)
+        return {};
+    out.normal = nSum / nLen;
+
+    // Boundary edges in group space: an edge on exactly one selected face walls;
+    // a shared interior edge (count 2) does not, so the region caps as one piece.
+    std::unordered_map<uint64_t, int> regionEdgeCount;
+    auto edgeKey = [](uint32_t ga, uint32_t gb) {
+        if (ga > gb)
+            std::swap(ga, gb);
+        return ((uint64_t)ga << 32) | gb;
+    };
+    for (uint32_t f : selectedFaces) {
+        const uint32_t* gv = mesh.faces[f].v; // EditVertex (weld-group) ids
+        for (int c = 0; c < 3; ++c)
+            ++regionEdgeCount[edgeKey(gv[c], gv[(c + 1) % 3])];
+    }
+
+    out.vertices = srcVertices;
+    out.indices = srcIndices;
+
+    // Cap: duplicate the region's raw verts and re-point the selected triangles
+    // to them. The originals stay put as the floor (now referenced only by walls).
+    std::unordered_map<uint32_t, uint32_t> capOf;
+    auto capVert = [&](uint32_t raw) {
+        auto [it, inserted] = capOf.try_emplace(raw, (uint32_t)out.vertices.size());
+        if (inserted) {
+            out.vertices.push_back(srcVertices[raw]);
+            out.capVerts.push_back(it->second);
+        }
+        return it->second;
+    };
+    for (uint32_t f : selectedFaces)
+        for (int c = 0; c < 3; ++c)
+            out.indices[f * 3 + c] = capVert(srcIndices[f * 3 + c]);
+
+    // Walls: a fresh quad per boundary edge — bottom shares the floor position,
+    // top slides with the cap, so the rim reads as a hard edge by construction.
+    for (uint32_t f : selectedFaces) {
+        const uint32_t* gv = mesh.faces[f].v;
+        for (int c = 0; c < 3; ++c) {
+            if (regionEdgeCount[edgeKey(gv[c], gv[(c + 1) % 3])] != 1)
+                continue; // interior region edge: no wall
+            uint32_t a = srcIndices[f * 3 + c], b = srcIndices[f * 3 + (c + 1) % 3];
+            uint32_t bottomA = (uint32_t)out.vertices.size();
+            out.vertices.push_back(srcVertices[a]);
+            uint32_t bottomB = (uint32_t)out.vertices.size();
+            out.vertices.push_back(srcVertices[b]);
+            uint32_t topA = (uint32_t)out.vertices.size();
+            out.vertices.push_back(srcVertices[a]);
+            uint32_t topB = (uint32_t)out.vertices.size();
+            out.vertices.push_back(srcVertices[b]);
+            out.capVerts.push_back(topA);
+            out.capVerts.push_back(topB);
+            // Matches the source edge's winding (region on the left) so the wall
+            // faces outward for a positive offset; a negative offset flips it
+            // into the cavity automatically since the top positions carry the sign.
+            out.indices.insert(out.indices.end(), {bottomA, bottomB, topB, bottomA, topB, topA});
+        }
+    }
+    return out;
 }
 
 } // namespace forge

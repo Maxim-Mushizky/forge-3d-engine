@@ -24,10 +24,10 @@ void AddQuad(std::vector<Vertex>& v, std::vector<uint32_t>& idx, vec3 a, vec3 b,
     idx.insert(idx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
 }
 
-EditMesh BuildCube()
+// Raw cube geometry: faces in order +X(tris 0,1) -X(2,3) +Y(4,5) -Y(6,7)
+// +Z(8,9) -Z(10,11), each quad split on the c0-c2 diagonal.
+void BuildCubeRaw(std::vector<Vertex>& v, std::vector<uint32_t>& idx)
 {
-    std::vector<Vertex> v;
-    std::vector<uint32_t> idx;
     const float h = 0.5f;
     AddQuad(v, idx, {h, -h, -h}, {h, h, -h}, {h, h, h}, {h, -h, h});     // +X
     AddQuad(v, idx, {-h, -h, h}, {-h, h, h}, {-h, h, -h}, {-h, -h, -h}); // -X
@@ -35,6 +35,13 @@ EditMesh BuildCube()
     AddQuad(v, idx, {-h, -h, h}, {-h, -h, -h}, {h, -h, -h}, {h, -h, h}); // -Y
     AddQuad(v, idx, {-h, -h, h}, {h, -h, h}, {h, h, h}, {-h, h, h});     // +Z
     AddQuad(v, idx, {h, -h, -h}, {-h, -h, -h}, {-h, h, -h}, {h, h, -h}); // -Z
+}
+
+EditMesh BuildCube()
+{
+    std::vector<Vertex> v;
+    std::vector<uint32_t> idx;
+    BuildCubeRaw(v, idx);
     return BuildEditMesh(v, idx);
 }
 
@@ -182,6 +189,11 @@ void RunEditMeshTests()
         vec3 c = SelectionCentroid(m, all);
         CHECK(ApproxEq(c.x, 0.0f) && ApproxEq(c.y, 0.0f) && ApproxEq(c.z, 0.0f)); // unit cube centered
         CHECK(ApproxEq(SelectionCentroid(m, {}).x, 0.0f)); // empty -> origin
+        // Stale ids are skipped in the divisor too: {0, bogus} == just vertex 0.
+        vec3 v0 = m.vertices[0].position;
+        vec3 mixed = SelectionCentroid(m, {0, 999999});
+        CHECK(ApproxEq(mixed.x, v0.x) && ApproxEq(mixed.y, v0.y) && ApproxEq(mixed.z, v0.z));
+        CHECK(ApproxEq(SelectionCentroid(m, {999999}).x, 0.0f)); // all stale -> origin
     }
 
     // --- ApplyVertexTransform: writes all rawVerts of a group, leaves rest ----
@@ -218,6 +230,47 @@ void RunEditMeshTests()
         uint32_t other = (v == 1) ? 2 : 1;
         for (uint32_t raw : m.vertices[other].rawVerts)
             CHECK(ApproxEq(verts[raw].position.x, m.vertices[other].position.x));
+    }
+
+    // --- BuildFaceExtrusion: one cube face -> cap + 4 walls, diagonal has none -
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+
+        // +X face = triangles 0,1 (the two halves of one quad).
+        FaceExtrusion ex = BuildFaceExtrusion(m, verts, idx, {0, 1});
+        CHECK(!ex.indices.empty());
+        // Region normal points +X.
+        CHECK(ApproxEq(ex.normal.x, 1.0f) && ApproxEq(ex.normal.y, 0.0f) && ApproxEq(ex.normal.z, 0.0f));
+        // 4 cap corners + 2 wall tops x 4 boundary edges = 12 sliding verts.
+        CHECK(ex.capVerts.size() == 12);
+        // 24 source + 4 cap + 4 walls x 4 verts = 44 verts.
+        CHECK(ex.vertices.size() == 44);
+        // 36 source + 4 walls x 6 = 60 indices (20 tris). The shared quad diagonal
+        // is an interior region edge, so it grows no wall (4 walls, not 5).
+        CHECK(ex.indices.size() == 60);
+
+        // Slide the cap out and confirm the re-pointed face triangles followed.
+        const float off = 0.5f;
+        for (uint32_t v : ex.capVerts)
+            ex.vertices[v].position += ex.normal * off;
+        for (int c = 0; c < 6; ++c) // tris 0,1 corners all sit on the raised cap
+            CHECK(ApproxEq(ex.vertices[ex.indices[c]].position.x, 1.0f));
+        // A floor corner (an original +X vert, now only walled) stayed put.
+        CHECK(ApproxEq(verts[idx[0]].position.x, 0.5f));
+    }
+
+    // --- BuildFaceExtrusion: degenerate / empty selections return nothing ------
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+        CHECK(BuildFaceExtrusion(m, verts, idx, {}).indices.empty());        // empty selection
+        CHECK(BuildFaceExtrusion(m, verts, idx, {0, 2}).indices.empty());    // +X & -X normals cancel
+        CHECK(BuildFaceExtrusion(m, verts, idx, {999}).indices.empty());     // stale face id
     }
 }
 
