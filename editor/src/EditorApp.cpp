@@ -398,8 +398,14 @@ void EditorApp::HandleShortcuts()
     else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G))
         GroupSelection();
 
-    if (ImGui::IsKeyPressed(ImGuiKey_Tab))
-        ToggleSculptMode();
+    // Tab toggles the two mesh modes: bare = sculpt, Shift = edit. Both are
+    // mutually exclusive and Esc-exit, so they share the Tab family.
+    if (ImGui::IsKeyPressed(ImGuiKey_Tab)) {
+        if (io.KeyShift)
+            ToggleEditMode();
+        else
+            ToggleSculptMode();
+    }
     if (m_Sculpt.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape))
         m_Sculpt.Exit();
     if (m_Edit.Active() && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
@@ -1582,7 +1588,7 @@ void EditorApp::DrawSidebar()
                 ToggleEditMode();
             ui::PopAccentButton();
         } else {
-            if (ImGui::Button("Edit Mode", ImVec2(-1, 32)))
+            if (ImGui::Button("Edit Mode (Shift+Tab)", ImVec2(-1, 32)))
                 ToggleEditMode();
             ImGui::SetItemTooltip("Edit the selected mesh by vertices, edges and faces");
         }
