@@ -397,6 +397,15 @@ void RunEditMeshTests()
         CHECK(r.vertices.size() == 13);
         CHECK(r.faces.size() == 22);
         CHECK(isWatertight(r));
+
+        // Every sub-triangle keeps outward winding (cube centred at origin), so
+        // the 1->4 split's corner triangles aren't normal-inverted.
+        for (size_t t = 0; t + 2 < sd.indices.size(); t += 3) {
+            const vec3& p0 = sd.vertices[sd.indices[t]].position;
+            const vec3& p1 = sd.vertices[sd.indices[t + 1]].position;
+            const vec3& p2 = sd.vertices[sd.indices[t + 2]].position;
+            CHECK(glm::dot(glm::cross(p1 - p0, p2 - p0), (p0 + p1 + p2) / 3.0f) > 0.0f);
+        }
     }
 
     // --- BuildEdgeSubdivision: split one cube edge, both incident faces split --
