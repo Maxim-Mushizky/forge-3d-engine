@@ -272,6 +272,94 @@ void RunEditMeshTests()
         CHECK(BuildFaceExtrusion(m, verts, idx, {0, 2}).indices.empty());    // +X & -X normals cancel
         CHECK(BuildFaceExtrusion(m, verts, idx, {999}).indices.empty());     // stale face id
     }
+
+    // --- BuildEdgeExtrusion: a quad's boundary edge -> one bridging quad -------
+    {
+        // Single quad in the XY plane (+Z normal), two tris on the 0-2 diagonal.
+        std::vector<Vertex> verts = {{{0.0f, 0.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{1.0f, 0.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{1.0f, 1.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{0.0f, 1.0f, 0.0f}, vec3(0.0f), vec2(0.0f)}};
+        std::vector<uint32_t> idx = {0, 1, 2, 0, 2, 3};
+        EditMesh m = BuildEditMesh(verts, idx);
+
+        // Bottom edge g0-g1; it belongs to only tri0, so it's a boundary edge.
+        const EditEdge* e01 = FindEdge(m, 0, 1);
+        CHECK(e01 != nullptr);
+        CHECK(e01->kind == EdgeKind::Boundary);
+        uint32_t eid = (uint32_t)(e01 - m.edges.data());
+
+        EdgeExtrusion ex = BuildEdgeExtrusion(m, verts, idx, {eid});
+        CHECK(!ex.indices.empty());
+        // In-plane, perpendicular to the edge, away from the quad interior: -Y.
+        CHECK(ApproxEq(ex.normal.x, 0.0f) && ApproxEq(ex.normal.y, -1.0f) && ApproxEq(ex.normal.z, 0.0f));
+        CHECK(ex.movingVerts.size() == 2);          // the new top edge
+        CHECK(ex.vertices.size() == 4 + 4);         // 2 bottom + 2 top duplicates
+        CHECK(ex.indices.size() == 6 + 6);          // one bridging quad (2 tris)
+        CHECK(ex.newEdges.size() == 1);
+
+        const float off = 0.5f;
+        for (uint32_t v : ex.movingVerts)
+            ex.vertices[v].position += ex.normal * off;
+        for (uint32_t v : ex.movingVerts) // the pulled edge sits at y = -0.5
+            CHECK(ApproxEq(ex.vertices[v].position.y, -0.5f));
+    }
+
+    // --- BuildEdgeExtrusion: connected boundary edges pull as one strip --------
+    {
+        std::vector<Vertex> verts = {{{0.0f, 0.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{1.0f, 0.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{1.0f, 1.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{0.0f, 1.0f, 0.0f}, vec3(0.0f), vec2(0.0f)}};
+        std::vector<uint32_t> idx = {0, 1, 2, 0, 2, 3};
+        EditMesh m = BuildEditMesh(verts, idx);
+        uint32_t e01 = (uint32_t)(FindEdge(m, 0, 1) - m.edges.data());
+        uint32_t e12 = (uint32_t)(FindEdge(m, 1, 2) - m.edges.data());
+
+        EdgeExtrusion ex = BuildEdgeExtrusion(m, verts, idx, {e01, e12});
+        // Shared corner g1 dedups: 3 top verts (not 4), 3 bottoms, 2 quads.
+        CHECK(ex.movingVerts.size() == 3);
+        CHECK(ex.newEdges.size() == 2);
+        CHECK(ex.indices.size() == 6 + 12); // two bridging quads
+    }
+
+    // --- BuildEdgeExtrusion: a cube (manifold) edge lifts a ridge --------------
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+        auto groupAt = [&](vec3 p) {
+            for (uint32_t g = 0; g < m.vertices.size(); ++g)
+                if (ApproxEq(m.vertices[g].position.x, p.x) && ApproxEq(m.vertices[g].position.y, p.y) &&
+                    ApproxEq(m.vertices[g].position.z, p.z))
+                    return g;
+            return UINT32_MAX;
+        };
+        // Vertical edge shared by the +X and +Y faces.
+        uint32_t ga = groupAt({0.5f, 0.5f, 0.5f}), gb = groupAt({0.5f, 0.5f, -0.5f});
+        CHECK(ga != UINT32_MAX && gb != UINT32_MAX);
+        const EditEdge* edge = FindEdge(m, ga, gb);
+        CHECK(edge != nullptr && edge->kind == EdgeKind::Manifold);
+        uint32_t eid = (uint32_t)(edge - m.edges.data());
+
+        EdgeExtrusion ex = BuildEdgeExtrusion(m, verts, idx, {eid});
+        // Ridge: averaged +X and +Y normals -> diagonal (0.707, 0.707, 0).
+        CHECK(ApproxEq(ex.normal.x, 0.70710678f) && ApproxEq(ex.normal.y, 0.70710678f) &&
+              ApproxEq(ex.normal.z, 0.0f));
+        CHECK(ex.movingVerts.size() == 2);
+        CHECK(ex.indices.size() == 36 + 6); // one bridging quad on top of the cube
+    }
+
+    // --- BuildEdgeExtrusion: empty / stale selections return nothing -----------
+    {
+        std::vector<Vertex> verts;
+        std::vector<uint32_t> idx;
+        BuildCubeRaw(verts, idx);
+        EditMesh m = BuildEditMesh(verts, idx);
+        CHECK(BuildEdgeExtrusion(m, verts, idx, {}).indices.empty());    // empty selection
+        CHECK(BuildEdgeExtrusion(m, verts, idx, {999}).indices.empty()); // stale edge id
+    }
 }
 
 } // namespace forge::test

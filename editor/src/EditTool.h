@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace forge {
@@ -60,13 +61,18 @@ public:
     void ApplyTransform(Scene& scene, const mat4& objectXform);
     std::unique_ptr<Command> EndTransform(Scene& scene);
 
-    // --- face extrude (T3, #63) ----------------------------------------------
-    // Push-pull the selected faces along their averaged normal. The editor arms
-    // it with BeginExtrude (which swaps in the cap+wall geometry at zero offset
-    // and stays in edit mode), drives UpdateExtrude as the mouse slides, then
-    // commits with EndExtrude (one MeshSwapCommand, cap left selected) or aborts
-    // with CancelExtrude. Only Face mode with a live selection can extrude.
-    bool CanExtrude() const { return m_Active && m_Mode == Element::Face && !m_Selected.empty() && !m_Extruding; }
+    // --- extrude (T3 faces #63, T4 edges #64) --------------------------------
+    // Push-pull the selected faces (cap + walls) or pull the selected edges (new
+    // bridging quads) along a computed normal. The editor arms it with
+    // BeginExtrude (which swaps in the zero-offset geometry and stays in edit
+    // mode), drives UpdateExtrude as the mouse slides, then commits with
+    // EndExtrude (one MeshSwapCommand, the new geometry left selected) or aborts
+    // with CancelExtrude. Face or Edge mode with a live selection can extrude.
+    bool CanExtrude() const
+    {
+        return m_Active && (m_Mode == Element::Face || m_Mode == Element::Edge) && !m_Selected.empty() &&
+               !m_Extruding;
+    }
     bool Extruding() const { return m_Extruding; }
     // Object-space anchor (cap centroid at offset 0) and slide direction — the
     // editor maps these to world space to build the drag line.
@@ -98,8 +104,12 @@ private:
     std::vector<uint32_t> m_ExtrudeMoving;   // raw vert indices that slide (cap + wall tops)
     std::vector<vec3> m_ExtrudeBase;         // their object-space positions at offset 0 (parallel)
     vec3 m_ExtrudeNormal{0.0f, 1.0f, 0.0f};  // object-space slide direction
-    vec3 m_ExtrudeAnchor{0.0f};              // cap centroid at offset 0 (drag-line anchor)
+    vec3 m_ExtrudeAnchor{0.0f};              // new-geometry centroid at offset 0 (drag-line anchor)
     float m_ExtrudeLastOffset = 0.0f;
+    // Edge extrude (#64) only: new top-edge endpoint pairs (raw vert indices),
+    // remapped to EditEdge ids after commit so the new edges stay selected.
+    // Empty for a face extrude, whose cap keeps its stable triangle ids.
+    std::vector<std::pair<uint32_t, uint32_t>> m_ExtrudeNewEdges;
 };
 
 } // namespace forge

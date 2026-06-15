@@ -2410,17 +2410,20 @@ void EditorApp::DrawViewport()
             elemBtn("Edge", EditTool::Element::Edge, "Select and edit edges");
             ImGui::SameLine();
             elemBtn("Face", EditTool::Element::Face, "Select and edit faces");
-            // Extrude (T3): push-pull the selected faces. Only in Face mode; armed
-            // it stays accented and owns the viewport until LMB commits / Esc cancels.
-            if (m_Edit.Mode() == EditTool::Element::Face) {
+            // Extrude (T3 faces / T4 edges): in Face mode push-pull the selection,
+            // in Edge mode pull new quads. Armed it stays accented and owns the
+            // viewport until LMB commits / Esc cancels.
+            bool extrudeMode = m_Edit.Mode() == EditTool::Element::Face ||
+                               m_Edit.Mode() == EditTool::Element::Edge;
+            if (extrudeMode) {
                 ImGui::SameLine();
                 bool extruding = m_Edit.Extruding();
                 if (extruding)
                     ui::PushAccentButton();
                 ImGui::BeginDisabled(!m_Edit.CanExtrude() && !extruding);
                 if (ImGui::Button("Extrude") && m_Edit.BeginExtrude(m_Scene)) {
-                    // Map the object-space slide line to world for the drag. The
-                    // cap travels along the object-space normal, so its world
+                    // Map the object-space slide line to world for the drag. The new
+                    // geometry travels along the object-space normal, so its world
                     // direction and the units-per-offset scale both come from the
                     // same transformed displacement (consistent under any scale).
                     mat4 world = m_Scene.WorldTransform(m_Edit.Target());
@@ -2432,8 +2435,11 @@ void EditorApp::DrawViewport()
                 ImGui::EndDisabled();
                 if (extruding)
                     ui::PopAccentButton();
-                ImGui::SetItemTooltip("Push/pull the selected faces along their normal\n"
-                                      "Move the cursor to set depth, click to commit, Esc cancels");
+                ImGui::SetItemTooltip(m_Edit.Mode() == EditTool::Element::Face
+                                          ? "Push/pull the selected faces along their normal\n"
+                                            "Move the cursor to set depth, click to commit, Esc cancels"
+                                          : "Pull the selected edges into new faces\n"
+                                            "Move the cursor to set depth, click to commit, Esc cancels");
             }
             ImGui::End();
         }
