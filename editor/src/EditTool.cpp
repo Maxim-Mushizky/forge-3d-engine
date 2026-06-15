@@ -99,6 +99,7 @@ void EditTool::Exit()
     m_ExtrudeOriginal.reset();
     m_ExtrudeMoving.clear();
     m_ExtrudeBase.clear();
+    m_ExtrudeNewEdges.clear();
 }
 
 void EditTool::DrawOverlay(Scene& scene, const EditorCamera& camera, const vec2& viewportPos,
@@ -377,6 +378,39 @@ void Readopt(EditMesh& edit, MeshTopology& topo, Mesh*& guard, uint64_t& version
     topo = MeshTopology::Build(mesh);
     versionSeen = mesh.Version();
 }
+
+// After the rebuild, map each new top-edge vertex pair (raw indices into the
+// committed mesh) back to its EditEdge id, so the freshly pulled edges stay
+// selected for chaining. Edge ids aren't stable across a topology change, so
+// this re-derives them by weld group.
+std::vector<uint32_t> RemapNewEdges(const EditMesh& em,
+                                    const std::vector<std::pair<uint32_t, uint32_t>>& newEdges)
+{
+    size_t maxRaw = 0;
+    for (const EditVertex& v : em.vertices)
+        for (uint32_t r : v.rawVerts)
+            maxRaw = std::max(maxRaw, (size_t)r);
+    std::vector<uint32_t> rawToGroup(maxRaw + 1, UINT32_MAX);
+    for (uint32_t g = 0; g < em.vertices.size(); ++g)
+        for (uint32_t r : em.vertices[g].rawVerts)
+            rawToGroup[r] = g;
+
+    std::vector<uint32_t> sel;
+    for (auto [ra, rb] : newEdges) {
+        if (ra >= rawToGroup.size() || rb >= rawToGroup.size())
+            continue;
+        uint32_t ga = rawToGroup[ra], gb = rawToGroup[rb];
+        if (ga == UINT32_MAX || gb == UINT32_MAX)
+            continue;
+        const EditEdge* edge = FindEdge(em, ga, gb);
+        if (!edge)
+            continue;
+        uint32_t id = (uint32_t)(edge - em.edges.data());
+        if (std::find(sel.begin(), sel.end(), id) == sel.end())
+            sel.push_back(id);
+    }
+    return sel;
+}
 } // namespace
 
 bool EditTool::BeginExtrude(Scene& scene)
@@ -385,25 +419,47 @@ bool EditTool::BeginExtrude(Scene& scene)
     if (!e || !e->mesh || !CanExtrude())
         return false;
 
-    FaceExtrusion ex = BuildFaceExtrusion(m_EditMesh, e->mesh->Vertices(), e->mesh->Indices(), m_Selected);
-    if (ex.indices.empty() || ex.capVerts.empty())
-        return false; // empty/stale selection or degenerate region normal
+    // Build the zero-offset geometry for the active element type. Both kernels
+    // return a moving-vert set + slide direction; the rest of the drag is shared.
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> indices, moving;
+    vec3 normal;
+    m_ExtrudeNewEdges.clear();
+    if (m_Mode == Element::Face) {
+        FaceExtrusion ex = BuildFaceExtrusion(m_EditMesh, e->mesh->Vertices(), e->mesh->Indices(), m_Selected);
+        if (ex.indices.empty() || ex.capVerts.empty())
+            return false; // empty/stale selection or degenerate region normal
+        verts = std::move(ex.vertices);
+        indices = std::move(ex.indices);
+        moving = std::move(ex.capVerts);
+        normal = ex.normal;
+    } else { // Edge
+        EdgeExtrusion ex = BuildEdgeExtrusion(m_EditMesh, e->mesh->Vertices(), e->mesh->Indices(), m_Selected);
+        if (ex.indices.empty() || ex.movingVerts.empty())
+            return false;
+        verts = std::move(ex.vertices);
+        indices = std::move(ex.indices);
+        moving = std::move(ex.movingVerts);
+        normal = ex.normal;
+        m_ExtrudeNewEdges = std::move(ex.newEdges); // remapped to edge ids on commit
+    }
 
     m_ExtrudeOriginal = e->mesh;
-    m_ExtrudeNormal = ex.normal;
-    m_ExtrudeMoving = ex.capVerts;
+    m_ExtrudeNormal = normal;
+    m_ExtrudeMoving = std::move(moving);
     m_ExtrudeBase.clear();
-    m_ExtrudeBase.reserve(ex.capVerts.size());
+    m_ExtrudeBase.reserve(m_ExtrudeMoving.size());
     vec3 anchor(0.0f);
-    for (uint32_t v : ex.capVerts) {
-        m_ExtrudeBase.push_back(ex.vertices[v].position);
-        anchor += ex.vertices[v].position;
+    for (uint32_t v : m_ExtrudeMoving) {
+        m_ExtrudeBase.push_back(verts[v].position);
+        anchor += verts[v].position;
     }
-    m_ExtrudeAnchor = anchor / (float)ex.capVerts.size();
+    m_ExtrudeAnchor = anchor / (float)m_ExtrudeMoving.size();
 
-    // Swap in the zero-offset geometry and re-adopt it — the cap faces keep their
-    // triangle ids (walls are appended), so m_Selected still points at the cap.
-    e->mesh = std::make_shared<Mesh>(std::move(ex.vertices), std::move(ex.indices));
+    // Swap in the zero-offset geometry and re-adopt it. A face cap keeps its
+    // triangle ids so m_Selected still points at it; a new edge's id isn't stable,
+    // so EndExtrude remaps the selection from m_ExtrudeNewEdges.
+    e->mesh = std::make_shared<Mesh>(std::move(verts), std::move(indices));
     Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
     m_ExtrudeLastOffset = 0.0f;
     m_Extruding = true;
@@ -445,11 +501,12 @@ std::unique_ptr<Command> EditTool::EndExtrude(Scene& scene)
     if (std::abs(m_ExtrudeLastOffset) < minOffset) {
         e->mesh = m_ExtrudeOriginal; // negligible drag: restore, no undo entry
         Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+        m_ExtrudeNewEdges.clear(); // original mesh restored — existing selection stays valid
         m_ExtrudeOriginal.reset();
         return nullptr;
     }
 
-    // Fresh mesh so bounds/normals match the committed cap; one undo step.
+    // Fresh mesh so bounds/normals match the committed geometry; one undo step.
     auto finalMesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
     MeshTopology topo = MeshTopology::Build(*finalMesh);
     RecomputeNormalsWelded(*finalMesh, topo);
@@ -457,6 +514,15 @@ std::unique_ptr<Command> EditTool::EndExtrude(Scene& scene)
     finalMesh->UploadVertices();
     e->mesh = finalMesh;
     Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+
+    // Edge extrude: face/tri ids are stable but edge ids aren't, so reselect the
+    // new edges by weld group. (Face extrude leaves m_ExtrudeNewEdges empty.)
+    if (!m_ExtrudeNewEdges.empty()) {
+        std::vector<uint32_t> sel = RemapNewEdges(m_EditMesh, m_ExtrudeNewEdges);
+        if (!sel.empty())
+            m_Selected = std::move(sel);
+        m_ExtrudeNewEdges.clear();
+    }
 
     auto original = m_ExtrudeOriginal;
     m_ExtrudeOriginal.reset();
@@ -473,6 +539,7 @@ void EditTool::CancelExtrude(Scene& scene)
         e->mesh = m_ExtrudeOriginal;
         Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
     }
+    m_ExtrudeNewEdges.clear();
     m_ExtrudeOriginal.reset();
 }
 

@@ -340,4 +340,93 @@ FaceExtrusion BuildFaceExtrusion(const EditMesh& mesh, const std::vector<Vertex>
     return out;
 }
 
+EdgeExtrusion BuildEdgeExtrusion(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                 const std::vector<uint32_t>& srcIndices,
+                                 const std::vector<uint32_t>& selectedEdges)
+{
+    EdgeExtrusion out;
+    (void)srcIndices; // edges build from EditMesh group reps, not raw triangles
+    if (selectedEdges.empty())
+        return out;
+
+    // Per-edge slide direction, summed: a boundary edge extends in its face's
+    // plane (perpendicular to the edge, away from the face interior); a manifold
+    // edge lifts along the two faces' averaged normal.
+    vec3 dirSum(0.0f);
+    for (uint32_t id : selectedEdges) {
+        if (id >= mesh.edges.size())
+            return {}; // stale selection id
+        const EditEdge& E = mesh.edges[id];
+        vec3 edgeVec = mesh.vertices[E.v1].position - mesh.vertices[E.v0].position;
+        if (E.faces.size() == 1) {
+            const EditFace& f = mesh.faces[E.faces[0]];
+            vec3 perp = glm::cross(f.normal, edgeVec);
+            if (glm::length(perp) < 1e-12f)
+                continue;
+            perp = glm::normalize(perp);
+            // Flip so it points away from the face's third (off-edge) corner.
+            uint32_t opp = f.v[0];
+            for (uint32_t c = 0; c < 3; ++c)
+                if (f.v[c] != E.v0 && f.v[c] != E.v1)
+                    opp = f.v[c];
+            vec3 mid = 0.5f * (mesh.vertices[E.v0].position + mesh.vertices[E.v1].position);
+            if (glm::dot(perp, mesh.vertices[opp].position - mid) > 0.0f)
+                perp = -perp;
+            dirSum += perp;
+        } else if (E.faces.size() >= 2) {
+            dirSum += glm::normalize(mesh.faces[E.faces[0]].normal + mesh.faces[E.faces[1]].normal);
+        }
+        // A floating edge (no faces) has no orientation — it contributes nothing.
+    }
+    float dlen = glm::length(dirSum);
+    if (dlen < 1e-12f)
+        return {}; // no orientable edge, or directions cancelled
+    out.normal = dirSum / dlen;
+
+    out.vertices = srcVertices;
+    out.indices = srcIndices;
+
+    // One duplicated vertex per touched group, deduped so a connected selection
+    // shares verts and pulls as a strip. Bottom verts sit on the source edge
+    // (welded back to the surface by position); top verts slide.
+    std::unordered_map<uint32_t, uint32_t> botOf, topOf;
+    auto dupVert = [&](std::unordered_map<uint32_t, uint32_t>& cache, uint32_t group, bool moving) {
+        auto [it, inserted] = cache.try_emplace(group, (uint32_t)out.vertices.size());
+        if (inserted) {
+            // Copy attributes from a representative raw vert, then pin the group rep.
+            Vertex v = srcVertices[mesh.vertices[group].rawVerts[0]];
+            v.position = mesh.vertices[group].position;
+            out.vertices.push_back(v);
+            if (moving)
+                out.movingVerts.push_back(it->second);
+        }
+        return it->second;
+    };
+
+    for (uint32_t id : selectedEdges) {
+        const EditEdge& E = mesh.edges[id];
+        // Direct the edge as its incident face winds (region on a consistent side)
+        // so the bridging quad faces outward like the rest of the surface.
+        uint32_t a = E.v0, b = E.v1;
+        if (!E.faces.empty()) {
+            const EditFace& f = mesh.faces[E.faces[0]];
+            for (uint32_t c = 0; c < 3; ++c) {
+                uint32_t u = f.v[c], w = f.v[(c + 1) % 3];
+                if ((u == E.v0 && w == E.v1) || (u == E.v1 && w == E.v0)) {
+                    a = u;
+                    b = w;
+                    break;
+                }
+            }
+        }
+        uint32_t botA = dupVert(botOf, a, false), botB = dupVert(botOf, b, false);
+        uint32_t topA = dupVert(topOf, a, true), topB = dupVert(topOf, b, true);
+        out.newEdges.emplace_back(topA, topB);
+        // Same winding pattern as the face-extrude walls; sign of the offset
+        // carries the orientation, so push and pull both stay consistent.
+        out.indices.insert(out.indices.end(), {botA, botB, topB, botA, topB, topA});
+    }
+    return out;
+}
+
 } // namespace forge

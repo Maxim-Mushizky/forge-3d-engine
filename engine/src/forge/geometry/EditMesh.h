@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace forge {
@@ -133,5 +134,34 @@ struct FaceExtrusion {
 FaceExtrusion BuildFaceExtrusion(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
                                  const std::vector<uint32_t>& srcIndices,
                                  const std::vector<uint32_t>& selectedFaces);
+
+// --- edge extrude (#64) ---------------------------------------------------
+// Pull selected edges to grow new quad faces — the edge sibling of the face
+// extrude. The original edge stays on the surface; a fresh edge is duplicated
+// from it and the two are bridged by a quad.
+
+// New geometry for an edge-extrude, built at zero offset (the new edge coincides
+// with the source edge). The editor slides `movingVerts` along `normal`.
+struct EdgeExtrusion {
+    std::vector<Vertex> vertices;   // source verts + duplicated bottom/top edge verts
+    std::vector<uint32_t> indices;  // source tris + one bridging quad (2 tris) per selected edge
+    std::vector<uint32_t> movingVerts; // indices into `vertices` that slide: the new (top) edge
+    vec3 normal{0.0f, 1.0f, 0.0f};  // object-space slide direction (normalized)
+    // New top-edge endpoint pairs (indices into `vertices`). The editor maps these
+    // to EditEdge ids after the snapshot rebuild to keep the new edges selected.
+    std::vector<std::pair<uint32_t, uint32_t>> newEdges;
+};
+
+// Build pull geometry for an edge selection. Each selected edge spawns a fresh
+// edge (duplicated at zero offset) bridged to the original by a quad; edges that
+// share an endpoint share the duplicated vertex, so a connected selection pulls
+// as one strip. The slide direction is per-edge: a boundary edge (one incident
+// face) extends in that face's plane, away from the face; a manifold edge (two
+// faces) lifts along their averaged normal (a ridge); contributions are summed
+// and normalized. selectedEdges are EditEdge ids. Returns an empty result if the
+// selection is empty, refers to a stale id, or the summed direction is degenerate.
+EdgeExtrusion BuildEdgeExtrusion(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                 const std::vector<uint32_t>& srcIndices,
+                                 const std::vector<uint32_t>& selectedEdges);
 
 } // namespace forge
