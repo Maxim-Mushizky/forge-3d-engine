@@ -5,6 +5,7 @@
 #include "EditTool.h"
 #include "ExtrudeTool.h"
 #include "SculptTool.h"
+#include "Toasts.h"
 
 #include <forge/geometry/MeshBoolean.h>
 #include <forge/platform/Window.h>
@@ -40,6 +41,8 @@ private:
     void DrawHierarchy();
     void DrawInspector();
     void DrawViewport();
+    void DrawHistorySection(); // undo-history list inside the sidebar (#23)
+    void DrawHelpOverlay();    // shortcut cheat-sheet, toggled with '?' (#10)
     void BuildDockLayoutIfNeeded(unsigned int dockspaceID);
 
     void SpawnPrimitive(const char* baseName, const std::shared_ptr<Mesh>& mesh, float yOffset);
@@ -128,6 +131,8 @@ private:
     SculptTool m_Sculpt;
     EditTool m_Edit;
     ExtrudeTool m_Extrude;
+    ToastManager m_Toasts;     // transient success/error notifications (#6)
+    bool m_ShowHelp = false;   // shortcut cheat-sheet overlay (#10)
     GizmoOp m_GizmoOp = GizmoOp::Translate;
     bool m_GizmoWasUsing = false;
     // Transform snapping (#5): quantize gizmo drags and inspector fields to

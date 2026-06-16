@@ -14,6 +14,9 @@ public:
     virtual ~Command() = default;
     virtual void Undo(Scene& scene) = 0;
     virtual void Redo(Scene& scene) = 0;
+    // Short label for the undo-history panel (#23). Coarse per command type —
+    // commands don't carry the originating action's semantics.
+    virtual const char* Name() const { return "Edit"; }
 };
 
 class AddEntityCommand : public Command {
@@ -21,6 +24,7 @@ public:
     explicit AddEntityCommand(Entity snapshot) : m_Entity(std::move(snapshot)) {}
     void Undo(Scene& scene) override { scene.Remove(m_Entity.id); }
     void Redo(Scene& scene) override { scene.Insert(m_Entity); }
+    const char* Name() const override { return "Add object"; }
 
 private:
     Entity m_Entity;
@@ -31,6 +35,7 @@ public:
     explicit DeleteEntityCommand(Entity snapshot) : m_Entity(std::move(snapshot)) {}
     void Undo(Scene& scene) override { scene.Insert(m_Entity); }
     void Redo(Scene& scene) override { scene.Remove(m_Entity.id); }
+    const char* Name() const override { return "Delete object"; }
 
 private:
     Entity m_Entity;
@@ -43,6 +48,7 @@ public:
         : m_Before(std::move(before)), m_After(std::move(after)) {}
     void Undo(Scene& scene) override { scene.Replace(m_Before); }
     void Redo(Scene& scene) override { scene.Replace(m_After); }
+    const char* Name() const override { return "Transform / edit"; }
 
 private:
     Entity m_Before, m_After;
@@ -62,6 +68,7 @@ public:
 
     void Undo(Scene& scene) override { Apply(scene, m_Before); }
     void Redo(Scene& scene) override { Apply(scene, m_After); }
+    const char* Name() const override { return "Edit vertices"; }
 
 private:
     void Apply(Scene& scene, const std::vector<Vertex>& values)
@@ -94,6 +101,7 @@ public:
 
     void Undo(Scene& scene) override { Apply(scene, m_Before); }
     void Redo(Scene& scene) override { Apply(scene, m_After); }
+    const char* Name() const override { return "Mesh op"; }
 
 private:
     void Apply(Scene& scene, const std::shared_ptr<Mesh>& mesh)
@@ -122,6 +130,7 @@ public:
         for (auto& c : m_Commands)
             c->Redo(scene);
     }
+    const char* Name() const override { return "Batch"; }
 
 private:
     std::vector<std::unique_ptr<Command>> m_Commands;
@@ -170,6 +179,11 @@ public:
     // dirty tracking without hooking every call site. (Undoing back to the
     // saved state still reads as dirty — a harmless false positive.)
     uint64_t Revision() const { return m_Revision; }
+
+    // For the undo-history panel (#23): applied steps oldest->newest (back = the
+    // current state) and the pending redo steps (back = the next to redo).
+    const std::vector<std::unique_ptr<Command>>& UndoEntries() const { return m_UndoStack; }
+    const std::vector<std::unique_ptr<Command>>& RedoEntries() const { return m_RedoStack; }
 
 private:
     std::vector<std::unique_ptr<Command>> m_UndoStack;

@@ -39,6 +39,13 @@ struct ForgeGifWriter {
 
 namespace forge {
 
+// Leaf name of a path, for toast text ("Saved duck.forge" rather than the
+// full absolute path).
+static std::string FileName(const std::string& path)
+{
+    return std::filesystem::path(path).filename().string();
+}
+
 EditorApp::EditorApp()
     : m_Window(1600, 900, "Forge Editor"),
       m_Framebuffer(1280, 720, /*hdr=*/true),
@@ -134,6 +141,8 @@ void EditorApp::Run()
         DrawHierarchy();
         DrawInspector();
         DrawViewport(); // updates the camera
+        DrawHelpOverlay();
+        m_Toasts.Draw();
         ImGui::Render();
 
         // Raster while sculpting: mid-stroke mesh edits would otherwise trigger a
@@ -331,6 +340,11 @@ void EditorApp::HandleShortcuts()
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput)
         return;
+
+    // '?' (Shift+/) toggles the shortcut cheat-sheet. F1 is taken by camera
+    // bookmark recall, so help lives on the conventional '?' key instead.
+    if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Slash))
+        m_ShowHelp = !m_ShowHelp;
 
     if (ImGui::IsKeyPressed(ImGuiKey_W)) m_GizmoOp = GizmoOp::Translate;
     if (ImGui::IsKeyPressed(ImGuiKey_E)) m_GizmoOp = GizmoOp::Rotate;
@@ -825,6 +839,7 @@ void EditorApp::OpenSceneFile(const std::string& path)
     auto fromRecipe = [this](const std::string& r) { return MeshFromRecipe(r); };
     if (!LoadSceneFile(path, m_Scene, extras, fromRecipe)) {
         FORGE_ERROR("Could not open scene: %s", path.c_str());
+        m_Toasts.Push(ToastManager::Kind::Error, "Could not open " + FileName(path));
         return;
     }
     SelectOnly(0);
@@ -834,6 +849,7 @@ void EditorApp::OpenSceneFile(const std::string& path)
     MarkSaved();
     AddRecentFile(path);
     m_LastSceneHash = 0; // force RT re-upload
+    m_Toasts.Push(ToastManager::Kind::Success, "Opened " + FileName(path));
 }
 
 bool EditorApp::SaveScene()
@@ -843,10 +859,12 @@ bool EditorApp::SaveScene()
     auto toRecipe = [this](const Mesh* m) { return MeshRecipe(m); };
     if (!SaveSceneFile(m_ScenePath, m_Scene, BuildExtrasJson(), toRecipe)) {
         FORGE_ERROR("Save failed: %s", m_ScenePath.c_str());
+        m_Toasts.Push(ToastManager::Kind::Error, "Save failed");
         return false;
     }
     MarkSaved();
     AddRecentFile(m_ScenePath);
+    m_Toasts.Push(ToastManager::Kind::Success, "Saved " + FileName(m_ScenePath));
     return true;
 }
 
@@ -1367,8 +1385,10 @@ void EditorApp::ExportStlDialog()
     StlExportResult r = ExportStl(m_Scene, ids, path, m_StlScale);
     if (!r.ok) {
         m_StlStatus = r.error;
+        m_Toasts.Push(ToastManager::Kind::Error, "STL export failed: " + r.error);
         return;
     }
+    m_Toasts.Push(ToastManager::Kind::Success, "Exported " + FileName(path));
     char buf[192];
     if (r.watertight)
         std::snprintf(buf, sizeof(buf), "Exported %u triangles - watertight, print-ready.", r.triangles);
@@ -1812,8 +1832,98 @@ void EditorApp::DrawSidebar()
         ImGui::SetItemTooltip("Render a looping 360-degree spin of your scene\n(path traced - takes a minute)");
     }
 
+    if (Section(m_HeaderFont, "History", false))
+        DrawHistorySection();
+
     DrawTurntableModal();
 
+    ImGui::End();
+}
+
+void EditorApp::DrawHistorySection()
+{
+    const auto& undo = m_Commands.UndoEntries();
+    const auto& redo = m_Commands.RedoEntries();
+    if (undo.empty() && redo.empty()) {
+        ImGui::TextDisabled("Nothing to undo yet");
+        return;
+    }
+
+    // Clicking a row jumps there. Don't mutate the stacks mid-iteration (it would
+    // invalidate `undo`/`redo`); record how far to step and apply after the loop.
+    int undoSteps = 0, redoSteps = 0;
+
+    // Applied steps, oldest -> current (the back of the undo stack is "now").
+    for (size_t i = 0; i < undo.size(); ++i) {
+        bool current = i + 1 == undo.size();
+        ImGui::PushID((int)i);
+        if (ImGui::Selectable(undo[i]->Name(), current) && !current)
+            undoSteps = (int)undo.size() - 1 - (int)i; // undo back to row i
+        ImGui::PopID();
+    }
+    // Pending (redone-away) steps, in forward order — the back of the redo stack
+    // is the next one to redo. Shown dimmed.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    for (size_t k = redo.size(); k-- > 0;) {
+        ImGui::PushID(1000 + (int)k);
+        if (ImGui::Selectable(redo[k]->Name()))
+            redoSteps = (int)redo.size() - (int)k; // redo forward to this row
+        ImGui::PopID();
+    }
+    ImGui::PopStyleColor();
+
+    for (int s = 0; s < undoSteps; ++s)
+        m_Commands.Undo(m_Scene);
+    for (int s = 0; s < redoSteps; ++s)
+        m_Commands.Redo(m_Scene);
+}
+
+void EditorApp::DrawHelpOverlay()
+{
+    if (!m_ShowHelp)
+        return;
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->GetCenter().x, vp->GetCenter().y), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    if (ImGui::Begin("Keyboard Shortcuts (?)", &m_ShowHelp,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        struct Row {
+            const char* keys;
+            const char* desc;
+        };
+        auto group = [](const char* title, std::initializer_list<Row> rows) {
+            ImGui::SeparatorText(title);
+            if (ImGui::BeginTable(title, 2, ImGuiTableFlags_SizingFixedFit)) {
+                for (const Row& r : rows) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextColored(ImVec4(0.94f, 0.58f, 0.22f, 1.0f), "%s", r.keys);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(r.desc);
+                }
+                ImGui::EndTable();
+            }
+        };
+        group("View", {{"Alt+LMB", "Orbit"},
+                       {"MMB / Alt+Shift+LMB", "Pan"},
+                       {"Scroll / = -", "Zoom"},
+                       {"F", "Frame selection"},
+                       {"1 / 3 / 7", "Front / right / top (Ctrl = opposite)"},
+                       {"F1-F4", "Recall camera bookmark (Ctrl = store)"}});
+        group("Transform", {{"W / E / R", "Move / rotate / scale gizmo"},
+                            {"Ctrl+Z / Ctrl+Y", "Undo / redo"},
+                            {"Ctrl+D", "Duplicate"},
+                            {"Delete", "Delete selection"},
+                            {"Ctrl+G / Ctrl+Shift+G", "Group / ungroup"}});
+        group("Modes", {{"Tab", "Sculpt mode"},
+                        {"Shift+Tab", "Edit mode"},
+                        {"Right-click", "Edit-mode actions (extrude, subdivide, smooth)"},
+                        {"Esc", "Exit / cancel mode"}});
+        group("File", {{"Ctrl+N / Ctrl+O", "New / open scene"},
+                       {"Ctrl+S / Ctrl+Shift+S", "Save / save as"},
+                       {"?", "Toggle this help"}});
+    }
     ImGui::End();
 }
 
