@@ -543,4 +543,60 @@ void EditTool::CancelExtrude(Scene& scene)
     m_ExtrudeOriginal.reset();
 }
 
+// --- subdivide (T5, #62) -----------------------------------------------------
+
+namespace {
+// Map raw vertex indices (from a kernel result) to their EditEdge-rebuilt weld
+// groups, deduped — the selection ids for the inserted midpoint vertices.
+std::vector<uint32_t> RemapNewVerts(const EditMesh& em, const std::vector<uint32_t>& rawVerts)
+{
+    size_t maxRaw = 0;
+    for (const EditVertex& v : em.vertices)
+        for (uint32_t r : v.rawVerts)
+            maxRaw = std::max(maxRaw, (size_t)r);
+    std::vector<uint32_t> rawToGroup(maxRaw + 1, UINT32_MAX);
+    for (uint32_t g = 0; g < em.vertices.size(); ++g)
+        for (uint32_t r : em.vertices[g].rawVerts)
+            rawToGroup[r] = g;
+
+    std::vector<uint32_t> sel;
+    for (uint32_t raw : rawVerts) {
+        if (raw >= rawToGroup.size())
+            continue;
+        uint32_t g = rawToGroup[raw];
+        if (g != UINT32_MAX && std::find(sel.begin(), sel.end(), g) == sel.end())
+            sel.push_back(g);
+    }
+    return sel;
+}
+} // namespace
+
+std::unique_ptr<Command> EditTool::Subdivide(Scene& scene)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh || !CanSubdivide())
+        return nullptr;
+
+    MeshSubdivision sd =
+        m_Mode == Element::Face
+            ? BuildFaceSubdivision(m_EditMesh, e->mesh->Vertices(), e->mesh->Indices(), m_Selected)
+            : BuildEdgeSubdivision(m_EditMesh, e->mesh->Vertices(), e->mesh->Indices(), m_Selected);
+    if (sd.indices.empty() || sd.newVerts.empty())
+        return nullptr; // empty/stale selection
+
+    auto original = e->mesh;
+    auto finalMesh = std::make_shared<Mesh>(std::move(sd.vertices), std::move(sd.indices));
+    MeshTopology topo = MeshTopology::Build(*finalMesh);
+    RecomputeNormalsWelded(*finalMesh, topo);
+    finalMesh->RecomputeBounds();
+    finalMesh->UploadVertices();
+    e->mesh = finalMesh;
+    Readopt(m_EditMesh, m_Topology, m_MeshAtEnter, m_MeshVersionSeen, *e->mesh);
+
+    // Leave the inserted midpoints selected as vertices so they're ready to move.
+    m_Mode = Element::Vertex;
+    m_Selected = RemapNewVerts(m_EditMesh, sd.newVerts);
+    return std::make_unique<MeshSwapCommand>(m_Target, original, finalMesh);
+}
+
 } // namespace forge

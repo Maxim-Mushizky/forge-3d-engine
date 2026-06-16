@@ -2446,6 +2446,18 @@ void EditorApp::DrawViewport()
                                             "Move the cursor to set depth, click to commit, Esc cancels"
                                           : "Pull the selected edges into new faces\n"
                                             "Move the cursor to set depth, click to commit, Esc cancels");
+
+                // Subdivide (T5): add geometry to the selection (faces 1->4, edges
+                // at their midpoint). Inserted verts are left selected to move.
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!m_Edit.CanSubdivide());
+                if (ImGui::Button("Subdivide"))
+                    if (auto cmd = m_Edit.Subdivide(m_Scene))
+                        m_Commands.Push(std::move(cmd));
+                ImGui::EndDisabled();
+                ImGui::SetItemTooltip(m_Edit.Mode() == EditTool::Element::Face
+                                          ? "Split each selected face into four"
+                                          : "Split each selected edge at its midpoint");
             }
             ImGui::End();
         }

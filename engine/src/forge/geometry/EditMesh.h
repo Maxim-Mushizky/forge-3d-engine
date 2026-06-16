@@ -164,4 +164,32 @@ EdgeExtrusion BuildEdgeExtrusion(const EditMesh& mesh, const std::vector<Vertex>
                                  const std::vector<uint32_t>& srcIndices,
                                  const std::vector<uint32_t>& selectedEdges);
 
+// --- subdivide (#62) ------------------------------------------------------
+// Add geometry locally: insert edge midpoints and re-triangulate. Selected
+// triangles split 1->4 (red); a neighbour that shares a split edge but isn't
+// itself selected splits 1->2 or 1->3 (green) so no T-junction / crack is left,
+// keeping the surface watertight. Plain midpoints (no Loop smoothing) so adding
+// detail doesn't move the surface. GL-free; the editor swaps the result in.
+
+// New geometry for a subdivision. The editor reselects `newVerts` (the inserted
+// midpoints) in Vertex mode so they're immediately transformable.
+struct MeshSubdivision {
+    std::vector<Vertex> vertices;  // source verts + one midpoint per split group-edge
+    std::vector<uint32_t> indices; // re-triangulated soup (selected + affected neighbours)
+    std::vector<uint32_t> newVerts; // indices into `vertices` of the inserted midpoints
+};
+
+// Subdivide the selected faces: every edge of each selected triangle is split at
+// its midpoint, and faces around the selection re-triangulate to stay watertight.
+// selectedFaces are EditFace ids (== triangle ids). Empty/stale -> empty result.
+MeshSubdivision BuildFaceSubdivision(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                     const std::vector<uint32_t>& srcIndices,
+                                     const std::vector<uint32_t>& selectedFaces);
+
+// Subdivide the selected edges: each is split at its midpoint and its incident
+// faces re-triangulate. selectedEdges are EditEdge ids. Empty/stale -> empty.
+MeshSubdivision BuildEdgeSubdivision(const EditMesh& mesh, const std::vector<Vertex>& srcVertices,
+                                     const std::vector<uint32_t>& srcIndices,
+                                     const std::vector<uint32_t>& selectedEdges);
+
 } // namespace forge
