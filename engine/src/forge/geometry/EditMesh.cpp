@@ -547,4 +547,36 @@ MeshSubdivision BuildEdgeSubdivision(const EditMesh& mesh, const std::vector<Ver
     return SubdivideByEdgeSet(mesh, srcVertices, srcIndices, splitEdges);
 }
 
+std::vector<std::vector<uint32_t>> BuildVertexAdjacency(const EditMesh& mesh)
+{
+    std::vector<std::vector<uint32_t>> adj(mesh.vertices.size());
+    for (const EditEdge& e : mesh.edges) {
+        adj[e.v0].push_back(e.v1);
+        adj[e.v1].push_back(e.v0);
+    }
+    return adj;
+}
+
+std::vector<vec3> LaplacianSmooth(const std::vector<vec3>& positions,
+                                  const std::vector<std::vector<uint32_t>>& adjacency,
+                                  const std::vector<uint32_t>& selected, float strength, int iterations)
+{
+    std::vector<vec3> pos = positions;
+    float s = glm::clamp(strength, 0.0f, 1.0f);
+    for (int it = 0; it < iterations; ++it) {
+        std::vector<vec3> next = pos; // anchors (unselected) carry over unchanged
+        for (uint32_t v : selected) {
+            if (v >= pos.size() || v >= adjacency.size() || adjacency[v].empty())
+                continue;
+            vec3 avg(0.0f);
+            for (uint32_t n : adjacency[v])
+                avg += pos[n];
+            avg /= (float)adjacency[v].size();
+            next[v] = glm::mix(pos[v], avg, s);
+        }
+        pos.swap(next);
+    }
+    return pos;
+}
+
 } // namespace forge

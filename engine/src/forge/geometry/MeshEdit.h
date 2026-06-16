@@ -27,6 +27,12 @@ struct MeshTopology {
 // groups so seams stay shading-continuous. ~1-2 ms at 100k verts.
 void RecomputeNormalsWelded(Mesh& mesh, const MeshTopology& topology);
 
+// Faceted shading: write each triangle's geometric normal to its three corners.
+// A vertex shared by triangles with differing normals takes the last writer —
+// exact on the crease-duplicated primitives (each face owns its corners),
+// approximate on fully-welded surfaces (Shade Flat, #65 T6).
+void RecomputeNormalsFlat(Mesh& mesh);
+
 // Edge map in weld-GROUP space. Raw-index edges would split along UV seams
 // (primitives are topologically open there) and report false boundaries;
 // group-space edges see the surface as closed. tris holds triangle ids (i/3).

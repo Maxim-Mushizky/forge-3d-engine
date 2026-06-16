@@ -285,4 +285,19 @@ void RecomputeNormalsWelded(Mesh& mesh, const MeshTopology& topology)
     }
 }
 
+void RecomputeNormalsFlat(Mesh& mesh)
+{
+    auto& verts = mesh.MutableVertices();
+    const auto& idx = mesh.Indices();
+    for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+        const vec3& p0 = verts[idx[i]].position;
+        vec3 n = glm::cross(verts[idx[i + 1]].position - p0, verts[idx[i + 2]].position - p0);
+        float len = glm::length(n);
+        n = len > 1e-8f ? n / len : vec3(0.0f, 1.0f, 0.0f);
+        verts[idx[i]].normal = n;
+        verts[idx[i + 1]].normal = n;
+        verts[idx[i + 2]].normal = n;
+    }
+}
+
 } // namespace forge

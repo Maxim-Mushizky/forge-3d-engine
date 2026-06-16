@@ -450,6 +450,46 @@ void RunEditMeshTests()
         CHECK(BuildEdgeSubdivision(m, verts, idx, {}).indices.empty());
         CHECK(BuildEdgeSubdivision(m, verts, idx, {999}).indices.empty());
     }
+
+    // --- LaplacianSmooth: selected vertex relaxes toward neighbour average -----
+    {
+        std::vector<vec3> pos = {{0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 0.0f}, {2.0f, 0.0f, 0.0f}};
+        std::vector<std::vector<uint32_t>> adj = {{1}, {0, 2}, {1}};
+
+        // strength 1, one pass: middle vert moves to the mean of its ends (1,0,0).
+        auto full = LaplacianSmooth(pos, adj, {1}, 1.0f, 1);
+        CHECK(ApproxEq(full[1].x, 1.0f) && ApproxEq(full[1].y, 0.0f) && ApproxEq(full[1].z, 0.0f));
+        // Anchors (unselected) stay put.
+        CHECK(ApproxEq(full[0].x, 0.0f) && ApproxEq(full[2].x, 2.0f));
+
+        // strength 0.5: halfway toward the average.
+        auto half = LaplacianSmooth(pos, adj, {1}, 0.5f, 1);
+        CHECK(ApproxEq(half[1].y, 0.5f));
+
+        // zero iterations is a no-op; a vertex with no neighbours never moves.
+        CHECK(ApproxEq(LaplacianSmooth(pos, adj, {1}, 1.0f, 0)[1].y, 1.0f));
+        std::vector<std::vector<uint32_t>> isolated = {{}, {}, {}};
+        CHECK(ApproxEq(LaplacianSmooth(pos, isolated, {0, 1, 2}, 1.0f, 5)[1].y, 1.0f));
+    }
+
+    // --- BuildVertexAdjacency: endpoints of every incident edge ----------------
+    {
+        // Single quad: corner 0 and 2 carry the diagonal (degree 3), 1 and 3 don't.
+        std::vector<Vertex> verts = {{{0.0f, 0.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{1.0f, 0.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{1.0f, 1.0f, 0.0f}, vec3(0.0f), vec2(0.0f)},
+                                     {{0.0f, 1.0f, 0.0f}, vec3(0.0f), vec2(0.0f)}};
+        std::vector<uint32_t> idx = {0, 1, 2, 0, 2, 3};
+        EditMesh m = BuildEditMesh(verts, idx);
+        auto adj = BuildVertexAdjacency(m);
+        CHECK(adj.size() == 4);
+        size_t total = 0;
+        for (const auto& a : adj)
+            total += a.size();
+        CHECK(total == m.edges.size() * 2); // every edge contributes both endpoints
+        CHECK(adj[0].size() == 3 && adj[2].size() == 3); // the two diagonal corners
+        CHECK(adj[1].size() == 2 && adj[3].size() == 2);
+    }
 }
 
 } // namespace forge::test

@@ -539,6 +539,21 @@ void EditorApp::ToggleEditMode()
         m_Edit.Enter(m_Scene, e->id);
 }
 
+void EditorApp::ArmEditExtrude()
+{
+    if (!m_Edit.BeginExtrude(m_Scene))
+        return;
+    // Map the object-space slide line to world for the drag. The new geometry
+    // travels along the object-space normal, so its world direction and the
+    // units-per-offset scale both come from the same transformed displacement
+    // (consistent under any scale).
+    mat4 world = m_Scene.WorldTransform(m_Edit.Target());
+    vec3 worldDisp = mat3(world) * m_Edit.ExtrudeNormalObject();
+    m_EditExtrudeLineP = vec3(world * vec4(m_Edit.ExtrudeAnchorObject(), 1.0f));
+    m_EditExtrudeLineD = glm::normalize(worldDisp);
+    m_EditExtrudeWorldPerLocal = std::max(glm::length(worldDisp), 1e-6f);
+}
+
 void EditorApp::LoadHDRI()
 {
     std::string path = OpenFileDialog(m_Window.NativeHandle(), "HDR Image\0*.hdr\0All Files\0*.*\0");
@@ -2234,6 +2249,35 @@ void EditorApp::DrawViewport()
                     m_BoxSelecting = false;
                 }
             }
+
+            // Right-click context menu: the discoverable home for edit-mode verbs
+            // (RMB is free — camera is Alt+LMB / MMB). Opens on a click, not a drag.
+            if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+                io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Right] < 25.0f)
+                ImGui::OpenPopup("##edit_ctx");
+            if (ImGui::BeginPopup("##edit_ctx")) {
+                const char* extrudeLabel =
+                    m_Edit.Mode() == EditTool::Element::Edge ? "Extrude edges" : "Extrude faces";
+                if (ImGui::MenuItem(extrudeLabel, nullptr, false, m_Edit.CanExtrude()))
+                    ArmEditExtrude();
+                if (ImGui::MenuItem("Subdivide", nullptr, false, m_Edit.CanSubdivide()))
+                    if (auto cmd = m_Edit.Subdivide(m_Scene))
+                        m_Commands.Push(std::move(cmd));
+                ImGui::Separator();
+                ImGui::SetNextItemWidth(140);
+                ImGui::SliderFloat("Strength", &m_EditSmoothStrength, 0.0f, 1.0f);
+                if (ImGui::MenuItem("Smooth", nullptr, false, m_Edit.CanSmooth()))
+                    if (auto cmd = m_Edit.SmoothSelection(m_Scene, m_EditSmoothStrength, 1))
+                        m_Commands.Push(std::move(cmd));
+                ImGui::Separator();
+                if (ImGui::MenuItem("Shade Smooth"))
+                    if (auto cmd = m_Edit.SetShading(m_Scene, true))
+                        m_Commands.Push(std::move(cmd));
+                if (ImGui::MenuItem("Shade Flat"))
+                    if (auto cmd = m_Edit.SetShading(m_Scene, false))
+                        m_Commands.Push(std::move(cmd));
+                ImGui::EndPopup();
+            }
             } // end !Extruding
 
             ImGui::GetWindowDrawList()->AddRect(imgMin, ImVec2(imgMin.x + avail.x, imgMin.y + avail.y),
@@ -2427,17 +2471,8 @@ void EditorApp::DrawViewport()
                 if (extruding)
                     ui::PushAccentButton();
                 ImGui::BeginDisabled(!m_Edit.CanExtrude() && !extruding);
-                if (ImGui::Button("Extrude") && m_Edit.BeginExtrude(m_Scene)) {
-                    // Map the object-space slide line to world for the drag. The new
-                    // geometry travels along the object-space normal, so its world
-                    // direction and the units-per-offset scale both come from the
-                    // same transformed displacement (consistent under any scale).
-                    mat4 world = m_Scene.WorldTransform(m_Edit.Target());
-                    vec3 worldDisp = mat3(world) * m_Edit.ExtrudeNormalObject();
-                    m_EditExtrudeLineP = vec3(world * vec4(m_Edit.ExtrudeAnchorObject(), 1.0f));
-                    m_EditExtrudeLineD = glm::normalize(worldDisp);
-                    m_EditExtrudeWorldPerLocal = std::max(glm::length(worldDisp), 1e-6f);
-                }
+                if (ImGui::Button("Extrude"))
+                    ArmEditExtrude();
                 ImGui::EndDisabled();
                 if (extruding)
                     ui::PopAccentButton();
@@ -2476,7 +2511,7 @@ void EditorApp::DrawViewport()
                                 ? "Extrude: move the cursor to set depth   click commits   Esc cancels"
                             : m_Edit.Active()
                                 ? "Edit: click select   Ctrl+Click add   drag box   "
-                                  "W/E/R + gizmo to move selection   Extrude pushes faces   Esc exits"
+                                  "W/E/R gizmo moves   Right-click for actions   Esc exits"
                             : m_Extrude.Busy()
                                 ? "Press a flat face and drag to extrude   Esc cancels"
                                 : "Alt+Drag orbit   MMB pan   Scroll zoom   F frame   Click select   "
