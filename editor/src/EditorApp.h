@@ -81,6 +81,7 @@ public:
     bool LoadHDRIFile(const std::string& path);
     void ToggleSculptMode();
     void ToggleEditMode();
+    void ArmEditExtrude(); // start an edit-mode extrude drag + set its world slide line
     void OpenSceneFile(const std::string& path); // CLI arg / recents / drag-drop
 private:
     // --- scene file lifecycle (#1) ---------------------------------------
@@ -147,6 +148,7 @@ private:
     vec3 m_EditExtrudeLineP{0.0f};
     vec3 m_EditExtrudeLineD{0.0f, 1.0f, 0.0f};
     float m_EditExtrudeWorldPerLocal = 1.0f;
+    float m_EditSmoothStrength = 0.5f; // edit-mode Laplacian smooth strength (#65)
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
     bool m_FirstDockLayout = false;
 

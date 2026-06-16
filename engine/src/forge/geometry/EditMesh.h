@@ -192,4 +192,18 @@ MeshSubdivision BuildEdgeSubdivision(const EditMesh& mesh, const std::vector<Ver
                                      const std::vector<uint32_t>& srcIndices,
                                      const std::vector<uint32_t>& selectedEdges);
 
+// --- smooth (#62 T6) ------------------------------------------------------
+// Per-vertex neighbour list (group-space) derived from the EditMesh edges, for
+// Laplacian smoothing. adjacency[v] = the other endpoint of each edge on v.
+std::vector<std::vector<uint32_t>> BuildVertexAdjacency(const EditMesh& mesh);
+
+// Laplacian smooth: for `iterations`, move each selected vertex a fraction
+// `strength` toward the average of its neighbours (Jacobi — each pass reads the
+// previous pass's positions). `positions` and `adjacency` are parallel by vertex
+// id; unselected verts are anchors (kept, but read as neighbours). A vertex with
+// no neighbours is left unchanged. strength is clamped to [0,1]. GL-free.
+std::vector<vec3> LaplacianSmooth(const std::vector<vec3>& positions,
+                                  const std::vector<std::vector<uint32_t>>& adjacency,
+                                  const std::vector<uint32_t>& selected, float strength, int iterations);
+
 } // namespace forge

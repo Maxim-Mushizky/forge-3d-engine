@@ -599,4 +599,71 @@ std::unique_ptr<Command> EditTool::Subdivide(Scene& scene)
     return std::make_unique<MeshSwapCommand>(m_Target, original, finalMesh);
 }
 
+// --- smooth + shading (T6, #65) ----------------------------------------------
+
+namespace {
+// Sparse vertex diff -> one undo step (same shape as EndTransform): only the
+// vertices that actually changed go on the stack. nullptr if nothing changed.
+std::unique_ptr<Command> DiffStroke(UUID target, const std::vector<Vertex>& before,
+                                    const std::vector<Vertex>& after)
+{
+    std::vector<uint32_t> indices;
+    std::vector<Vertex> from, to;
+    for (uint32_t i = 0; i < (uint32_t)after.size() && i < (uint32_t)before.size(); ++i) {
+        if (std::memcmp(&after[i], &before[i], sizeof(Vertex)) != 0) {
+            indices.push_back(i);
+            from.push_back(before[i]);
+            to.push_back(after[i]);
+        }
+    }
+    if (indices.empty())
+        return nullptr;
+    return std::make_unique<SculptStrokeCommand>(target, std::move(indices), std::move(from), std::move(to));
+}
+} // namespace
+
+std::unique_ptr<Command> EditTool::SmoothSelection(Scene& scene, float strength, int iterations)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh || !CanSmooth())
+        return nullptr;
+    std::vector<uint32_t> sel = ResolveVertexSet(m_EditMesh, m_Mode, m_Selected);
+    if (sel.empty())
+        return nullptr;
+
+    std::vector<vec3> pos(m_EditMesh.vertices.size());
+    for (size_t i = 0; i < pos.size(); ++i)
+        pos[i] = m_EditMesh.vertices[i].position;
+    std::vector<vec3> out = LaplacianSmooth(pos, BuildVertexAdjacency(m_EditMesh), sel, strength, iterations);
+
+    std::vector<Vertex> before = e->mesh->Vertices(); // snapshot for the undo diff
+    auto& verts = e->mesh->MutableVertices();
+    for (uint32_t g : sel) {
+        m_EditMesh.vertices[g].position = out[g]; // keep the overlay tracking
+        for (uint32_t raw : m_EditMesh.vertices[g].rawVerts)
+            if (raw < verts.size())
+                verts[raw].position = out[g];
+    }
+    RecomputeNormalsWelded(*e->mesh, m_Topology);
+    e->mesh->RecomputeBounds();
+    e->mesh->UploadVertices();
+    m_MeshVersionSeen = e->mesh->Version(); // our own in-place edit — no resync
+    return DiffStroke(m_Target, before, e->mesh->Vertices());
+}
+
+std::unique_ptr<Command> EditTool::SetShading(Scene& scene, bool smooth)
+{
+    Entity* e = scene.Find(m_Target);
+    if (!e || !e->mesh || !m_Active)
+        return nullptr;
+    std::vector<Vertex> before = e->mesh->Vertices();
+    if (smooth)
+        RecomputeNormalsWelded(*e->mesh, m_Topology);
+    else
+        RecomputeNormalsFlat(*e->mesh);
+    e->mesh->UploadVertices();
+    m_MeshVersionSeen = e->mesh->Version(); // normals only, positions unchanged
+    return DiffStroke(m_Target, before, e->mesh->Vertices());
+}
+
 } // namespace forge

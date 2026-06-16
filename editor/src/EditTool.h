@@ -95,6 +95,15 @@ public:
     }
     std::unique_ptr<Command> Subdivide(Scene& scene);
 
+    // --- smooth + shading (T6, #65) ------------------------------------------
+    // In-place edits (no topology change), committed as one SculptStrokeCommand
+    // so they survive the edit-mode staleness guard (no mesh swap). Smooth relaxes
+    // the selected verts toward their neighbours (Laplacian); shading recomputes
+    // the whole mesh's normals welded (smooth) or per-face (flat).
+    bool CanSmooth() const { return m_Active && !m_Selected.empty() && !m_Extruding; }
+    std::unique_ptr<Command> SmoothSelection(Scene& scene, float strength, int iterations);
+    std::unique_ptr<Command> SetShading(Scene& scene, bool smooth);
+
 private:
     bool m_Active = false;
     UUID m_Target = 0;
