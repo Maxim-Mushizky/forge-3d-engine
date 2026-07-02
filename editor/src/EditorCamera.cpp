@@ -70,16 +70,16 @@ void EditorCamera::OnUpdate(bool viewportHovered)
                (io.KeyAlt && io.KeyShift && ImGui::IsMouseDown(ImGuiMouseButton_Left));
 
     if (orbit) {
-        m_Yaw += delta.x * 0.006f;
-        m_Pitch += delta.y * 0.006f;
+        m_Yaw += delta.x * m_Tuning.orbitSensitivity;
+        m_Pitch += delta.y * m_Tuning.orbitSensitivity * (m_Tuning.invertOrbitY ? -1.0f : 1.0f);
         m_Pitch = std::clamp(m_Pitch, -1.55f, 1.55f);
     } else if (pan) {
-        float speed = m_Distance * 0.0015f;
+        float speed = m_Distance * m_Tuning.panSpeed;
         m_FocalPoint += -Right() * delta.x * speed + Up() * delta.y * speed;
     }
 
     if (viewportHovered && io.MouseWheel != 0.0f)
-        Zoom(1.0f - io.MouseWheel * 0.1f);
+        Zoom(1.0f - io.MouseWheel * m_Tuning.zoomStep);
 
     RecalculateView();
 }

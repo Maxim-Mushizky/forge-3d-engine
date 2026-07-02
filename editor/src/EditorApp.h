@@ -5,6 +5,7 @@
 #include "EditTool.h"
 #include "ExtrudeTool.h"
 #include "SculptTool.h"
+#include "Settings.h"
 #include "Toasts.h"
 
 #include <forge/geometry/MeshBoolean.h>
@@ -118,6 +119,12 @@ private:
     // the cursor position and routed once per frame (viewport rect is stable then).
     void ProcessPendingDrops();
     void DropImageOnViewport(const std::string& path, const vec2& cursorPx);
+    // --- preferences (#13) ------------------------------------------------
+    void LoadSettings();      // read forge_settings.json, apply, seed live values
+    void SaveSettings();      // sync live values back and rewrite the file
+    void ApplySettings();     // push camera tuning / font scale / tooltips
+    void QueueSettingsSave(); // debounce: rewrite shortly after the last edit
+    void DrawSettingsWindow();
 
     Window m_Window;
     Renderer m_Renderer;
@@ -137,11 +144,15 @@ private:
     ExtrudeTool m_Extrude;
     ToastManager m_Toasts;     // transient success/error notifications (#6)
     bool m_ShowHelp = false;   // shortcut cheat-sheet overlay (#10)
+    Settings m_Settings;           // persistent preferences (#13)
+    bool m_ShowSettings = false;   // Preferences window visibility
+    double m_SettingsSaveAt = 0.0; // 0 = no save pending (debounced write)
     GizmoOp m_GizmoOp = GizmoOp::Translate;
     bool m_GizmoWasUsing = false;
     // Transform snapping (#5): quantize gizmo drags and inspector fields to
     // fixed increments. The toggle persists; holding Ctrl flips it for a single
-    // gesture (industry standard). Session-only until the settings file lands.
+    // gesture (industry standard). Defaults seeded from Settings (#13); live
+    // values sync back into the file on save.
     bool m_SnapEnabled = false;
     float m_SnapTranslate = 0.25f; // world units per grid step
     float m_SnapRotateDeg = 15.0f; // degrees per angle step
