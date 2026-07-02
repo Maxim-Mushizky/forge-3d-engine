@@ -1,12 +1,20 @@
 name: CI
 
-# Build must pass before tests run; any test failure fails the workflow, which
-# blocks the PR when these checks are marked "required" in branch protection.
+# One job builds everything and runs the suite: the engine/editor compile is
+# the gate (nothing GPU-dependent executes here), and forge_tests is GL-free
+# by design. Splitting build/test across runners doubled toolchain setup and
+# dependency compilation for no isolation benefit (#24).
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+# A force-push or rapid follow-up commit obsoletes the older run; don't burn
+# minutes finishing it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -15,6 +23,8 @@ jobs:
     defaults:
       run:
         shell: msys2 {0}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - uses: actions/checkout@v4
 
@@ -22,49 +32,47 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: true
+          update: false # pinned runner snapshot beats a rolling pacman update for reproducibility
           install: >-
             git
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-ccache
+
+      # Two-layer cache (#24): _deps skips the FetchContent clones; ccache skips
+      # recompiling them (Manifold/GLFW/GLEW dominate a cold build). The ccache
+      # key never matches exactly (sha-keyed) so the cache is re-saved each run
+      # and stays warm via restore-keys.
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build/release/_deps
+          key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+      - name: Cache compiler output
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
 
       # CMake 4.x on the runner dropped compat with deps that request cmake < 3.5
       # (glew-cmake); this is CMake's documented escape hatch for that.
       - name: Configure
-        run: cmake --preset mingw-release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+        run: >-
+          cmake --preset mingw-release
+          -DFORGE_BUILD_TESTS=ON
+          -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build --preset mingw-release
 
-  test:
-    name: Unit tests
-    needs: build            # build is the prerequisite stage
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up MinGW toolchain
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            git
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-
-      - name: Configure (tests enabled)
-        run: cmake --preset mingw-release -DFORGE_BUILD_TESTS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-
-      # The test target links only glm (header-only), so this is fast and needs
-      # no GL context — it does not rebuild the full engine.
-      - name: Build tests
-        run: cmake --build --preset mingw-release --target forge_tests
-
       - name: Run tests
         run: ctest --test-dir build/release --output-on-failure
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
