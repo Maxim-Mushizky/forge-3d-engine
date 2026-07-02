@@ -38,11 +38,13 @@ but re-check at implementation time.
   clients should not issue overlapping Tool calls"). No C++ SDK does this for you. [verified 3-0]
 - **No C++ MCP SDK is turnkey** — hand-roll the protocol layer on cpp-httplib + nlohmann/json
   (ChiR24 pattern):
+
   | SDK | License | Problem |
   |---|---|---|
   | hkr04/cpp-mcp | MIT | transport/spec-revision claims **refuted 0-3** on inspection — capabilities unclear |
   | Qihoo360/TinyMCP | MIT | stdio-only (GUI app can't cede stdin/stdout), no root CMakeLists |
   | GopherSecurity/gopher-mcp | Apache-2.0 | pre-1.0, libevent dep, Windows builds via Cygwin scripts |
+
 - **Visual feedback transport:** render → PNG → base64 MCP image content, capped ~1024px.
 
 ## 3. Tool surface — mid-coarse granularity + batch
@@ -76,6 +78,7 @@ generative models, with agent ops for assembly/adjustment.
   SMPL-X-competitive accuracy (2.4mm fitting error, 3DBodyTex). No clothing/textures.
 
 **Generation shortlist** *(unverified tier)*:
+
 | Model/API | VRAM / cost | License | Notes |
 |---|---|---|---|
 | Hunyuan3D-2GP / WinPortable | ~3GB shape, ~6GB texture (mmgp offload, needs ~24GB RAM); 24GB native | open | ships local **API-server mode** → Forge talks HTTP |
@@ -100,8 +103,8 @@ hair strands (mesh cards v1), UV *editing* tools (unwrap only).
 
 ## 6. Roadmap
 
-Epic #74. Order: #75 → #76 → #77 → #78 → #79 (agent builds prop scenes) → #80 → #16 → #81 →
-#82 → #17 (complex-asset engine floor) → #83 → #84 (generation) → #85 → #86 (human milestone).
+Epic #74. Order: #75 → #76 → #77 → #78 → #79 (agent builds prop scenes) → #80 → #16 → #81
+→ #82 → #17 (complex-asset engine floor) → #83 → #84 (generation) → #85 → #86 (human milestone).
 
 Milestone acceptance (#86): a fresh Claude session, told only *"create a realistic middle-aged
 man, casually posed, studio-lit, and render a portrait"*, completes unassisted via MCP.
