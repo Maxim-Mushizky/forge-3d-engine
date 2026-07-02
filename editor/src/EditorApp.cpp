@@ -48,6 +48,15 @@ static std::string FileName(const std::string& path)
     return std::filesystem::path(path).filename().string();
 }
 
+// Beginner-help tooltips, globally gated by the Interface preference (#13).
+// File-static so every call site stays a one-liner.
+static bool s_ShowTooltips = true;
+static void Tip(const char* text)
+{
+    if (s_ShowTooltips && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("%s", text);
+}
+
 EditorApp::EditorApp()
     : m_Window(1600, 900, "Forge Editor"),
       m_Framebuffer(1280, 720, /*hdr=*/true),
@@ -95,6 +104,7 @@ EditorApp::EditorApp()
     cube.transform.translation = {0.0f, 0.5f, 0.0f};
     cube.material.albedo = {0.85f, 0.35f, 0.25f};
 
+    LoadSettings(); // before recents: recentFilesMax caps the list
     LoadRecentFiles();
     MarkSaved(); // the starter scene isn't "unsaved work"
 
@@ -109,6 +119,7 @@ EditorApp::EditorApp()
 
 EditorApp::~EditorApp()
 {
+    SaveSettings(); // final sync: live snap/RT/export values persist across runs
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
@@ -130,6 +141,10 @@ void EditorApp::Run()
 
         UpdateWindowTitle();
         ProcessPendingDrops();
+        if (m_SettingsSaveAt > 0.0 && ImGui::GetTime() >= m_SettingsSaveAt) {
+            m_SettingsSaveAt = 0.0;
+            SaveSettings();
+        }
 
         float az = glm::radians(m_SunAzimuth), el = glm::radians(m_SunElevation);
         m_Sun.direction = -vec3(std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az));
@@ -153,6 +168,7 @@ void EditorApp::Run()
         DrawInspector();
         DrawViewport(); // updates the camera
         DrawHelpOverlay();
+        DrawSettingsWindow();
         m_Toasts.Draw();
         ImGui::Render();
 
@@ -956,6 +972,11 @@ void EditorApp::DrawMainMenuBar()
                 RequestWithUnsavedCheck(FileAction::Exit);
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Edit")) {
+            if (ImGui::MenuItem("Preferences..."))
+                m_ShowSettings = true;
+            ImGui::EndMenu();
+        }
         ImGui::EndMainMenuBar();
     }
 
@@ -1003,23 +1024,29 @@ void EditorApp::UpdateWindowTitle()
     }
 }
 
-static std::filesystem::path RecentFilesPath()
+// Per-user config directory (recents, settings). Exe dirs are often read-only,
+// so LOCALAPPDATA is the primary home; temp is the headless/CI fallback.
+static std::filesystem::path ForgeConfigDir()
 {
     const char* base = std::getenv("LOCALAPPDATA");
     std::filesystem::path dir = base ? std::filesystem::path(base) / "Forge"
                                      : std::filesystem::temp_directory_path() / "Forge";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    return dir / "recent.txt";
+    return dir;
 }
+
+static std::filesystem::path RecentFilesPath() { return ForgeConfigDir() / "recent.txt"; }
+static std::filesystem::path SettingsPath() { return ForgeConfigDir() / "forge_settings.json"; }
 
 void EditorApp::AddRecentFile(const std::string& path)
 {
     m_RecentFiles.erase(std::remove(m_RecentFiles.begin(), m_RecentFiles.end(), path),
                         m_RecentFiles.end());
     m_RecentFiles.insert(m_RecentFiles.begin(), path);
-    if (m_RecentFiles.size() > 8)
-        m_RecentFiles.resize(8);
+    size_t maxFiles = (size_t)std::max(1, m_Settings.recentFilesMax);
+    if (m_RecentFiles.size() > maxFiles)
+        m_RecentFiles.resize(maxFiles);
     SaveRecentFiles();
 }
 
@@ -1037,6 +1064,221 @@ void EditorApp::SaveRecentFiles() const
     std::ofstream out(RecentFilesPath(), std::ios::trunc);
     for (const std::string& p : m_RecentFiles)
         out << p << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Preferences (#13)
+// ---------------------------------------------------------------------------
+
+void EditorApp::LoadSettings()
+{
+    std::ifstream in(SettingsPath());
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    m_Settings = SettingsFromJson(text); // missing/corrupt file -> defaults
+
+    // Seed the live values these settings are defaults for.
+    m_Camera.SetFOV(m_Settings.defaultFov);
+    m_SnapEnabled = m_Settings.snapEnabled;
+    m_SnapTranslate = m_Settings.snapTranslate;
+    m_SnapRotateDeg = m_Settings.snapRotateDeg;
+    m_SnapScale = m_Settings.snapScale;
+    m_Bounces = m_Settings.rtBounces;
+    m_RTScale = m_Settings.rtScale;
+    m_Denoise = m_Settings.denoise;
+    m_DenoiseStrength = m_Settings.denoiseStrength;
+    m_StlScale = m_Settings.exportScale;
+
+    ApplySettings();
+}
+
+void EditorApp::SaveSettings()
+{
+    // The sidebar edits these live; the file records where the user left them.
+    m_Settings.snapEnabled = m_SnapEnabled;
+    m_Settings.snapTranslate = m_SnapTranslate;
+    m_Settings.snapRotateDeg = m_SnapRotateDeg;
+    m_Settings.snapScale = m_SnapScale;
+    m_Settings.rtBounces = m_Bounces;
+    m_Settings.rtScale = m_RTScale;
+    m_Settings.denoise = m_Denoise;
+    m_Settings.denoiseStrength = m_DenoiseStrength;
+    m_Settings.exportScale = m_StlScale;
+
+    std::string existing;
+    {
+        std::ifstream in(SettingsPath());
+        existing.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    }
+    std::ofstream out(SettingsPath(), std::ios::trunc);
+    if (!out) {
+        FORGE_WARN("Couldn't write settings to %s", SettingsPath().string().c_str());
+        return;
+    }
+    out << SettingsToJson(m_Settings, existing);
+}
+
+void EditorApp::ApplySettings()
+{
+    CameraTuning& t = m_Camera.Tuning();
+    t.orbitSensitivity = m_Settings.orbitSensitivity;
+    t.zoomStep = m_Settings.zoomSpeed;
+    t.panSpeed = m_Settings.panSpeed;
+    t.invertOrbitY = m_Settings.invertOrbitY;
+
+    ImGui::GetIO().FontGlobalScale = m_Settings.fontScale;
+    s_ShowTooltips = m_Settings.showTooltips;
+}
+
+void EditorApp::QueueSettingsSave()
+{
+    m_SettingsSaveAt = ImGui::GetTime() + 0.75; // one write after a burst of edits
+}
+
+void EditorApp::DrawSettingsWindow()
+{
+    if (!m_ShowSettings)
+        return;
+
+    ImGui::SetNextWindowSize(ImVec2(460, 420), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Preferences", &m_ShowSettings)) {
+        ImGui::End();
+        return;
+    }
+
+    bool changed = false;
+    const Settings defaults; // per-tab "Restore defaults" copies from here
+
+    // Right-aligned restore button under a tab; returns true when clicked.
+    auto restoreButton = [] {
+        ImGui::Spacing();
+        ImGui::Separator();
+        return ImGui::Button("Restore defaults");
+    };
+
+    if (ImGui::BeginTabBar("settings_tabs")) {
+        if (ImGui::BeginTabItem("Camera")) {
+            changed |= ImGui::SliderFloat("Orbit sensitivity", &m_Settings.orbitSensitivity,
+                                          0.001f, 0.02f, "%.4f");
+            changed |= ImGui::SliderFloat("Zoom speed", &m_Settings.zoomSpeed, 0.02f, 0.3f, "%.2f");
+            changed |= ImGui::SliderFloat("Pan speed", &m_Settings.panSpeed, 0.0005f, 0.005f, "%.4f");
+            changed |= ImGui::Checkbox("Invert orbit Y", &m_Settings.invertOrbitY);
+            if (restoreButton()) {
+                m_Settings.orbitSensitivity = defaults.orbitSensitivity;
+                m_Settings.zoomSpeed = defaults.zoomSpeed;
+                m_Settings.panSpeed = defaults.panSpeed;
+                m_Settings.invertOrbitY = defaults.invertOrbitY;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Viewport")) {
+            if (ImGui::SliderFloat("Default FOV", &m_Settings.defaultFov, 20.0f, 90.0f, "%.0f deg")) {
+                m_Camera.SetFOV(m_Settings.defaultFov);
+                changed = true;
+            }
+            ImGui::SeparatorText("Snapping defaults");
+            if (ImGui::Checkbox("Snap enabled", &m_Settings.snapEnabled)) {
+                m_SnapEnabled = m_Settings.snapEnabled;
+                changed = true;
+            }
+            if (ImGui::DragFloat("Move step", &m_Settings.snapTranslate, 0.01f, 0.01f, 10.0f, "%.2f")) {
+                m_SnapTranslate = m_Settings.snapTranslate;
+                changed = true;
+            }
+            if (ImGui::DragFloat("Rotate step", &m_Settings.snapRotateDeg, 0.5f, 1.0f, 90.0f, "%.0f deg")) {
+                m_SnapRotateDeg = m_Settings.snapRotateDeg;
+                changed = true;
+            }
+            if (ImGui::DragFloat("Scale step", &m_Settings.snapScale, 0.01f, 0.01f, 1.0f, "%.2f")) {
+                m_SnapScale = m_Settings.snapScale;
+                changed = true;
+            }
+            if (restoreButton()) {
+                m_Settings.defaultFov = defaults.defaultFov;
+                m_Settings.snapEnabled = defaults.snapEnabled;
+                m_Settings.snapTranslate = defaults.snapTranslate;
+                m_Settings.snapRotateDeg = defaults.snapRotateDeg;
+                m_Settings.snapScale = defaults.snapScale;
+                m_Camera.SetFOV(m_Settings.defaultFov);
+                m_SnapEnabled = m_Settings.snapEnabled;
+                m_SnapTranslate = m_Settings.snapTranslate;
+                m_SnapRotateDeg = m_Settings.snapRotateDeg;
+                m_SnapScale = m_Settings.snapScale;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Rendering")) {
+            ImGui::TextDisabled("Defaults applied when the editor starts.");
+            if (ImGui::SliderInt("Bounces", &m_Settings.rtBounces, 1, 16)) {
+                m_Bounces = m_Settings.rtBounces;
+                changed = true;
+            }
+            if (ImGui::SliderFloat("Render scale", &m_Settings.rtScale, 0.25f, 1.0f, "%.2f")) {
+                m_RTScale = m_Settings.rtScale;
+                changed = true;
+            }
+            if (ImGui::Checkbox("Denoise", &m_Settings.denoise)) {
+                m_Denoise = m_Settings.denoise;
+                changed = true;
+            }
+            if (ImGui::SliderFloat("Denoise strength", &m_Settings.denoiseStrength, 0.0f, 1.0f, "%.2f")) {
+                m_DenoiseStrength = m_Settings.denoiseStrength;
+                changed = true;
+            }
+            if (restoreButton()) {
+                m_Settings.rtBounces = defaults.rtBounces;
+                m_Settings.rtScale = defaults.rtScale;
+                m_Settings.denoise = defaults.denoise;
+                m_Settings.denoiseStrength = defaults.denoiseStrength;
+                m_Bounces = m_Settings.rtBounces;
+                m_RTScale = m_Settings.rtScale;
+                m_Denoise = m_Settings.denoise;
+                m_DenoiseStrength = m_Settings.denoiseStrength;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Files")) {
+            changed |= ImGui::SliderInt("Recent files", &m_Settings.recentFilesMax, 1, 20);
+            if (ImGui::DragFloat("Export scale", &m_Settings.exportScale, 1.0f, 1.0f, 1000.0f,
+                                 "%.0f mm/unit")) {
+                m_StlScale = m_Settings.exportScale;
+                changed = true;
+            }
+            if (restoreButton()) {
+                m_Settings.recentFilesMax = defaults.recentFilesMax;
+                m_Settings.exportScale = defaults.exportScale;
+                m_StlScale = m_Settings.exportScale;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Appearance")) {
+            changed |= ImGui::SliderFloat("Font scale", &m_Settings.fontScale, 0.75f, 1.5f, "%.2f");
+            ImGui::TextDisabled("Theme presets arrive with the theme editor (#14).");
+            if (restoreButton()) {
+                m_Settings.fontScale = defaults.fontScale;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Interface")) {
+            changed |= ImGui::Checkbox("Show tooltips", &m_Settings.showTooltips);
+            if (restoreButton()) {
+                m_Settings.showTooltips = defaults.showTooltips;
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+
+    if (changed) {
+        ApplySettings();
+        QueueSettingsSave();
+    }
 }
 
 void EditorApp::ImportModel()
@@ -1649,16 +1891,16 @@ void EditorApp::DrawSidebar()
 
         if (ImGui::Button("Point Light", ImVec2(-1, 32)))
             SpawnPointLight();
-        ImGui::SetItemTooltip("A small light you can place anywhere");
+        Tip("A small light you can place anywhere");
         if (ImGui::Button("Sculpt Sphere", ImVec2(-1, 32)))
             SpawnPrimitive("Sculpt Sphere", m_SculptSphereMesh, 0.5f);
-        ImGui::SetItemTooltip("A high-detail sphere ready for sculpting");
+        Tip("A high-detail sphere ready for sculpting");
         if (ImGui::Button("Terrain", ImVec2(-1, 32)))
             SpawnPrimitive("Terrain", m_TerrainMesh, 0.01f);
-        ImGui::SetItemTooltip("A flat ground you can sculpt into hills");
+        Tip("A flat ground you can sculpt into hills");
         if (ImGui::Button("3D Text...", ImVec2(-1, 32)))
             ImGui::OpenPopup("Add 3D Text");
-        ImGui::SetItemTooltip("Turn a word into a solid 3D object (great for nameplates)");
+        Tip("Turn a word into a solid 3D object (great for nameplates)");
         if (ImGui::BeginPopupModal("Add 3D Text", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::InputText("Text", m_TextInput, sizeof(m_TextInput));
             ImGui::SliderFloat("Depth", &m_TextDepth, 0.05f, 1.0f);
@@ -1681,7 +1923,7 @@ void EditorApp::DrawSidebar()
         if (ImGui::Button("Import Model...", ImVec2(-1, 36)))
             ImportModel();
         ui::PopAccentButton();
-        ImGui::SetItemTooltip("Bring in a downloaded 3D model (.gltf, .glb, .obj)");
+        Tip("Bring in a downloaded 3D model (.gltf, .glb, .obj)");
     }
 
     if (Section(m_HeaderFont, "Sculpt", true)) {
@@ -1696,7 +1938,7 @@ void EditorApp::DrawSidebar()
         } else {
             if (ImGui::Button("Sculpt Mode (Tab)", ImVec2(-1, 32)))
                 ToggleSculptMode();
-            ImGui::SetItemTooltip("Shape the selected object with brushes");
+            Tip("Shape the selected object with brushes");
         }
         ImGui::EndDisabled();
         if (m_Sculpt.Active())
@@ -1715,7 +1957,7 @@ void EditorApp::DrawSidebar()
         } else {
             if (ImGui::Button("Edit Mode (Shift+Tab)", ImVec2(-1, 32)))
                 ToggleEditMode();
-            ImGui::SetItemTooltip("Edit the selected mesh by vertices, edges and faces");
+            Tip("Edit the selected mesh by vertices, edges and faces");
         }
         ImGui::EndDisabled();
     }
@@ -1729,29 +1971,29 @@ void EditorApp::DrawSidebar()
         ImGui::BeginDisabled(m_Selection.empty());
         if (ImGui::Button("Drop to Ground", ImVec2(-1, 30)))
             DropSelectedToGround();
-        ImGui::SetItemTooltip("Rest the selection on the floor or whatever is under it (End)");
+        Tip("Rest the selection on the floor or whatever is under it (End)");
         ImGui::EndDisabled();
 
         ImGui::BeginDisabled(!canModify);
         if (ImGui::Button("Mirror X", ImVec2(-1, 30)))
             MirrorSelected();
-        ImGui::SetItemTooltip("Bake a left-right mirrored copy across the object's own center plane");
+        Tip("Bake a left-right mirrored copy across the object's own center plane");
 
         ImGui::BeginDisabled(tooDense);
         if (ImGui::Button("Subdivide", ImVec2(-1, 30)))
             SubdivideSelected(m_SubdivKeepShape);
-        ImGui::SetItemTooltip("Split every triangle into four for finer detail");
+        Tip("Split every triangle into four for finer detail");
         ImGui::EndDisabled();
         ImGui::Checkbox("Keep shape", &m_SubdivKeepShape);
-        ImGui::SetItemTooltip("On: only add resolution (for sculpting).\nOff: also smooth the surface rounder");
+        Tip("On: only add resolution (for sculpting).\nOff: also smooth the surface rounder");
         if (tooDense)
             ImGui::TextDisabled("Too dense to subdivide (%zu tris)", triCount);
 
         if (ImGui::Button("Remesh", ImVec2(-1, 30)))
             RemeshSelected();
-        ImGui::SetItemTooltip("Rebuild the surface as clean, even triangles.\nFixes stretched or messy geometry before sculpting");
+        Tip("Rebuild the surface as clean, even triangles.\nFixes stretched or messy geometry before sculpting");
         ImGui::SliderInt("Detail", &m_RemeshDetail, 32, 160);
-        ImGui::SetItemTooltip("Higher keeps more detail but makes more triangles");
+        Tip("Higher keeps more detail but makes more triangles");
         ImGui::EndDisabled();
         if (!canModify)
             ImGui::TextDisabled("Select an object to modify.");
@@ -1765,20 +2007,20 @@ void EditorApp::DrawSidebar()
         }
         ImGui::Spacing();
         ImGui::TextUnformatted("Boolean");
-        ImGui::SetItemTooltip("Combine or carve two objects (select both with Ctrl+click)");
+        Tip("Combine or carve two objects (select both with Ctrl+click)");
         ImGui::BeginDisabled(!canBool);
         float thirdW = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
         if (ImGui::Button("Union", ImVec2(thirdW, 28)))
             BooleanSelected(BooleanOp::Union);
-        ImGui::SetItemTooltip("Merge both objects into one solid");
+        Tip("Merge both objects into one solid");
         ImGui::SameLine();
         if (ImGui::Button("Subtract", ImVec2(thirdW, 28)))
             BooleanSelected(BooleanOp::Subtract);
-        ImGui::SetItemTooltip("Carve the second-selected object out of the first");
+        Tip("Carve the second-selected object out of the first");
         ImGui::SameLine();
         if (ImGui::Button("Intersect", ImVec2(thirdW, 28)))
             BooleanSelected(BooleanOp::Intersect);
-        ImGui::SetItemTooltip("Keep only where both objects overlap");
+        Tip("Keep only where both objects overlap");
         ImGui::EndDisabled();
         if (!canBool)
             ImGui::TextDisabled("Select exactly two objects (Ctrl+click).");
@@ -1797,20 +2039,20 @@ void EditorApp::DrawSidebar()
         }
         if (armed)
             ui::PopAccentButton();
-        ImGui::SetItemTooltip("Pull a flat face out or push it in.\nClick the button, then press and drag a face in the viewport");
+        Tip("Pull a flat face out or push it in.\nClick the button, then press and drag a face in the viewport");
     }
 
     if (Section(m_HeaderFont, "Lighting & Sky", false)) {
         ImGui::SliderFloat("Sun direction", &m_SunAzimuth, 0.0f, 360.0f, "%.0f deg");
-        ImGui::SetItemTooltip("Compass direction the sunlight comes from");
+        Tip("Compass direction the sunlight comes from");
         ImGui::SliderFloat("Sun height", &m_SunElevation, 5.0f, 89.0f, "%.0f deg");
-        ImGui::SetItemTooltip("Low = sunset, high = noon");
+        Tip("Low = sunset, high = noon");
         ImGui::SliderFloat("Sun intensity", &m_Sun.intensity, 0.0f, 3.0f);
         ImGui::ColorEdit3("Sun color", &m_Sun.color.x);
         ImGui::Spacing();
         if (ImGui::Button("Load HDRI...", ImVec2(-1, 30)))
             LoadHDRI();
-        ImGui::SetItemTooltip("A 360-degree photo used as the sky and lighting");
+        Tip("A 360-degree photo used as the sky and lighting");
         if (m_Env && m_Env->Valid()) {
             ImGui::SliderFloat("Sky intensity", &m_Env->intensity, 0.0f, 4.0f);
             ImGui::SliderFloat("Sky rotation", &m_Env->rotationDegrees, 0.0f, 360.0f, "%.0f deg");
@@ -1831,22 +2073,22 @@ void EditorApp::DrawSidebar()
         float bloom = m_Post.BloomStrength();
         if (ImGui::SliderFloat("Bloom", &bloom, 0.0f, 0.3f))
             m_Post.SetBloomStrength(bloom);
-        ImGui::SetItemTooltip("Makes bright things glow");
+        Tip("Makes bright things glow");
         float fov = m_Camera.FOV();
         if (ImGui::SliderFloat("Camera FOV", &fov, 15.0f, 100.0f, "%.0f deg"))
             m_Camera.SetFOV(fov);
-        ImGui::SetItemTooltip("Camera lens angle - wide or zoomed");
+        Tip("Camera lens angle - wide or zoomed");
         bool ortho = m_Camera.IsOrthographic();
         if (ImGui::Checkbox("Orthographic", &ortho))
             m_Camera.SetOrthographic(ortho);
-        ImGui::SetItemTooltip("Parallel projection - no perspective, like a blueprint.\nGreat with the 1/3/7 view keys");
+        Tip("Parallel projection - no perspective, like a blueprint.\nGreat with the 1/3/7 view keys");
 
         // Transform snapping (#5): mirrors the viewport's Snap button; the step
         // pickers appear only when snapping is on to keep the panel uncluttered.
         if (ImGui::Checkbox("Snapping", &m_SnapEnabled))
             FORGE_INFO("Snapping %s (grid %.2f, angle %.0f deg)", m_SnapEnabled ? "on" : "off",
                        m_SnapTranslate, m_SnapRotateDeg);
-        ImGui::SetItemTooltip("Snap gizmo drags and inspector fields to fixed steps.\nHold Ctrl to flip it for one drag");
+        Tip("Snap gizmo drags and inspector fields to fixed steps.\nHold Ctrl to flip it for one drag");
         if (m_SnapEnabled) {
             static const float kGrid[] = {0.1f, 0.25f, 0.5f, 1.0f};
             int gi = m_SnapTranslate <= 0.15f ? 0 : m_SnapTranslate <= 0.35f ? 1 : m_SnapTranslate <= 0.75f ? 2 : 3;
@@ -1861,28 +2103,28 @@ void EditorApp::DrawSidebar()
 
     if (Section(m_HeaderFont, "Ray Tracing (photoreal)", false)) {
         ImGui::Checkbox("Enable", &m_RayTracing);
-        ImGui::SetItemTooltip("Physically accurate light - slower, sharpens over time");
+        Tip("Physically accurate light - slower, sharpens over time");
         if (m_RayTracing) {
             int quality = m_RTScale <= 0.55f ? 0 : (m_RTScale <= 0.80f ? 1 : 2);
             if (ImGui::Combo("Quality", &quality, "Fast (50%)\0Balanced (75%)\0Full (100%)\0"))
                 m_RTScale = quality == 0 ? 0.5f : (quality == 1 ? 0.75f : 1.0f);
-            ImGui::SetItemTooltip("Render resolution - lower converges much faster");
+            Tip("Render resolution - lower converges much faster");
             ImGui::SliderInt("Bounces", &m_Bounces, 1, 8);
-            ImGui::SetItemTooltip("Light bounces. 3-4 is usually enough;\nglass and water want 6+ to see through.\nMore adds noise faster than realism");
+            Tip("Light bounces. 3-4 is usually enough;\nglass and water want 6+ to see through.\nMore adds noise faster than realism");
             bool ground = m_PathTracer.GroundPlane();
             if (ImGui::Checkbox("Ground plane", &ground))
                 m_PathTracer.SetGroundPlane(ground);
-            ImGui::SetItemTooltip("A studio floor that catches shadows");
+            Tip("A studio floor that catches shadows");
 
             ImGui::Checkbox("Denoise", &m_Denoise);
-            ImGui::SetItemTooltip("Smooths the grainy noise away while the image converges");
+            Tip("Smooths the grainy noise away while the image converges");
             if (m_Denoise) {
                 ImGui::SliderFloat("Denoise strength", &m_DenoiseStrength, 0.0f, 1.0f);
-                ImGui::SetItemTooltip("Higher = smoother but softer early on");
+                Tip("Higher = smoother but softer early on");
             }
 
             ImGui::SliderFloat("Aperture", &m_Aperture, 0.0f, 0.3f, "%.3f");
-            ImGui::SetItemTooltip("Camera lens size. 0 = everything sharp;\nbigger = blurrier foreground/background");
+            Tip("Camera lens size. 0 = everything sharp;\nbigger = blurrier foreground/background");
             if (m_Aperture > 0.0f) {
                 if (m_Camera.IsOrthographic()) {
                     ImGui::TextDisabled("Depth of field is off in orthographic view");
@@ -1890,13 +2132,13 @@ void EditorApp::DrawSidebar()
                     if (m_FocusDist <= 0.0f)
                         m_FocusDist = glm::length(m_Camera.FocalPoint() - m_Camera.Position());
                     ImGui::SliderFloat("Focus distance", &m_FocusDist, 0.5f, 50.0f, "%.2f");
-                    ImGui::SetItemTooltip("Distance to the plane that stays sharp");
+                    Tip("Distance to the plane that stays sharp");
                     if (ImGui::Button("Focus on selected", ImVec2(-1, 0))) {
                         if (Entity* sel = m_Scene.Find(m_Selected))
                             m_FocusDist = glm::length(vec3(m_Scene.WorldTransform(sel->id)[3]) -
                                                       m_Camera.Position());
                     }
-                    ImGui::SetItemTooltip("Set the focus distance to the selected object");
+                    Tip("Set the focus distance to the selected object");
                 }
             }
 
@@ -1907,10 +2149,10 @@ void EditorApp::DrawSidebar()
 
     if (Section(m_HeaderFont, "Export", false)) {
         ImGui::DragFloat("Scale (mm/unit)", &m_StlScale, 1.0f, 1.0f, 1000.0f, "%.0f");
-        ImGui::SetItemTooltip("How many millimeters one scene unit becomes when printed");
+        Tip("How many millimeters one scene unit becomes when printed");
         if (ImGui::Button("Export STL...", ImVec2(-1, 30)))
             ExportStlDialog();
-        ImGui::SetItemTooltip("Save for 3D printing. Exports the selection,\nor the whole scene when nothing is selected");
+        Tip("Save for 3D printing. Exports the selection,\nor the whole scene when nothing is selected");
         if (!m_StlStatus.empty())
             ImGui::TextWrapped("%s", m_StlStatus.c_str());
 
@@ -1919,7 +2161,7 @@ void EditorApp::DrawSidebar()
         if (ImGui::Button("Turntable GIF...", ImVec2(-1, 30)))
             StartTurntableDialog();
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Render a looping 360-degree spin of your scene\n(path traced - takes a minute)");
+        Tip("Render a looping 360-degree spin of your scene\n(path traced - takes a minute)");
     }
 
     if (Section(m_HeaderFont, "History", false))
@@ -2083,13 +2325,13 @@ void EditorApp::DrawHierarchy()
     ImGui::BeginDisabled(m_Selection.empty());
     if (ImGui::Button("+ Group"))
         GroupSelection();
-    ImGui::SetItemTooltip("Put selected objects in a folder (Ctrl+G)");
+    Tip("Put selected objects in a folder (Ctrl+G)");
     ImGui::SameLine();
     ui::PushDangerButton();
     if (ImGui::Button("Delete"))
         DeleteSelected();
     ui::PopDangerButton();
-    ImGui::SetItemTooltip("Delete selected (Del)");
+    Tip("Delete selected (Del)");
     ImGui::EndDisabled();
     ImGui::Separator();
 
@@ -2180,7 +2422,7 @@ void EditorApp::DrawInspector()
                 m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
             }
             ImGui::PopStyleColor(3);
-            ImGui::SetItemTooltip("Click to reset");
+            Tip("Click to reset");
             ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
             ImGui::SetNextItemWidth(fieldW);
             float* comp = &(&v.x)[a];
@@ -2207,25 +2449,25 @@ void EditorApp::DrawInspector()
 
     sepText("Material");
     ImGui::ColorEdit3("Albedo", &e->material.albedo.x);
-    ImGui::SetItemTooltip("The object's base color");
+    Tip("The object's base color");
     track();
     ImGui::SliderFloat("Metallic", &e->material.metallic, 0.0f, 1.0f);
-    ImGui::SetItemTooltip("0 = plastic or wood, 1 = metal");
+    Tip("0 = plastic or wood, 1 = metal");
     track();
     ImGui::SliderFloat("Roughness", &e->material.roughness, 0.0f, 1.0f);
-    ImGui::SetItemTooltip("0 = polished mirror, 1 = matte");
+    Tip("0 = polished mirror, 1 = matte");
     track();
     ImGui::ColorEdit3("Emissive", &e->material.emissive.x);
     track();
     ImGui::SliderFloat("Emission", &e->material.emissiveStrength, 0.0f, 20.0f);
-    ImGui::SetItemTooltip("Makes the object glow and light the scene");
+    Tip("Makes the object glow and light the scene");
     track();
     ImGui::SliderFloat("Transmission", &e->material.transmission, 0.0f, 1.0f);
-    ImGui::SetItemTooltip("0 = solid, 1 = clear like glass or water");
+    Tip("0 = solid, 1 = clear like glass or water");
     track();
     if (e->material.transmission > 0.0f) {
         ImGui::SliderFloat("IOR", &e->material.ior, 1.0f, 2.5f);
-        ImGui::SetItemTooltip("How much light bends: water 1.33, glass 1.5, diamond 2.4");
+        Tip("How much light bends: water 1.33, glass 1.5, diamond 2.4");
         track();
     }
 
@@ -2278,13 +2520,13 @@ void EditorApp::DrawInspector()
     float actionW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     if (ImGui::Button("Duplicate", ImVec2(actionW, 30)))
         DuplicateSelected();
-    ImGui::SetItemTooltip("Copy this object (Ctrl+D)");
+    Tip("Copy this object (Ctrl+D)");
     ImGui::SameLine();
     ui::PushDangerButton();
     if (ImGui::Button("Delete", ImVec2(actionW, 30)))
         DeleteSelected();
     ui::PopDangerButton();
-    ImGui::SetItemTooltip("Delete this object (Del)");
+    Tip("Delete this object (Del)");
 
     ImGui::End();
 }
@@ -2613,7 +2855,7 @@ void EditorApp::DrawViewport()
                     m_GizmoOp = op;
                 if (active)
                     ui::PopAccentButton();
-                ImGui::SetItemTooltip("%s", tip);
+                Tip(tip);
             };
             modeBtn("Move (W)", GizmoOp::Translate, "Drag the arrows to move");
             ImGui::SameLine();
@@ -2633,7 +2875,7 @@ void EditorApp::DrawViewport()
             }
             if (snapActive)
                 ui::PopAccentButton();
-            ImGui::SetItemTooltip("Snap moves/rotations to fixed steps.\nHold Ctrl to flip it for one drag");
+            Tip("Snap moves/rotations to fixed steps.\nHold Ctrl to flip it for one drag");
             ImGui::End();
         }
 
@@ -2653,7 +2895,7 @@ void EditorApp::DrawViewport()
                     m_Edit.SetMode(elem);
                 if (active)
                     ui::PopAccentButton();
-                ImGui::SetItemTooltip("%s", tip);
+                Tip(tip);
             };
             elemBtn("Vertex", EditTool::Element::Vertex, "Select and edit vertices");
             ImGui::SameLine();
@@ -2676,7 +2918,7 @@ void EditorApp::DrawViewport()
                 ImGui::EndDisabled();
                 if (extruding)
                     ui::PopAccentButton();
-                ImGui::SetItemTooltip(m_Edit.Mode() == EditTool::Element::Face
+                Tip(m_Edit.Mode() == EditTool::Element::Face
                                           ? "Push/pull the selected faces along their normal\n"
                                             "Move the cursor to set depth, click to commit, Esc cancels"
                                           : "Pull the selected edges into new faces\n"
@@ -2690,7 +2932,7 @@ void EditorApp::DrawViewport()
                     if (auto cmd = m_Edit.Subdivide(m_Scene))
                         m_Commands.Push(std::move(cmd));
                 ImGui::EndDisabled();
-                ImGui::SetItemTooltip(m_Edit.Mode() == EditTool::Element::Face
+                Tip(m_Edit.Mode() == EditTool::Element::Face
                                           ? "Split each selected face into four"
                                           : "Split each selected edge at its midpoint");
             }
