@@ -1403,6 +1403,7 @@ void EditorApp::RegisterMcpTools()
             m_McpRender.viewProj = glm::perspective(glm::radians(m_Camera.FOV()),
                                                     (float)w / (float)h, 0.1f, 1000.0f) *
                                    view;
+            m_McpRender.camPos = m_Camera.Position();
             m_McpRender.respond = std::move(respond);
         });
 }
@@ -1413,7 +1414,7 @@ void EditorApp::UpdateMcpRender()
     if (!job.active)
         return;
 
-    m_PathTracer.Dispatch(job.viewProj, m_Camera.Position(), m_Sun, m_Bounces, m_FrameLights,
+    m_PathTracer.Dispatch(job.viewProj, job.camPos, m_Sun, m_Bounces, m_FrameLights,
                           m_Env.get(), 8);
     if (m_PathTracer.SampleCount() < job.sppTarget)
         return;

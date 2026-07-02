@@ -1,4 +1,4 @@
-﻿add_library(forge STATIC
+add_library(forge STATIC
     src/forge/platform/Window.cpp
     src/forge/renderer/Shader.cpp
     src/forge/renderer/Mesh.cpp

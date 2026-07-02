@@ -263,6 +263,8 @@ private:
         bool active = false;
         int sppTarget = 256;
         mat4 viewProj{1.0f};    // frozen at start: requested aspect, current camera
+        vec3 camPos{0.0f};      // frozen with viewProj — a live camera position
+                                // against a frozen matrix corrupts accumulation
         ToolResponder respond;  // held until the render converges
     };
     McpRenderJob m_McpRender;

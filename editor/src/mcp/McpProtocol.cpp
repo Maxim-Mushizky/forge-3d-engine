@@ -74,7 +74,9 @@ void McpProtocol::HandleMessage(const std::string& body,
 
     // The MCP spec (2025-06-18+) removed JSON-RPC batching: every message is a
     // single object. Anything else — including arrays — is an invalid request.
-    if (!msg.is_object() || msg.value("jsonrpc", "") != "2.0" || !msg["method"].is_string()) {
+    // Compare the raw json value (never .value<string>()): present-but-wrong-
+    // type keys would throw type_error out of the kernel.
+    if (!msg.is_object() || msg["jsonrpc"] != "2.0" || !msg["method"].is_string()) {
         respond(MakeError(msg.is_object() ? msg.value("id", json()) : json(), kInvalidRequest,
                           "Invalid Request")
                     .dump());
@@ -168,7 +170,11 @@ void McpProtocol::HandleMessage(const std::string& body,
     }
 
     if (method == "resources/read") {
-        const std::string uri = params.value("uri", "");
+        if (!params.contains("uri") || !params["uri"].is_string()) {
+            respond(MakeError(id, kInvalidParams, "Missing resource uri").dump());
+            return;
+        }
+        const std::string uri = params["uri"];
         for (const Resource& r : m_Resources) {
             if (r.uri != uri)
                 continue;

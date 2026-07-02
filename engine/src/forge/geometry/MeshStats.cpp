@@ -44,6 +44,7 @@ MeshStats ComputeMeshStats(const std::vector<Vertex>& vertices,
 
     // Weld coincident positions so seam-duplicated meshes read as closed.
     std::unordered_map<PosKey, uint32_t, PosKeyHash> weld;
+    weld.reserve(vertices.size());
     std::vector<uint32_t> welded(vertices.size());
     for (size_t i = 0; i < vertices.size(); ++i) {
         auto [it, inserted] = weld.try_emplace(KeyOf(vertices[i].position), (uint32_t)i);
@@ -62,8 +63,13 @@ MeshStats ComputeMeshStats(const std::vector<Vertex>& vertices,
                        c = welded[indices[t + 2]];
 
         const vec3& pa = vertices[a].position;
-        const vec3 cross = glm::cross(vertices[b].position - pa, vertices[c].position - pa);
-        if (a == b || b == c || a == c || glm::dot(cross, cross) < 1e-20f) {
+        const vec3 ab = vertices[b].position - pa;
+        const vec3 ac = vertices[c].position - pa;
+        const vec3 cross = glm::cross(ab, ac);
+        // Relative epsilon: |cross|^2 scales with the 4th power of coordinate
+        // magnitude, so an absolute threshold misclassifies at extreme scales.
+        const float edgeScale = glm::dot(ab, ab) * glm::dot(ac, ac);
+        if (a == b || b == c || a == c || glm::dot(cross, cross) < 1e-12f * edgeScale) {
             // Degenerates contribute no surface; counting their edges would
             // misreport the surrounding topology as non-manifold.
             ++s.degenerateTriangles;

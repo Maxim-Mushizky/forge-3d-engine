@@ -98,6 +98,10 @@ void TestInvalidRequestShapes()
     CHECK(Handle(proto, R"({"jsonrpc":"2.0","id":5})")["error"]["code"] == -32600);
     // Wrong jsonrpc version.
     CHECK(Handle(proto, R"({"jsonrpc":"1.0","id":5,"method":"ping"})")["error"]["code"] == -32600);
+    // Non-string jsonrpc/method must not throw out of the kernel (CodeRabbit
+    // PR #89: .value() throws type_error on present-but-wrong-type keys).
+    CHECK(Handle(proto, R"({"jsonrpc":123,"id":5,"method":"ping"})")["error"]["code"] == -32600);
+    CHECK(Handle(proto, R"({"jsonrpc":"2.0","id":5,"method":7})")["error"]["code"] == -32600);
 }
 
 void TestUnknownMethod()
@@ -186,6 +190,9 @@ void TestUnknownResourceError()
     json r = Handle(proto, Request("resources/read", json{{"uri", "forge://nope"}}));
     CHECK(r["error"]["code"] == -32002); // MCP: resource not found
     CHECK(r["error"]["data"]["uri"] == "forge://nope");
+    // A non-string uri must produce an error response, not a throw.
+    json bad = Handle(proto, Request("resources/read", json{{"uri", 42}}));
+    CHECK(bad.contains("error"));
 }
 
 void TestEmptyResourcesList()
