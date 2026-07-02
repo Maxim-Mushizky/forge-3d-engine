@@ -799,12 +799,15 @@ ToolResult EditorApp::ToolManageScene(const json& args)
     }
     if (action == "save") {
         const std::string path = args.value("path", "");
+        const std::string previousPath = m_ScenePath; // roll back on failure, like SaveSceneAs
         if (!path.empty())
             m_ScenePath = path;
         if (m_ScenePath.empty())
             return Err("Scene is untitled; provide path");
-        if (!SaveScene())
-            return Err("Save failed: " + m_ScenePath);
+        if (!SaveScene()) {
+            m_ScenePath = previousPath;
+            return Err("Save failed: " + (path.empty() ? previousPath : path));
+        }
         return JsonResult(json{{"ok", true}, {"path", m_ScenePath}});
     }
     if (action == "import_model") {

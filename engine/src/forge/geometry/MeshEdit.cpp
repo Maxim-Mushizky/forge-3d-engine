@@ -149,6 +149,11 @@ std::shared_ptr<Mesh> MirrorBakeX(const Mesh& mesh)
 
 std::shared_ptr<Mesh> LaplacianSmoothMesh(const Mesh& mesh, float strength, int iterations)
 {
+    // Engine API, not tool-only: clamp here so no caller can extrapolate
+    // (strength > 1 explodes geometry) or spin unbounded passes.
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    iterations = std::clamp(iterations, 0, 64);
+
     std::vector<Vertex> verts = mesh.Vertices();
     std::vector<uint32_t> indices = mesh.Indices();
     MeshTopology topo = MeshTopology::Build(mesh);
