@@ -147,6 +147,44 @@ std::shared_ptr<Mesh> MirrorBakeX(const Mesh& mesh)
     return result;
 }
 
+std::shared_ptr<Mesh> LaplacianSmoothMesh(const Mesh& mesh, float strength, int iterations)
+{
+    // Engine API, not tool-only: clamp here so no caller can extrapolate
+    // (strength > 1 explodes geometry) or spin unbounded passes.
+    strength = std::clamp(strength, 0.0f, 1.0f);
+    iterations = std::clamp(iterations, 0, 64);
+
+    std::vector<Vertex> verts = mesh.Vertices();
+    std::vector<uint32_t> indices = mesh.Indices();
+    MeshTopology topo = MeshTopology::Build(mesh);
+
+    // Jacobi passes over weld groups: snapshot positions first so the result
+    // is independent of group iteration order.
+    std::vector<vec3> groupPos(topo.groups.size());
+    for (int pass = 0; pass < iterations; ++pass) {
+        for (size_t g = 0; g < topo.groups.size(); ++g)
+            groupPos[g] = verts[topo.groups[g][0]].position;
+        for (size_t g = 0; g < topo.groups.size(); ++g) {
+            const auto& nbrs = topo.groupNeighbors[g];
+            if (nbrs.empty())
+                continue;
+            vec3 avg{0.0f};
+            for (uint32_t n : nbrs)
+                avg += groupPos[n];
+            avg /= (float)nbrs.size();
+            const vec3 target = glm::mix(groupPos[g], avg, strength);
+            for (uint32_t vi : topo.groups[g])
+                verts[vi].position = target;
+        }
+    }
+
+    auto result = std::make_shared<Mesh>(std::move(verts), std::move(indices));
+    MeshTopology rtopo = MeshTopology::Build(*result);
+    RecomputeNormalsWelded(*result, rtopo);
+    result->UploadVertices();
+    return result;
+}
+
 std::shared_ptr<Mesh> LoopSubdivide(const Mesh& mesh, bool keepShape)
 {
     MeshTopology topo = MeshTopology::Build(mesh);

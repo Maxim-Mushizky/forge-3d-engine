@@ -55,6 +55,11 @@ struct MeshEdgeMap {
 // (no clipping in v1 — caller may warn). Normals are recomputed welded.
 std::shared_ptr<Mesh> MirrorBakeX(const Mesh& mesh);
 
+// Whole-mesh uniform Laplacian smooth (#77): each weld group relaxes toward
+// the average of its neighbor groups, `iterations` Jacobi passes blended by
+// `strength` in [0,1]. Seam copies move together (group space), UVs untouched.
+std::shared_ptr<Mesh> LaplacianSmoothMesh(const Mesh& mesh, float strength, int iterations);
+
 // Loop subdivision: 4x triangle count. Positions are smoothed in weld-GROUP
 // space (both seam copies read the same group-edge position — no cracks) while
 // connectivity and UVs stay on raw indices (seams keep their own UVs).
