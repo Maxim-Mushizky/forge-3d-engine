@@ -127,10 +127,15 @@ private:
     void ApplySettings();     // push camera tuning / font scale / tooltips
     void QueueSettingsSave(); // debounce: rewrite shortly after the last edit
     void DrawSettingsWindow();
-    // --- MCP server (#75/#76) ----------------------------------------------
-    void RegisterMcpTools();  // fills m_McpProtocol; A3/A4 grow this
+    // --- MCP server (#75/#76/#77) — tool bodies live in mcp/McpTools.cpp ----
+    void RegisterMcpTools();  // fills m_McpProtocol; A4 (#78) grows this
     void UpdateMcpServer();   // start/stop/restart to match settings + CLI flag
     void UpdateMcpRender();   // one path-tracer slice per UI frame (like turntable)
+    ToolResult ToolManageEntity(const nlohmann::json& args);
+    ToolResult ToolManageMaterial(const nlohmann::json& args);
+    ToolResult ToolManageLight(const nlohmann::json& args);
+    ToolResult ToolEditMesh(const nlohmann::json& args);
+    ToolResult ToolManageScene(const nlohmann::json& args);
 
     Window m_Window;
     Renderer m_Renderer;
