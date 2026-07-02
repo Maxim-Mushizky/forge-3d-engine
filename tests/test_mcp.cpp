@@ -1,0 +1,223 @@
+#include "test_framework.h"
+
+#include "mcp/McpProtocol.h"
+
+#include <json.hpp>
+
+#include <stdexcept>
+#include <string>
+
+// Exercises the GL-free MCP protocol kernel: JSON-RPC 2.0 framing, lifecycle,
+// tool/resource dispatch, and the error taxonomy (protocol errors vs isError
+// tool results). No sockets, no threads — HandleMessage in, JSON out.
+
+namespace forge::test {
+namespace {
+
+using nlohmann::json;
+
+McpProtocol MakeProtocolWithPing()
+{
+    McpProtocol proto;
+    proto.RegisterTool("ping", "Health check; returns pong.",
+                       json{{"type", "object"}, {"additionalProperties", false}},
+                       [](const json&) { return ToolResult::Text("pong"); });
+    return proto;
+}
+
+std::string Request(const char* method, json params = json::object(), json id = 1)
+{
+    json j{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}};
+    if (!params.empty())
+        j["params"] = params;
+    return j.dump();
+}
+
+json Handle(McpProtocol& proto, const std::string& body)
+{
+    std::string out = proto.HandleMessage(body);
+    if (out.empty())
+        return json(); // null marks "no response" (notification)
+    return json::parse(out);
+}
+
+void TestInitialize()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("initialize",
+                                   json{{"protocolVersion", "2025-11-25"},
+                                        {"capabilities", json::object()},
+                                        {"clientInfo", {{"name", "test"}, {"version", "0"}}}}));
+    CHECK(r["jsonrpc"] == "2.0");
+    CHECK(r["id"] == 1);
+    CHECK(r["result"]["protocolVersion"] == "2025-11-25");
+    CHECK(r["result"]["capabilities"].contains("tools"));
+    CHECK(r["result"]["capabilities"].contains("resources"));
+    CHECK(r["result"]["serverInfo"]["name"] == "forge");
+    CHECK(r["result"]["serverInfo"].contains("version"));
+}
+
+void TestInitializedNotificationHasNoResponse()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    // No "id" => notification => empty response (HTTP layer turns it into 202).
+    std::string out = proto.HandleMessage(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
+    CHECK(out.empty());
+}
+
+void TestPingMethod()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("ping"));
+    CHECK(r["result"].is_object());
+    CHECK(r["result"].empty());
+}
+
+void TestMalformedJsonIsParseError()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, "{not json");
+    CHECK(r["error"]["code"] == -32700);
+    CHECK(r["id"].is_null());
+}
+
+void TestInvalidRequestShapes()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    // Valid JSON but not a request object.
+    CHECK(Handle(proto, "42")["error"]["code"] == -32600);
+    // Batch arrays were removed from the MCP spec (2025-06-18) — reject them.
+    CHECK(Handle(proto, "[]")["error"]["code"] == -32600);
+    // Missing method.
+    CHECK(Handle(proto, R"({"jsonrpc":"2.0","id":5})")["error"]["code"] == -32600);
+    // Wrong jsonrpc version.
+    CHECK(Handle(proto, R"({"jsonrpc":"1.0","id":5,"method":"ping"})")["error"]["code"] == -32600);
+}
+
+void TestUnknownMethod()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("no/such_method"));
+    CHECK(r["error"]["code"] == -32601);
+    CHECK(r["id"] == 1);
+}
+
+void TestToolsList()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("tools/list"));
+    const json& tools = r["result"]["tools"];
+    CHECK(tools.is_array());
+    CHECK(tools.size() == 1);
+    CHECK(tools[0]["name"] == "ping");
+    CHECK(tools[0]["description"] == "Health check; returns pong.");
+    CHECK(tools[0]["inputSchema"]["type"] == "object");
+}
+
+void TestToolsCall()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("tools/call", json{{"name", "ping"}, {"arguments", json::object()}}));
+    CHECK(r["result"]["content"][0]["type"] == "text");
+    CHECK(r["result"]["content"][0]["text"] == "pong");
+    CHECK(r["result"]["isError"] == false);
+}
+
+void TestToolsCallWithoutArguments()
+{
+    // "arguments" may be absent for no-arg tools.
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("tools/call", json{{"name", "ping"}}));
+    CHECK(r["result"]["content"][0]["text"] == "pong");
+}
+
+void TestUnknownToolIsProtocolError()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("tools/call", json{{"name", "nope"}}));
+    CHECK(r["error"]["code"] == -32602);
+}
+
+void TestMissingToolNameIsProtocolError()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("tools/call"));
+    CHECK(r["error"]["code"] == -32602);
+}
+
+void TestThrowingToolBecomesIsErrorResult()
+{
+    // Execution failures are tool results (isError:true), not protocol errors —
+    // the model reads the message and self-corrects.
+    McpProtocol proto;
+    proto.RegisterTool("boom", "Always fails.", json{{"type", "object"}},
+                       [](const json&) -> ToolResult { throw std::runtime_error("kaboom"); });
+    json r = Handle(proto, Request("tools/call", json{{"name", "boom"}}));
+    CHECK(r["result"]["isError"] == true);
+    CHECK(r["result"]["content"][0]["text"] == "kaboom");
+}
+
+void TestResourcesListAndRead()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    proto.RegisterResource("forge://docs/test", "test-doc", "A doc.", "text/markdown",
+                           []() { return std::string("# hello"); });
+
+    json list = Handle(proto, Request("resources/list"));
+    CHECK(list["result"]["resources"].size() == 1);
+    CHECK(list["result"]["resources"][0]["uri"] == "forge://docs/test");
+    CHECK(list["result"]["resources"][0]["name"] == "test-doc");
+    CHECK(list["result"]["resources"][0]["mimeType"] == "text/markdown");
+
+    json read = Handle(proto, Request("resources/read", json{{"uri", "forge://docs/test"}}));
+    CHECK(read["result"]["contents"][0]["uri"] == "forge://docs/test");
+    CHECK(read["result"]["contents"][0]["text"] == "# hello");
+}
+
+void TestUnknownResourceError()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("resources/read", json{{"uri", "forge://nope"}}));
+    CHECK(r["error"]["code"] == -32002); // MCP: resource not found
+    CHECK(r["error"]["data"]["uri"] == "forge://nope");
+}
+
+void TestEmptyResourcesList()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    json r = Handle(proto, Request("resources/list"));
+    CHECK(r["result"]["resources"].is_array());
+    CHECK(r["result"]["resources"].empty());
+}
+
+void TestIdEcho()
+{
+    McpProtocol proto = MakeProtocolWithPing();
+    // String ids must round-trip unchanged.
+    json r = Handle(proto, Request("ping", json::object(), "abc-7"));
+    CHECK(r["id"] == "abc-7");
+}
+
+} // namespace
+
+void RunMcpTests()
+{
+    TestInitialize();
+    TestInitializedNotificationHasNoResponse();
+    TestPingMethod();
+    TestMalformedJsonIsParseError();
+    TestInvalidRequestShapes();
+    TestUnknownMethod();
+    TestToolsList();
+    TestToolsCall();
+    TestToolsCallWithoutArguments();
+    TestUnknownToolIsProtocolError();
+    TestMissingToolNameIsProtocolError();
+    TestThrowingToolBecomesIsErrorResult();
+    TestResourcesListAndRead();
+    TestUnknownResourceError();
+    TestEmptyResourcesList();
+    TestIdEcho();
+}
+
+} // namespace forge::test

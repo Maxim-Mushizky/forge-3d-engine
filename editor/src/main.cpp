@@ -32,6 +32,8 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--rt") == 0)
             app.SetRayTracing(true);
+        else if (std::strcmp(argv[i], "--mcp") == 0)
+            app.ForceEnableMcp();
         else if (std::strcmp(argv[i], "--hdri") == 0 && i + 1 < argc)
             app.LoadHDRIFile(argv[++i]);
         else if (EndsWithNoCase(argv[i], ".forge"))

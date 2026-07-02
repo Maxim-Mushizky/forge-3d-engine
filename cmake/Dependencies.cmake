@@ -66,7 +66,26 @@ FetchContent_Declare(manifold
     GIT_TAG v3.5.1
     GIT_SHALLOW TRUE)
 
-FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold)
+# --- cpp-httplib (header-only HTTP server for the embedded MCP endpoint) ------
+# Its CMake links ws2_32 for us; the in-header #pragma comment(lib,...) is
+# MSVC-only, so always consume it through the httplib::httplib target on MinGW.
+# Feature autodetection OFF: it would otherwise pick up Strawberry Perl's
+# OpenSSL/zlib on dev machines — a localhost-only plain-HTTP server needs none
+# of it. Non-blocking getaddrinfo needs GetAddrInfoExCancel, which MinGW-w64
+# headers don't declare; a server never resolves names anyway.
+set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_NON_BLOCKING_GETADDRINFO OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG v0.48.0
+    GIT_SHALLOW TRUE)
+
+FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold httplib)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp

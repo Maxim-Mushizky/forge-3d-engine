@@ -7,6 +7,7 @@
 #include "SculptTool.h"
 #include "Settings.h"
 #include "Toasts.h"
+#include "mcp/McpServer.h"
 
 #include <forge/geometry/MeshBoolean.h>
 #include <forge/platform/Window.h>
@@ -87,6 +88,7 @@ public:
     void ToggleEditMode();
     void ArmEditExtrude(); // start an edit-mode extrude drag + set its world slide line
     void OpenSceneFile(const std::string& path); // CLI arg / recents / drag-drop
+    void ForceEnableMcp(); // --mcp CLI flag: run the server without persisting the pref
 private:
     // --- scene file lifecycle (#1) ---------------------------------------
     enum class FileAction { None, NewScene, OpenScene, Exit };
@@ -125,6 +127,9 @@ private:
     void ApplySettings();     // push camera tuning / font scale / tooltips
     void QueueSettingsSave(); // debounce: rewrite shortly after the last edit
     void DrawSettingsWindow();
+    // --- MCP server (#75) --------------------------------------------------
+    void RegisterMcpTools();  // fills m_McpProtocol; A2/A3/A4 grow this
+    void UpdateMcpServer();   // start/stop/restart to match settings + CLI flag
 
     Window m_Window;
     Renderer m_Renderer;
@@ -244,6 +249,12 @@ private:
         vec2 cursorPx; // window client coords at drop time
     };
     std::vector<PendingDrop> m_PendingDrops;
+
+    // MCP (#75): protocol declared before the server so the server (which
+    // holds a reference to it) is destroyed first.
+    McpProtocol m_McpProtocol;
+    std::unique_ptr<McpServer> m_McpServer; // null = off
+    bool m_McpCliForced = false;            // --mcp: enabled for this run only
 };
 
 } // namespace forge

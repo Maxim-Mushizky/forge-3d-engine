@@ -31,6 +31,8 @@ void TestDefaultsRoundTrip()
     CHECK(Near(back.exportScale, s.exportScale));
     CHECK(Near(back.fontScale, s.fontScale));
     CHECK(back.showTooltips == s.showTooltips);
+    CHECK(back.mcpEnabled == s.mcpEnabled);
+    CHECK(back.mcpPort == s.mcpPort);
 }
 
 void TestModifiedValuesRoundTrip()
@@ -45,6 +47,8 @@ void TestModifiedValuesRoundTrip()
     s.recentFilesMax = 3;
     s.fontScale = 1.25f;
     s.showTooltips = false;
+    s.mcpEnabled = true;
+    s.mcpPort = 9123;
 
     Settings back = SettingsFromJson(SettingsToJson(s, ""));
     CHECK(Near(back.orbitSensitivity, 0.012f));
@@ -56,6 +60,8 @@ void TestModifiedValuesRoundTrip()
     CHECK(back.recentFilesMax == 3);
     CHECK(Near(back.fontScale, 1.25f));
     CHECK(back.showTooltips == false);
+    CHECK(back.mcpEnabled == true);
+    CHECK(back.mcpPort == 9123);
 }
 
 void TestMissingKeysFallBackToDefaults()

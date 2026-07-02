@@ -15,8 +15,10 @@ add_executable(forge_tests
     test_editmesh.cpp
     test_droprouter.cpp
     test_settings.cpp
+    test_mcp.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/Settings.cpp
+    ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpProtocol.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/raytrace/BVH.cpp

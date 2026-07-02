@@ -61,6 +61,8 @@ std::string SettingsToJson(const Settings& s, const std::string& existingJson)
 
     j["appearance"]["fontScale"] = s.fontScale;
     j["interface"]["showTooltips"] = s.showTooltips;
+    j["interface"]["mcpEnabled"] = s.mcpEnabled;
+    j["interface"]["mcpPort"] = s.mcpPort;
 
     return j.dump(2); // pretty-printed: the file is meant to be hand-editable
 }
@@ -97,7 +99,10 @@ Settings SettingsFromJson(const std::string& jsonText)
     Get(files, "exportScale", s.exportScale);
 
     Get(j.value("appearance", json::object()), "fontScale", s.fontScale);
-    Get(j.value("interface", json::object()), "showTooltips", s.showTooltips);
+    const json& ui = j.value("interface", json::object());
+    Get(ui, "showTooltips", s.showTooltips);
+    Get(ui, "mcpEnabled", s.mcpEnabled);
+    Get(ui, "mcpPort", s.mcpPort);
 
     return s;
 }
