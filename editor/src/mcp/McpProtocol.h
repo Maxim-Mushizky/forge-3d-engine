@@ -19,6 +19,11 @@ struct ToolResult {
 };
 
 using ToolHandler = std::function<ToolResult(const nlohmann::json& args)>;
+// Async tools receive a responder they may store and call on a later frame
+// (e.g. an amortized path-traced render). Call it exactly once; extra calls
+// are ignored.
+using ToolResponder = std::function<void(ToolResult)>;
+using AsyncToolHandler = std::function<void(const nlohmann::json& args, ToolResponder respond)>;
 using ResourceReader = std::function<std::string()>; // returns text content
 
 // GL-free MCP protocol kernel: JSON-RPC 2.0 framing + dispatch of the MCP
@@ -28,19 +33,22 @@ class McpProtocol {
 public:
     void RegisterTool(std::string name, std::string description,
                       nlohmann::json inputSchema, ToolHandler handler);
+    void RegisterToolAsync(std::string name, std::string description,
+                           nlohmann::json inputSchema, AsyncToolHandler handler);
     void RegisterResource(std::string uri, std::string name, std::string description,
                           std::string mimeType, ResourceReader reader);
 
-    // Handles one raw JSON-RPC message. Empty return = no response owed
-    // (notification) — the HTTP layer turns that into 202 Accepted.
-    std::string HandleMessage(const std::string& body);
+    // Handles one raw JSON-RPC message. `respond` fires exactly once — inline
+    // for everything except async tools, which may answer frames later. An
+    // empty string means no response body is owed (notification -> HTTP 202).
+    void HandleMessage(const std::string& body, std::function<void(std::string)> respond);
 
 private:
     struct Tool {
         std::string name;
         std::string description;
         nlohmann::json inputSchema;
-        ToolHandler handler;
+        AsyncToolHandler handler; // sync tools are wrapped at registration
     };
     struct Resource {
         std::string uri;

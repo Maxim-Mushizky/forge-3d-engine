@@ -51,7 +51,9 @@ private:
     std::thread m_Thread;
 
     std::mutex m_QueueMutex;
-    std::vector<std::unique_ptr<Pending>> m_Queue;
+    // shared_ptr: async tools (render_image) hold the responder — and with it
+    // the Pending — across frames until they answer.
+    std::vector<std::shared_ptr<Pending>> m_Queue;
 };
 
 } // namespace forge

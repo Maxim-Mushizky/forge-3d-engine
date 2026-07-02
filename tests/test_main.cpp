@@ -14,6 +14,7 @@ void RunEditMeshTests();
 void RunDropRouterTests();
 void RunSettingsTests();
 void RunMcpTests();
+void RunMeshStatsTests();
 } // namespace forge::test
 
 int main()
@@ -31,6 +32,7 @@ int main()
     RunDropRouterTests();
     RunSettingsTests();
     RunMcpTests();
+    RunMeshStatsTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

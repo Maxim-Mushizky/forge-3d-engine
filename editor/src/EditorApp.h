@@ -127,9 +127,10 @@ private:
     void ApplySettings();     // push camera tuning / font scale / tooltips
     void QueueSettingsSave(); // debounce: rewrite shortly after the last edit
     void DrawSettingsWindow();
-    // --- MCP server (#75) --------------------------------------------------
-    void RegisterMcpTools();  // fills m_McpProtocol; A2/A3/A4 grow this
+    // --- MCP server (#75/#76) ----------------------------------------------
+    void RegisterMcpTools();  // fills m_McpProtocol; A3/A4 grow this
     void UpdateMcpServer();   // start/stop/restart to match settings + CLI flag
+    void UpdateMcpRender();   // one path-tracer slice per UI frame (like turntable)
 
     Window m_Window;
     Renderer m_Renderer;
@@ -255,6 +256,16 @@ private:
     McpProtocol m_McpProtocol;
     std::unique_ptr<McpServer> m_McpServer; // null = off
     bool m_McpCliForced = false;            // --mcp: enabled for this run only
+
+    // render_image (#76): amortized like the turntable — ~8 spp per UI frame,
+    // the MCP response resolves when sppTarget is reached.
+    struct McpRenderJob {
+        bool active = false;
+        int sppTarget = 256;
+        mat4 viewProj{1.0f};    // frozen at start: requested aspect, current camera
+        ToolResponder respond;  // held until the render converges
+    };
+    McpRenderJob m_McpRender;
 };
 
 } // namespace forge
