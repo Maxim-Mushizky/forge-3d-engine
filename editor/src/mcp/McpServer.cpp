@@ -37,7 +37,7 @@ McpServer::McpServer(McpProtocol& protocol, int port)
             return;
         }
 
-        auto pending = std::make_unique<Pending>();
+        auto pending = std::make_shared<Pending>();
         pending->body = req.body;
         std::future<std::string> reply = pending->response.get_future();
         {
@@ -102,13 +102,17 @@ void McpServer::ProcessMainThread()
 
     // Swap out under the lock, then work locally: handlers may take a while
     // and must not hold the queue mutex against the listener threads.
-    std::vector<std::unique_ptr<Pending>> batch;
+    std::vector<std::shared_ptr<Pending>> batch;
     {
         std::lock_guard<std::mutex> lock(m_QueueMutex);
         batch.swap(m_Queue);
     }
-    for (std::unique_ptr<Pending>& p : batch)
-        p->response.set_value(m_Protocol.HandleMessage(p->body));
+    for (const std::shared_ptr<Pending>& p : batch) {
+        // Async tools keep this callback (and the Pending) alive until they
+        // answer on a later frame; everything else responds inline.
+        m_Protocol.HandleMessage(
+            p->body, [p](std::string response) { p->response.set_value(std::move(response)); });
+    }
 }
 
 } // namespace forge

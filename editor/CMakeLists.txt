@@ -10,7 +10,8 @@ add_executable(ForgeEditor
     src/Settings.cpp
     src/Toasts.cpp
     src/mcp/McpProtocol.cpp
-    src/mcp/McpServer.cpp)
+    src/mcp/McpServer.cpp
+    src/mcp/McpImage.cpp)
 
 target_include_directories(ForgeEditor PRIVATE vendor ${tinygltf_SOURCE_DIR}) # tinygltf dir: bundled json.hpp
 target_link_libraries(ForgeEditor PRIVATE forge imgui imguizmo httplib::httplib comdlg32)

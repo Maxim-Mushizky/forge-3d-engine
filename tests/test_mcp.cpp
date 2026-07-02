@@ -35,9 +35,15 @@ std::string Request(const char* method, json params = json::object(), json id = 
 
 json Handle(McpProtocol& proto, const std::string& body)
 {
-    std::string out = proto.HandleMessage(body);
+    std::string out;
+    bool called = false;
+    proto.HandleMessage(body, [&](std::string s) {
+        out = std::move(s);
+        called = true;
+    });
+    CHECK(called); // sync paths must respond before HandleMessage returns
     if (out.empty())
-        return json(); // null marks "no response" (notification)
+        return json(); // null marks "no response body" (notification -> 202)
     return json::parse(out);
 }
 
@@ -61,8 +67,8 @@ void TestInitializedNotificationHasNoResponse()
 {
     McpProtocol proto = MakeProtocolWithPing();
     // No "id" => notification => empty response (HTTP layer turns it into 202).
-    std::string out = proto.HandleMessage(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
-    CHECK(out.empty());
+    json r = Handle(proto, R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
+    CHECK(r.is_null());
 }
 
 void TestPingMethod()
@@ -92,6 +98,10 @@ void TestInvalidRequestShapes()
     CHECK(Handle(proto, R"({"jsonrpc":"2.0","id":5})")["error"]["code"] == -32600);
     // Wrong jsonrpc version.
     CHECK(Handle(proto, R"({"jsonrpc":"1.0","id":5,"method":"ping"})")["error"]["code"] == -32600);
+    // Non-string jsonrpc/method must not throw out of the kernel (CodeRabbit
+    // PR #89: .value() throws type_error on present-but-wrong-type keys).
+    CHECK(Handle(proto, R"({"jsonrpc":123,"id":5,"method":"ping"})")["error"]["code"] == -32600);
+    CHECK(Handle(proto, R"({"jsonrpc":"2.0","id":5,"method":7})")["error"]["code"] == -32600);
 }
 
 void TestUnknownMethod()
@@ -180,6 +190,9 @@ void TestUnknownResourceError()
     json r = Handle(proto, Request("resources/read", json{{"uri", "forge://nope"}}));
     CHECK(r["error"]["code"] == -32002); // MCP: resource not found
     CHECK(r["error"]["data"]["uri"] == "forge://nope");
+    // A non-string uri must produce an error response, not a throw.
+    json bad = Handle(proto, Request("resources/read", json{{"uri", 42}}));
+    CHECK(bad.contains("error"));
 }
 
 void TestEmptyResourcesList()
@@ -196,6 +209,53 @@ void TestIdEcho()
     // String ids must round-trip unchanged.
     json r = Handle(proto, Request("ping", json::object(), "abc-7"));
     CHECK(r["id"] == "abc-7");
+}
+
+void TestAsyncToolDeferredResponse()
+{
+    // Long-running tools (render_image) hold the responder and answer on a
+    // later frame; the response must not be produced until they do.
+    McpProtocol proto;
+    ToolResponder deferred;
+    proto.RegisterToolAsync("slow", "Answers later.", json{{"type", "object"}},
+                            [&](const json&, ToolResponder respond) { deferred = std::move(respond); });
+
+    std::string out;
+    bool called = false;
+    proto.HandleMessage(Request("tools/call", json{{"name", "slow"}}, 42),
+                        [&](std::string s) {
+                            out = std::move(s);
+                            called = true;
+                        });
+    CHECK(!called); // still pending
+
+    deferred(ToolResult::Text("done"));
+    CHECK(called);
+    json r = json::parse(out);
+    CHECK(r["id"] == 42);
+    CHECK(r["result"]["content"][0]["text"] == "done");
+    CHECK(r["result"]["isError"] == false);
+}
+
+void TestAsyncToolThrowBecomesIsError()
+{
+    // A synchronous throw out of an async handler must still produce a
+    // response, or the HTTP request would hang forever.
+    McpProtocol proto;
+    proto.RegisterToolAsync("bad", "Throws.", json{{"type", "object"}},
+                            [](const json&, ToolResponder) -> void { throw std::runtime_error("sync boom"); });
+    json r = Handle(proto, Request("tools/call", json{{"name", "bad"}}));
+    CHECK(r["result"]["isError"] == true);
+    CHECK(r["result"]["content"][0]["text"] == "sync boom");
+}
+
+void TestAsyncToolListedInToolsList()
+{
+    McpProtocol proto;
+    proto.RegisterToolAsync("slow", "Answers later.", json{{"type", "object"}},
+                            [](const json&, ToolResponder) {});
+    json r = Handle(proto, Request("tools/list"));
+    CHECK(r["result"]["tools"][0]["name"] == "slow");
 }
 
 } // namespace
@@ -218,6 +278,9 @@ void RunMcpTests()
     TestUnknownResourceError();
     TestEmptyResourcesList();
     TestIdEcho();
+    TestAsyncToolDeferredResponse();
+    TestAsyncToolThrowBecomesIsError();
+    TestAsyncToolListedInToolsList();
 }
 
 } // namespace forge::test

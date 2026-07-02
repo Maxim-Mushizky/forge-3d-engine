@@ -20,6 +20,7 @@ add_library(forge STATIC
     src/forge/geometry/MeshEdit.cpp
     src/forge/geometry/MeshBoolean.cpp
     src/forge/geometry/MeshRemesh.cpp
+    src/forge/geometry/MeshStats.cpp
     src/forge/raytrace/BVH.cpp
     src/forge/raytrace/PathTracer.cpp)
 

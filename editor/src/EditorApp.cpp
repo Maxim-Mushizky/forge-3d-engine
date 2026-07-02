@@ -2,6 +2,7 @@
 #include "DropRouter.h"
 #include "FileDialog.h"
 #include "Theme.h"
+#include "mcp/McpImage.h"
 
 #include <forge/assets/AssetManager.h>
 #include <forge/assets/MeshFactory.h>
@@ -10,6 +11,7 @@
 #include <forge/core/Log.h>
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
+#include <forge/geometry/MeshStats.h>
 #include <forge/renderer/Texture2D.h>
 #include <forge/scene/DropToGround.h>
 
@@ -181,6 +183,8 @@ void EditorApp::Run()
         bool rtActive = (m_RayTracing && !m_Sculpt.Active() && !m_Edit.Active()) || m_Turntable.active;
         if (m_Turntable.active)
             UpdateTurntable(); // drives the path tracer directly, bypasses settle logic
+        else if (m_McpRender.active)
+            UpdateMcpRender(); // MCP render owns the path tracer until it converges (#76)
         else if (rtActive)
             UpdateRayTracer();
         if (!rtActive || m_RTUploadPending)
@@ -1134,14 +1138,304 @@ void EditorApp::ApplySettings()
     UpdateMcpServer();
 }
 
+// --- MCP JSON helpers (#76) --------------------------------------------------
+// Entity ids serialize as strings: a raw uint64 exceeds the 2^53 safe-integer
+// range of the JS-centric MCP clients consuming this JSON.
+
+static nlohmann::json Vec3Json(const vec3& v) { return {v.x, v.y, v.z}; }
+
+static nlohmann::json MaterialJson(const Material& m)
+{
+    nlohmann::json j;
+    j["albedo"] = Vec3Json(m.albedo);
+    j["metallic"] = m.metallic;
+    j["roughness"] = m.roughness;
+    if (m.emissiveStrength > 0.0f) {
+        j["emissive"] = Vec3Json(m.emissive);
+        j["emissiveStrength"] = m.emissiveStrength;
+    }
+    if (m.transmission > 0.0f) {
+        j["transmission"] = m.transmission;
+        j["ior"] = m.ior;
+    }
+    if (m.albedoMap)
+        j["hasAlbedoMap"] = true;
+    return j;
+}
+
+static nlohmann::json EntityJson(const Scene& scene, const Entity& e)
+{
+    nlohmann::json j;
+    j["id"] = std::to_string(e.id);
+    j["name"] = e.name;
+    if (e.parent)
+        j["parent"] = std::to_string(e.parent);
+    j["translation"] = Vec3Json(e.transform.translation);
+    j["rotationDeg"] = Vec3Json(glm::degrees(e.transform.rotation));
+    j["scale"] = Vec3Json(e.transform.scale);
+    j["worldPosition"] = Vec3Json(vec3(scene.WorldTransform(e.id)[3]));
+    if (e.mesh)
+        j["mesh"] = {{"vertices", e.mesh->Vertices().size()},
+                     {"triangles", e.mesh->Indices().size() / 3}};
+    j["material"] = MaterialJson(e.material);
+    if (e.light.enabled)
+        j["light"] = {{"color", Vec3Json(e.light.color)},
+                      {"intensity", e.light.intensity},
+                      {"range", e.light.range}};
+    return j;
+}
+
+// Resolve a tool's target entity from {"id": "..."} (or {"name": "..."} as a
+// fallback). Returns null + fills `error` when nothing matches.
+static Entity* FindToolTarget(Scene& scene, const nlohmann::json& args, std::string& error)
+{
+    if (args.contains("id") && args["id"].is_string()) {
+        const std::string idStr = args["id"];
+        UUID id = 0;
+        try {
+            id = std::stoull(idStr);
+        } catch (const std::exception&) {
+            error = "Invalid entity id: " + idStr;
+            return nullptr;
+        }
+        if (Entity* e = scene.Find(id))
+            return e;
+        error = "No entity with id " + idStr;
+        return nullptr;
+    }
+    if (args.contains("name") && args["name"].is_string()) {
+        const std::string name = args["name"];
+        for (Entity& e : scene.Entities())
+            if (e.name == name)
+                return &e;
+        error = "No entity named \"" + name + "\"";
+        return nullptr;
+    }
+    error = "Provide \"id\" or \"name\"";
+    return nullptr;
+}
+
+static ToolResult JsonResult(const nlohmann::json& j)
+{
+    return ToolResult::Text(j.dump(2));
+}
+
 void EditorApp::RegisterMcpTools()
 {
-    // Stub tool proving the end-to-end path (#75); real perception/actuation
-    // tools land with A2/A3 (#76/#77).
+    using nlohmann::json;
+
     m_McpProtocol.RegisterTool(
         "ping", "Health check for the Forge MCP server; returns \"pong\".",
         {{"type", "object"}, {"additionalProperties", false}},
-        [](const nlohmann::json&) { return ToolResult::Text("pong"); });
+        [](const json&) { return ToolResult::Text("pong"); });
+
+    // --- perception (#76): read-only scene introspection ---------------------
+
+    m_McpProtocol.RegisterTool(
+        "get_scene",
+        "Full scene snapshot: all entities (ids, names, hierarchy, transforms, material "
+        "summaries, lights) plus sun, environment, and current selection.",
+        {{"type", "object"}, {"additionalProperties", false}}, [this](const json&) {
+            json j;
+            j["entities"] = json::array();
+            for (const Entity& e : m_Scene.Entities())
+                j["entities"].push_back(EntityJson(m_Scene, e));
+            j["sun"] = {{"azimuthDeg", m_SunAzimuth},
+                        {"elevationDeg", m_SunElevation},
+                        {"color", Vec3Json(m_Sun.color)},
+                        {"intensity", m_Sun.intensity}};
+            if (m_Env && m_Env->Valid())
+                j["environment"] = {{"path", m_EnvPath},
+                                    {"intensity", m_Env->intensity},
+                                    {"rotationDeg", m_Env->rotationDegrees}};
+            json sel = json::array();
+            for (UUID id : m_Selection)
+                sel.push_back(std::to_string(id));
+            j["selection"] = std::move(sel);
+            return JsonResult(j);
+        });
+
+    m_McpProtocol.RegisterTool(
+        "get_entity", "Full detail for one entity, looked up by id (or name).",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}, {"description", "Entity id from get_scene"}}},
+           {"name", {{"type", "string"}, {"description", "Entity name (first match)"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) {
+            std::string error;
+            Entity* e = FindToolTarget(m_Scene, args, error);
+            if (!e)
+                return ToolResult::Text(error, /*error=*/true);
+            json j = EntityJson(m_Scene, *e);
+            if (e->mesh) {
+                const AABB& b = e->mesh->Bounds();
+                j["mesh"]["boundsMin"] = Vec3Json(b.min);
+                j["mesh"]["boundsMax"] = Vec3Json(b.max);
+            }
+            json children = json::array();
+            for (UUID id : m_Scene.ChildrenOf(e->id))
+                children.push_back(std::to_string(id));
+            j["children"] = std::move(children);
+            return JsonResult(j);
+        });
+
+    m_McpProtocol.RegisterTool(
+        "get_mesh_stats",
+        "Topology diagnostics for an entity's mesh: triangle/vertex counts, degenerate "
+        "triangles, boundary and non-manifold edges, watertightness, UV presence, bounds.",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}}}, {"name", {{"type", "string"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) {
+            std::string error;
+            Entity* e = FindToolTarget(m_Scene, args, error);
+            if (!e)
+                return ToolResult::Text(error, /*error=*/true);
+            if (!e->mesh)
+                return ToolResult::Text("Entity \"" + e->name + "\" has no mesh", /*error=*/true);
+            MeshStats s = ComputeMeshStats(e->mesh->Vertices(), e->mesh->Indices());
+            json j{{"vertices", s.vertexCount},
+                   {"triangles", s.triangleCount},
+                   {"degenerateTriangles", s.degenerateTriangles},
+                   {"boundaryEdges", s.boundaryEdges},
+                   {"nonManifoldEdges", s.nonManifoldEdges},
+                   {"watertight", s.watertight},
+                   {"hasUVs", s.hasUVs},
+                   {"boundsMin", Vec3Json(s.bounds.min)},
+                   {"boundsMax", Vec3Json(s.bounds.max)},
+                   {"extents", Vec3Json(s.bounds.max - s.bounds.min)}};
+            return JsonResult(j);
+        });
+
+    m_McpProtocol.RegisterTool(
+        "raycast",
+        "Cast a ray and report the hit entity, position, and normal. Give either a world-"
+        "space origin+direction, or u/v in [0,1] to pick through the viewport camera.",
+        {{"type", "object"},
+         {"properties",
+          {{"origin", {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", "world [x,y,z]"}}},
+           {"direction", {{"type", "array"}, {"items", {{"type", "number"}}}, {"description", "world [x,y,z]"}}},
+           {"u", {{"type", "number"}, {"description", "viewport x in [0,1]"}}},
+           {"v", {{"type", "number"}, {"description", "viewport y in [0,1], top = 0"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) {
+            Ray ray;
+            auto vec3Of = [](const json& a) { return vec3(a[0], a[1], a[2]); };
+            if (args.contains("origin") && args.contains("direction") &&
+                args["origin"].is_array() && args["origin"].size() == 3 &&
+                args["direction"].is_array() && args["direction"].size() == 3) {
+                ray.origin = vec3Of(args["origin"]);
+                ray.direction = glm::normalize(vec3Of(args["direction"]));
+            } else if (args.contains("u") && args.contains("v")) {
+                ray = ViewportRay(vec2((float)args.value("u", 0.5), (float)args.value("v", 0.5)));
+            } else {
+                return ToolResult::Text("Provide origin+direction or u+v", /*error=*/true);
+            }
+            std::optional<RaycastHit> hit = m_Scene.Raycast(ray);
+            if (!hit)
+                return JsonResult(json{{"hit", false}});
+            const Entity* e = m_Scene.Find(hit->entity);
+            return JsonResult(json{{"hit", true},
+                                   {"entityId", std::to_string(hit->entity)},
+                                   {"entityName", e ? e->name : ""},
+                                   {"distance", hit->distance},
+                                   {"position", Vec3Json(hit->worldPos)},
+                                   {"normal", Vec3Json(hit->worldNormal)}});
+        });
+
+    m_McpProtocol.RegisterTool(
+        "viewport_screenshot",
+        "Grab the current viewport image (what the user sees) as a PNG.",
+        {{"type", "object"},
+         {"properties",
+          {{"maxDim", {{"type", "integer"}, {"description", "longest side in px, default 1024"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) {
+            int maxDim = args.value("maxDim", 1024);
+            maxDim = std::clamp(maxDim, 64, 2048);
+            const bool showRT = m_RayTracing && m_PathTracer.SampleCount() > 0;
+            const uint32_t tex = showRT ? m_PathTracer.DisplayTexture() : m_DisplayTex;
+            std::string b64 = TextureToPngBase64(tex, maxDim);
+            if (b64.empty())
+                return ToolResult::Text("No viewport image yet (editor still starting?)",
+                                        /*error=*/true);
+            ToolResult r;
+            r.content = json::array(
+                {{{"type", "image"}, {"data", std::move(b64)}, {"mimeType", "image/png"}}});
+            return r;
+        });
+
+    // Async: dispatches ~8 spp per UI frame and answers when converged, so the
+    // editor stays interactive during the render (see UpdateMcpRender).
+    m_McpProtocol.RegisterToolAsync(
+        "render_image",
+        "Path-traced render of the scene from the current camera at the given resolution "
+        "and samples-per-pixel. Runs in the background; the editor stays responsive.",
+        {{"type", "object"},
+         {"properties",
+          {{"width", {{"type", "integer"}, {"description", "px, default 512, max 1024"}}},
+           {"height", {{"type", "integer"}, {"description", "px, default 512, max 1024"}}},
+           {"spp", {{"type", "integer"}, {"description", "samples per pixel, default 256, max 4096"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args, ToolResponder respond) {
+            if (m_McpRender.active || m_Turntable.active) {
+                respond(ToolResult::Text("A render is already in progress", /*error=*/true));
+                return;
+            }
+            const int w = std::clamp(args.value("width", 512), 64, 1024);
+            const int h = std::clamp(args.value("height", 512), 64, 1024);
+
+            m_PathTracer.Resize((uint32_t)w, (uint32_t)h);
+            m_PathTracer.Upload(m_Scene);
+            GatherLights();
+            const mat4& view = m_Camera.View();
+            m_PathTracer.SetLens(0.0f, 1.0f, vec3(view[0][0], view[1][0], view[2][0]),
+                                 vec3(view[0][1], view[1][1], view[2][1]));
+            m_PathTracer.SetDenoise(m_Denoise, m_DenoiseStrength);
+            m_PathTracer.ResetAccumulation();
+
+            m_McpRender.active = true;
+            m_McpRender.sppTarget = std::clamp(args.value("spp", 256), 8, 4096);
+            // Projection rebuilt for the requested aspect; the viewport's own
+            // matrix would letterbox-stretch anything non-viewport-shaped.
+            m_McpRender.viewProj = glm::perspective(glm::radians(m_Camera.FOV()),
+                                                    (float)w / (float)h, 0.1f, 1000.0f) *
+                                   view;
+            m_McpRender.camPos = m_Camera.Position();
+            m_McpRender.respond = std::move(respond);
+        });
+}
+
+void EditorApp::UpdateMcpRender()
+{
+    McpRenderJob& job = m_McpRender;
+    if (!job.active)
+        return;
+
+    m_PathTracer.Dispatch(job.viewProj, job.camPos, m_Sun, m_Bounces, m_FrameLights,
+                          m_Env.get(), 8);
+    if (m_PathTracer.SampleCount() < job.sppTarget)
+        return;
+
+    ToolResult r;
+    std::string b64 = TextureToPngBase64(m_PathTracer.DisplayTexture(), 1024);
+    if (b64.empty()) {
+        r = ToolResult::Text("Render readback failed", /*error=*/true);
+    } else {
+        r.content = nlohmann::json::array(
+            {{{"type", "image"}, {"data", std::move(b64)}, {"mimeType", "image/png"}},
+             {{"type", "text"},
+              {"text", std::to_string(m_PathTracer.Width()) + "x" +
+                           std::to_string(m_PathTracer.Height()) + " render, " +
+                           std::to_string(m_PathTracer.SampleCount()) + " spp"}}});
+    }
+    job.active = false;
+    ToolResponder respond = std::move(job.respond);
+    job.respond = nullptr;
+    m_LastSceneHash = 0; // interactive RT must re-upload + resize after we hijacked the PT
+    respond(std::move(r));
 }
 
 void EditorApp::UpdateMcpServer()
