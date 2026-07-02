@@ -86,6 +86,9 @@ McpServer::~McpServer()
         m_Http->stop();
         m_Running = false;
     }
+    // join() is a hard barrier against use-after-free: listen_after_bind()
+    // ends with task_queue->shutdown(), which joins every handler thread, so
+    // m_Thread can't return while any handler still touches `this`.
     if (m_Thread.joinable())
         m_Thread.join();
     // Unprocessed queue entries die with us; their promises break, but every
