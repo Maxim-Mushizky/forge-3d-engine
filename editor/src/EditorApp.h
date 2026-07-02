@@ -79,7 +79,7 @@ private:
     void DrawHierarchyNode(Entity& e);
     void ImportModel();                          // file dialog
 public:
-    void ImportModel(const std::string& path);   // direct (CLI arg / drag-drop)
+    bool ImportModel(const std::string& path);   // direct (CLI arg / drag-drop); false = load failed
     void SetRayTracing(bool enabled) { m_RayTracing = enabled; }
     bool LoadHDRIFile(const std::string& path);
     void ToggleSculptMode();
@@ -114,6 +114,10 @@ private:
     uint64_t SceneHash() const;
     // Build a world-space ray through a point on the viewport image (uv in [0,1]).
     Ray ViewportRay(const vec2& uv) const;
+    // Drag-drop (#2): the OS drop lands mid-PollEvents, so files are queued with
+    // the cursor position and routed once per frame (viewport rect is stable then).
+    void ProcessPendingDrops();
+    void DropImageOnViewport(const std::string& path, const vec2& cursorPx);
 
     Window m_Window;
     Renderer m_Renderer;
@@ -223,6 +227,12 @@ private:
     vec2 m_ViewportPos{0.0f};  // screen-space top-left of the viewport image
     vec2 m_ViewportSize{1280.0f, 720.0f};
     int m_SpawnCounter = 1;
+
+    struct PendingDrop {
+        std::vector<std::string> paths;
+        vec2 cursorPx; // window client coords at drop time
+    };
+    std::vector<PendingDrop> m_PendingDrops;
 };
 
 } // namespace forge

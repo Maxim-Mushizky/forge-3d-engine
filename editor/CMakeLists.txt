@@ -6,6 +6,7 @@ add_executable(ForgeEditor
     src/SculptTool.cpp
     src/ExtrudeTool.cpp
     src/EditTool.cpp
+    src/DropRouter.cpp
     src/Toasts.cpp)
 
 target_include_directories(ForgeEditor PRIVATE vendor ${tinygltf_SOURCE_DIR}) # tinygltf dir: bundled json.hpp

@@ -1,4 +1,5 @@
 #include "EditorApp.h"
+#include "DropRouter.h"
 #include "FileDialog.h"
 #include "Theme.h"
 
@@ -9,6 +10,7 @@
 #include <forge/core/Log.h>
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
+#include <forge/renderer/Texture2D.h>
 #include <forge/scene/DropToGround.h>
 
 #include <GL/glew.h>
@@ -95,6 +97,14 @@ EditorApp::EditorApp()
 
     LoadRecentFiles();
     MarkSaved(); // the starter scene isn't "unsaved work"
+
+    // Drag-drop import (#2): queue with the cursor position (image drops target
+    // the entity under the cursor) and route next frame in ProcessPendingDrops.
+    m_Window.SetDropCallback([this](const std::vector<std::string>& paths) {
+        PendingDrop drop{paths, {}};
+        m_Window.CursorPos(drop.cursorPx.x, drop.cursorPx.y);
+        m_PendingDrops.push_back(std::move(drop));
+    });
 }
 
 EditorApp::~EditorApp()
@@ -119,6 +129,7 @@ void EditorApp::Run()
         }
 
         UpdateWindowTitle();
+        ProcessPendingDrops();
 
         float az = glm::radians(m_SunAzimuth), el = glm::radians(m_SunElevation);
         m_Sun.direction = -vec3(std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az));
@@ -1032,16 +1043,16 @@ void EditorApp::ImportModel()
 {
     std::string path = OpenFileDialog(m_Window.NativeHandle(),
                                       "3D Models (glTF, OBJ)\0*.gltf;*.glb;*.obj\0All Files\0*.*\0");
-    if (!path.empty())
-        ImportModel(path);
+    if (!path.empty() && !ImportModel(path))
+        m_Toasts.Push(ToastManager::Kind::Error, "Couldn't import " + FileName(path));
 }
 
-void EditorApp::ImportModel(const std::string& path)
+bool EditorApp::ImportModel(const std::string& path)
 {
     const std::vector<ImportedPart>* parts = AssetManager::Get().LoadModel(path);
     if (!parts) {
         FORGE_ERROR("Import failed: %s", path.c_str());
-        return;
+        return false;
     }
 
     // Combined bounds of all parts (vertices already share the model's space).
@@ -1088,6 +1099,85 @@ void EditorApp::ImportModel(const std::string& path)
     }
     SelectOnly(selectId);
     m_Commands.Push(std::move(composite));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Drag-drop import (#2)
+// ---------------------------------------------------------------------------
+
+void EditorApp::ProcessPendingDrops()
+{
+    // Swap out first: a routed action (e.g. the unsaved-changes modal) must not
+    // see a half-consumed queue if it re-enters the frame loop.
+    std::vector<PendingDrop> drops;
+    drops.swap(m_PendingDrops);
+
+    // RequestWithUnsavedCheck holds a single pending action, so only the first
+    // scene in a multi-file drop can open; later ones would silently clobber it.
+    bool sceneOpenRequested = false;
+
+    for (const PendingDrop& drop : drops) {
+        for (const std::string& path : drop.paths) {
+            switch (ClassifyDrop(path)) {
+            case DropAction::ImportModel:
+                if (ImportModel(path))
+                    m_Toasts.Push(ToastManager::Kind::Success, "Imported " + FileName(path));
+                else
+                    m_Toasts.Push(ToastManager::Kind::Error, "Couldn't import " + FileName(path));
+                break;
+            case DropAction::LoadHdri:
+                if (LoadHDRIFile(path))
+                    m_Toasts.Push(ToastManager::Kind::Success, "Sky: " + FileName(path));
+                else
+                    m_Toasts.Push(ToastManager::Kind::Error, "Couldn't load HDRI " + FileName(path));
+                break;
+            case DropAction::AssignTexture:
+                DropImageOnViewport(path, drop.cursorPx);
+                break;
+            case DropAction::OpenScene:
+                if (sceneOpenRequested) {
+                    m_Toasts.Push(ToastManager::Kind::Info,
+                                  FileName(path) + " skipped - one scene at a time");
+                } else {
+                    sceneOpenRequested = true;
+                    RequestWithUnsavedCheck(FileAction::OpenScene, path);
+                }
+                break;
+            case DropAction::UnsupportedStl:
+                m_Toasts.Push(ToastManager::Kind::Info,
+                              "STL import isn't supported yet - use glTF or OBJ");
+                break;
+            case DropAction::Unknown:
+                m_Toasts.Push(ToastManager::Kind::Info,
+                              FileName(path) + ": unsupported file type");
+                break;
+            }
+        }
+    }
+}
+
+void EditorApp::DropImageOnViewport(const std::string& path, const vec2& cursorPx)
+{
+    vec2 uv = (cursorPx - m_ViewportPos) / m_ViewportSize;
+    std::optional<RaycastHit> hit;
+    if (uv.x >= 0.0f && uv.x <= 1.0f && uv.y >= 0.0f && uv.y <= 1.0f)
+        hit = m_Scene.Raycast(ViewportRay(uv));
+    Entity* e = hit ? m_Scene.Find(hit->entity) : nullptr;
+    if (!e || !e->mesh) {
+        m_Toasts.Push(ToastManager::Kind::Info,
+                      "Drop an image onto an object to use it as a texture");
+        return;
+    }
+
+    auto tex = Texture2D::FromFile(path, /*srgb=*/true, /*flipV=*/false);
+    if (!tex) {
+        m_Toasts.Push(ToastManager::Kind::Error, "Couldn't load image " + FileName(path));
+        return;
+    }
+    // Direct assignment matches the inspector's albedo-map clear (no undo entry).
+    e->material.albedoMap = tex;
+    m_Toasts.Push(ToastManager::Kind::Success, e->name + ": albedo set to " + FileName(path));
 }
 
 void EditorApp::MirrorSelected()
