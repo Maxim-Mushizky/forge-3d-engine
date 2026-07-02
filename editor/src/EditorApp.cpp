@@ -1043,8 +1043,8 @@ void EditorApp::ImportModel()
 {
     std::string path = OpenFileDialog(m_Window.NativeHandle(),
                                       "3D Models (glTF, OBJ)\0*.gltf;*.glb;*.obj\0All Files\0*.*\0");
-    if (!path.empty())
-        ImportModel(path);
+    if (!path.empty() && !ImportModel(path))
+        m_Toasts.Push(ToastManager::Kind::Error, "Couldn't import " + FileName(path));
 }
 
 bool EditorApp::ImportModel(const std::string& path)
