@@ -104,7 +104,8 @@ EditorApp::EditorApp()
     cube.transform.translation = {0.0f, 0.5f, 0.0f};
     cube.material.albedo = {0.85f, 0.35f, 0.25f};
 
-    LoadSettings(); // before recents: recentFilesMax caps the list
+    RegisterMcpTools(); // before LoadSettings: ApplySettings may start the server
+    LoadSettings();     // before recents: recentFilesMax caps the list
     LoadRecentFiles();
     MarkSaved(); // the starter scene isn't "unsaved work"
 
@@ -141,6 +142,8 @@ void EditorApp::Run()
 
         UpdateWindowTitle();
         ProcessPendingDrops();
+        if (m_McpServer)
+            m_McpServer->ProcessMainThread(); // serial tool execution between frames (#75)
         if (m_SettingsSaveAt > 0.0 && ImGui::GetTime() >= m_SettingsSaveAt) {
             m_SettingsSaveAt = 0.0;
             SaveSettings();
@@ -1127,6 +1130,53 @@ void EditorApp::ApplySettings()
 
     ImGui::GetIO().FontGlobalScale = m_Settings.fontScale;
     s_ShowTooltips = m_Settings.showTooltips;
+
+    UpdateMcpServer();
+}
+
+void EditorApp::RegisterMcpTools()
+{
+    // Stub tool proving the end-to-end path (#75); real perception/actuation
+    // tools land with A2/A3 (#76/#77).
+    m_McpProtocol.RegisterTool(
+        "ping", "Health check for the Forge MCP server; returns \"pong\".",
+        {{"type", "object"}, {"additionalProperties", false}},
+        [](const nlohmann::json&) { return ToolResult::Text("pong"); });
+}
+
+void EditorApp::UpdateMcpServer()
+{
+    const bool want = m_Settings.mcpEnabled || m_McpCliForced;
+    const int port = m_Settings.mcpPort;
+
+    if (want && m_McpServer && m_McpServer->Port() == port)
+        return; // already running as configured
+    if (!want && !m_McpServer)
+        return;
+
+    if (m_McpServer) {
+        m_McpServer.reset();
+        if (!want) {
+            m_Toasts.Push(ToastManager::Kind::Info, "MCP server stopped");
+            return;
+        }
+    }
+
+    m_McpServer = std::make_unique<McpServer>(m_McpProtocol, port);
+    if (m_McpServer->Running()) {
+        m_Toasts.Push(ToastManager::Kind::Success,
+                      "MCP server on http://127.0.0.1:" + std::to_string(port) + "/mcp");
+    } else {
+        m_McpServer.reset();
+        m_Toasts.Push(ToastManager::Kind::Error,
+                      "MCP: can't listen on port " + std::to_string(port) + " (in use?)");
+    }
+}
+
+void EditorApp::ForceEnableMcp()
+{
+    m_McpCliForced = true;
+    UpdateMcpServer();
 }
 
 void EditorApp::QueueSettingsSave()
@@ -1265,8 +1315,18 @@ void EditorApp::DrawSettingsWindow()
         }
         if (ImGui::BeginTabItem("Interface")) {
             changed |= ImGui::Checkbox("Show tooltips", &m_Settings.showTooltips);
+            ImGui::SeparatorText("MCP server");
+            changed |= ImGui::Checkbox("Enable MCP server", &m_Settings.mcpEnabled);
+            Tip("Lets an AI agent (e.g. Claude) drive the editor over localhost.\n"
+                "claude mcp add --transport http forge http://127.0.0.1:<port>/mcp");
+            if (ImGui::InputInt("Port", &m_Settings.mcpPort)) {
+                m_Settings.mcpPort = std::clamp(m_Settings.mcpPort, 1024, 65535);
+                changed = true;
+            }
             if (restoreButton()) {
                 m_Settings.showTooltips = defaults.showTooltips;
+                m_Settings.mcpEnabled = defaults.mcpEnabled;
+                m_Settings.mcpPort = defaults.mcpPort;
                 changed = true;
             }
             ImGui::EndTabItem();

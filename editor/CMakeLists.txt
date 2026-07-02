@@ -8,7 +8,11 @@ add_executable(ForgeEditor
     src/EditTool.cpp
     src/DropRouter.cpp
     src/Settings.cpp
-    src/Toasts.cpp)
+    src/Toasts.cpp
+    src/mcp/McpProtocol.cpp
+    src/mcp/McpServer.cpp)
 
 target_include_directories(ForgeEditor PRIVATE vendor ${tinygltf_SOURCE_DIR}) # tinygltf dir: bundled json.hpp
-target_link_libraries(ForgeEditor PRIVATE forge imgui imguizmo comdlg32)
+target_link_libraries(ForgeEditor PRIVATE forge imgui imguizmo httplib::httplib comdlg32)
+# cpp-httplib requires Windows 10 APIs; MinGW-w64 headers default _WIN32_WINNT lower.
+target_compile_definitions(ForgeEditor PRIVATE _WIN32_WINNT=0x0A00)

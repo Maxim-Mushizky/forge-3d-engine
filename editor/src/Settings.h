@@ -36,6 +36,8 @@ struct Settings {
 
     // --- interface -------------------------------------------------------
     bool showTooltips = true;
+    bool mcpEnabled = false; // embedded MCP server (#75); off by default
+    int mcpPort = 8765;      // localhost-only listen port
 };
 
 // JSON round-trip is pure (no file I/O) so it's unit-testable headless.
