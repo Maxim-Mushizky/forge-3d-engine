@@ -1113,6 +1113,10 @@ void EditorApp::ProcessPendingDrops()
     std::vector<PendingDrop> drops;
     drops.swap(m_PendingDrops);
 
+    // RequestWithUnsavedCheck holds a single pending action, so only the first
+    // scene in a multi-file drop can open; later ones would silently clobber it.
+    bool sceneOpenRequested = false;
+
     for (const PendingDrop& drop : drops) {
         for (const std::string& path : drop.paths) {
             switch (ClassifyDrop(path)) {
@@ -1132,7 +1136,13 @@ void EditorApp::ProcessPendingDrops()
                 DropImageOnViewport(path, drop.cursorPx);
                 break;
             case DropAction::OpenScene:
-                RequestWithUnsavedCheck(FileAction::OpenScene, path);
+                if (sceneOpenRequested) {
+                    m_Toasts.Push(ToastManager::Kind::Info,
+                                  FileName(path) + " skipped - one scene at a time");
+                } else {
+                    sceneOpenRequested = true;
+                    RequestWithUnsavedCheck(FileAction::OpenScene, path);
+                }
                 break;
             case DropAction::UnsupportedStl:
                 m_Toasts.Push(ToastManager::Kind::Info,
