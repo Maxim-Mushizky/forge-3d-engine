@@ -11,6 +11,7 @@ void RunDropToGroundTests();
 void RunBvhTests();
 void RunSnapTests();
 void RunEditMeshTests();
+void RunDropRouterTests();
 } // namespace forge::test
 
 int main()
@@ -25,6 +26,7 @@ int main()
     RunBvhTests();
     RunSnapTests();
     RunEditMeshTests();
+    RunDropRouterTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

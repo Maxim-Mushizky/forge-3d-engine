@@ -46,6 +46,12 @@ Window::Window(uint32_t width, uint32_t height, const std::string& title)
         self->m_Height = (uint32_t)h;
         glViewport(0, 0, w, h);
     });
+    glfwSetDropCallback(m_Handle, [](GLFWwindow* win, int count, const char** paths) {
+        auto* self = (Window*)glfwGetWindowUserPointer(win);
+        if (!self->m_DropCallback)
+            return;
+        self->m_DropCallback(std::vector<std::string>(paths, paths + count));
+    });
 }
 
 Window::~Window()
@@ -61,5 +67,18 @@ void Window::PollEvents() { glfwPollEvents(); }
 void Window::SwapBuffers() { glfwSwapBuffers(m_Handle); }
 void Window::SetVSync(bool enabled) { glfwSwapInterval(enabled ? 1 : 0); }
 void Window::SetTitle(const std::string& title) { glfwSetWindowTitle(m_Handle, title.c_str()); }
+
+void Window::SetDropCallback(std::function<void(const std::vector<std::string>&)> callback)
+{
+    m_DropCallback = std::move(callback);
+}
+
+void Window::CursorPos(float& x, float& y) const
+{
+    double cx = 0.0, cy = 0.0;
+    glfwGetCursorPos(m_Handle, &cx, &cy);
+    x = (float)cx;
+    y = (float)cy;
+}
 
 } // namespace forge

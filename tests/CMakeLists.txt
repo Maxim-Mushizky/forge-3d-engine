@@ -13,6 +13,8 @@ add_executable(forge_tests
     test_bvh.cpp
     test_snap.cpp
     test_editmesh.cpp
+    test_droprouter.cpp
+    ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/raytrace/BVH.cpp
@@ -22,6 +24,7 @@ add_executable(forge_tests
 
 target_include_directories(forge_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/src
+    ${CMAKE_SOURCE_DIR}/editor/src # GL-free editor kernels (DropRouter)
     ${tinygltf_SOURCE_DIR}) # bundled nlohmann json.hpp
 target_link_libraries(forge_tests PRIVATE glm::glm)
 

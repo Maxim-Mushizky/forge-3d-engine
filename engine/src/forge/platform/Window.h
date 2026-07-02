@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 struct GLFWwindow;
 
@@ -24,6 +26,9 @@ public:
     void SwapBuffers();
     void SetVSync(bool enabled);
     void SetTitle(const std::string& title);
+    // Files dragged from the OS onto the window (absolute paths, one call per drop).
+    void SetDropCallback(std::function<void(const std::vector<std::string>&)> callback);
+    void CursorPos(float& x, float& y) const; // client-area pixels
 
     uint32_t Width() const { return m_Width; }
     uint32_t Height() const { return m_Height; }
@@ -33,6 +38,7 @@ private:
     GLFWwindow* m_Handle = nullptr;
     uint32_t m_Width;
     uint32_t m_Height;
+    std::function<void(const std::vector<std::string>&)> m_DropCallback;
 };
 
 } // namespace forge
