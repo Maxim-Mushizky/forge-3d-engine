@@ -5,6 +5,7 @@
 # Local AI/editor config
 .claude/
 CLAUDE.md
+lessons-learned/
 
 # Build output
 build/
