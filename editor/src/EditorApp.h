@@ -128,14 +128,19 @@ private:
     void QueueSettingsSave(); // debounce: rewrite shortly after the last edit
     void DrawSettingsWindow();
     // --- MCP server (#75/#76/#77) — tool bodies live in mcp/McpTools.cpp ----
-    void RegisterMcpTools();  // fills m_McpProtocol; A4 (#78) grows this
+    void RegisterMcpTools();  // fills m_McpProtocol
     void UpdateMcpServer();   // start/stop/restart to match settings + CLI flag
     void UpdateMcpRender();   // one path-tracer slice per UI frame (like turntable)
+    ToolResult ToolGetScene(const nlohmann::json& args);
+    ToolResult ToolGetEntity(const nlohmann::json& args);
+    ToolResult ToolGetMeshStats(const nlohmann::json& args);
+    ToolResult ToolRaycast(const nlohmann::json& args);
     ToolResult ToolManageEntity(const nlohmann::json& args);
     ToolResult ToolManageMaterial(const nlohmann::json& args);
     ToolResult ToolManageLight(const nlohmann::json& args);
     ToolResult ToolEditMesh(const nlohmann::json& args);
     ToolResult ToolManageScene(const nlohmann::json& args);
+    ToolResult ToolExecuteScript(const nlohmann::json& args); // #78: Lua, one undo entry
 
     Window m_Window;
     Renderer m_Renderer;

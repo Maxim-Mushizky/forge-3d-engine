@@ -14,6 +14,7 @@ void RunEditMeshTests();
 void RunDropRouterTests();
 void RunSettingsTests();
 void RunMcpTests();
+void RunMcpScriptTests();
 void RunMeshStatsTests();
 } // namespace forge::test
 
@@ -32,6 +33,7 @@ int main()
     RunDropRouterTests();
     RunSettingsTests();
     RunMcpTests();
+    RunMcpScriptTests();
     RunMeshStatsTests();
 
     if (g_failures == 0) {

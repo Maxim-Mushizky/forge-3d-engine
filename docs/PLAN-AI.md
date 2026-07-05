@@ -53,9 +53,11 @@ Shipped precedents converge: Unity MCP = 47 focused tools in 10 groups; ChiR24/U
 domain-multiplexed tools ("related actions live on their parent tools so clients load less
 context"); blender-mcp = ~22 tools + code escape hatch. [verified 3-0, 3-0, 2-1]
 
-Forge: **~15–40 domain-grouped tools** (#76 perception, #77 actuation) plus a **batch op-list
-tool** (#78) — code-interpreter-style batching is validated by LL3M (assets as code) and
-SceneCraft (ICML 2024: scripts placing ~100 assets). [verified 3-0 ×2]
+Forge: **~15–40 domain-grouped tools** (#76 perception, #77 actuation) plus **sandboxed Lua
+scripting** (#78, `execute_script`) — code-as-actuation is validated by LL3M (assets as code)
+and SceneCraft (ICML 2024: scripts placing ~100 assets). [verified 3-0 ×2] (#78 was originally
+a JSON batch op-list; re-specced 2026-07-05 — batching without loops/variables keeps the token
+problem, and blender-mcp's real workhorse is its code escape hatch, not its tool list.)
 
 **The render-feedback loop is load-bearing.** BlenderAlchemy (ECCV 2024): without a visual
 target "the verisimilitude of the material plateaus very quickly"; its evaluator + edit-reversion
@@ -103,8 +105,14 @@ hair strands (mesh cards v1), UV *editing* tools (unwrap only).
 
 ## 6. Roadmap
 
-Epic #74. Order: #75 → #76 → #77 → #78 → #79 (agent builds prop scenes) → #80 → #16 → #81
-→ #82 → #17 (complex-asset engine floor) → #83 → #84 (generation) → #85 → #86 (human milestone).
+Epic #74, restructured 2026-07-05 into two sub-epics after #75–#77 shipped: **#96 Draftsman I
+(code-as-actuation)** = #78 Lua `execute_script` → #91 extended `forge.*` bindings → #79 skill
+library + RAG resources; **#97 Draftsman II (eyes & spatial sense)** = #92 render controls →
+#93 multi-view/diagnostic renders → #94 spatial introspection → #95 relational placement.
+
+Order: #75 ✅ → #76 ✅ → #77 ✅ → #78 → #92 → #93 → #94 → #95 → #91 → #79 (agent builds prop
+scenes) → #80 → #16 → #81 → #82 → #17 (complex-asset engine floor) → #83 → #84 (generation)
+→ #85 → #86 (human milestone).
 
 Milestone acceptance (#86): a fresh Claude session, told only *"create a realistic middle-aged
 man, casually posed, studio-lit, and render a portrait"*, completes unassisted via MCP.
