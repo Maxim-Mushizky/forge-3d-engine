@@ -141,6 +141,14 @@ private:
     ToolResult ToolPlaceRelative(const nlohmann::json& args); // #95: on/above/against/facing/around
     ToolResult ToolSnapToSurface(const nlohmann::json& args); // #95: rest on surface (down or ray)
     ToolResult ToolArrangeEntities(const nlohmann::json& args); // #95: align / distribute
+    // #91: script-only bindings (forge.* Lua surface, no top-level MCP tools)
+    ToolResult ToolCameraOp(const nlohmann::json& args);        // pose / FOV / bookmarks
+    ToolResult ToolSelectOp(const nlohmann::json& args);        // select / toggle / box
+    ToolResult ToolSceneStructure(const nlohmann::json& args);  // group / ungroup / drop
+    ToolResult ToolSnapSettings(const nlohmann::json& args);    // gizmo snap prefs
+    ToolResult ToolMeshElements(const nlohmann::json& args);    // face/edge id queries
+    ToolResult ToolEditElements(const nlohmann::json& args);    // extrude/subdivide/shade
+    ToolResult ToolExportStl(const nlohmann::json& args);
     // Combined world AABB of an entity and its descendants; optionally
     // collects the subtree's ids (for excluding it from collision queries).
     AABB SubtreeWorldBounds(UUID root, std::unordered_set<UUID>* members);

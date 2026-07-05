@@ -19,6 +19,7 @@ void RunMcpViewsTests();
 void RunMeshStatsTests();
 void RunSpatialTests();
 void RunPlacementTests();
+void RunMcpElementsTests();
 } // namespace forge::test
 
 int main()
@@ -41,6 +42,7 @@ int main()
     RunMeshStatsTests();
     RunSpatialTests();
     RunPlacementTests();
+    RunMcpElementsTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

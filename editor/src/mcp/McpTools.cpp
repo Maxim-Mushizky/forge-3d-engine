@@ -1,9 +1,12 @@
 #include "EditorApp.h"
+#include "mcp/McpElements.h"
 #include "mcp/McpImage.h"
 #include "mcp/McpScript.h"
 #include "mcp/McpViews.h"
 
 #include <forge/assets/MeshFactory.h>
+#include <forge/assets/StlExporter.h>
+#include <forge/geometry/EditMesh.h>
 #include <forge/geometry/MeshBoolean.h>
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
@@ -617,8 +620,15 @@ void EditorApp::RegisterMcpTools()
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
-        "look_at{}, set_render_settings{}. Writes return the affected entity as a "
-        "table (use .id). "
+        "look_at{}, set_render_settings{}. Editor surface (#91, script-only): "
+        "camera{}/set_camera{}/store_view{}/recall_view{} (orbit pose, FOV, "
+        "bookmarks 1-4), select{}/toggle_select{}/clear_selection{}/"
+        "get_selection{}/box_select{} (viewport-UV marquee), group{}/ungroup{}/"
+        "drop_to_ground{}, snap_settings{}, mesh_elements{} (face/edge ids + "
+        "world centers; face id = raycast triIndex/3; ofFaces maps faces to "
+        "their edges), extrude_faces{}/extrude_edges{}/subdivide_faces{}/"
+        "subdivide_edges{}/shade{} (edit-mode element ops by id), export_stl{}. "
+        "Writes return the affected entity as a table (use .id). "
         "print() lines and the script's return value come back in the result. "
         "The whole script is ONE undo entry; on error the partial build rolls "
         "back (sun/environment/camera changes excepted). Sandboxed: no os/io/"
@@ -1325,6 +1335,373 @@ ToolResult EditorApp::ToolArrangeEntities(const json& args)
                            {"movedCount", moved.size()}, {"moved", std::move(moved)}});
 }
 
+// --- script-only editor surface (#91) ---------------------------------------------
+// These handlers back forge.* Lua bindings exclusively — no top-level MCP tool.
+// Minting one tool per editor op would bloat every client's tool list; the
+// script IS the escape hatch (blender-mcp's execute_blender_code precedent).
+
+ToolResult EditorApp::ToolCameraOp(const json& args)
+{
+    const std::string action = args.value("action", "");
+    auto pose = [this]() {
+        const EditorCamera::Bookmark b = m_Camera.GetBookmark();
+        return json{{"position", Vec3Json(m_Camera.Position())},
+                    {"focalPoint", Vec3Json(b.focalPoint)},
+                    {"distance", b.distance},
+                    {"pitchDeg", glm::degrees(b.pitch)},
+                    {"yawDeg", glm::degrees(b.yaw)},
+                    {"fovDeg", m_Camera.FOV()},
+                    {"orthographic", m_Camera.IsOrthographic()}};
+    };
+
+    if (action == "get")
+        return JsonResult(pose());
+    if (action == "set") {
+        // Orbit-parameterized on purpose: eye position is derived, so scripts
+        // set focal point / distance / angles, same as the mouse does.
+        EditorCamera::Bookmark b = m_Camera.GetBookmark();
+        GetVec3(args, "focalPoint", b.focalPoint);
+        if (args.contains("distance") && args["distance"].is_number())
+            b.distance = std::max(0.05f, (float)args["distance"]);
+        if (args.contains("pitchDeg") && args["pitchDeg"].is_number())
+            b.pitch = glm::radians(std::clamp((float)args["pitchDeg"], -88.0f, 88.0f));
+        if (args.contains("yawDeg") && args["yawDeg"].is_number())
+            b.yaw = glm::radians((float)args["yawDeg"]);
+        m_Camera.ApplyBookmark(b);
+        if (args.contains("fovDeg") && args["fovDeg"].is_number())
+            m_Camera.SetFOV((float)args["fovDeg"]);
+        if (args.contains("orthographic") && args["orthographic"].is_boolean())
+            m_Camera.SetOrthographic(args["orthographic"]);
+        return JsonResult(pose());
+    }
+    if (action == "store" || action == "recall") {
+        const int slot = args.value("slot", 1);
+        if (slot < 1 || slot > 4)
+            return Err("slot must be 1-4 (the editor's F1-F4 bookmarks)");
+        CameraBookmark& bm = m_Bookmarks[slot - 1];
+        if (action == "store") {
+            bm = {true, m_Camera.GetBookmark()};
+            return JsonResult(json{{"stored", slot}});
+        }
+        if (!bm.set)
+            return Err("Bookmark slot " + std::to_string(slot) + " is empty");
+        m_Camera.ApplyBookmark(bm.value);
+        return JsonResult(pose());
+    }
+    return Err("Unknown camera action \"" + action + "\"");
+}
+
+ToolResult EditorApp::ToolSelectOp(const json& args)
+{
+    const std::string action = args.value("action", "");
+    auto selectionJson = [this]() {
+        json ids = json::array();
+        for (UUID id : m_Selection)
+            ids.push_back(std::to_string(id));
+        json j{{"ids", std::move(ids)}};
+        if (m_Selected)
+            j["primary"] = std::to_string(m_Selected);
+        return j;
+    };
+
+    if (action == "get")
+        return JsonResult(selectionJson());
+    if (action == "clear") {
+        SelectOnly(0);
+        return JsonResult(selectionJson());
+    }
+    if (action == "select" || action == "toggle") {
+        std::string error;
+        Entity* e = FindToolTarget(m_Scene, args, error);
+        if (!e)
+            return Err(error);
+        if (action == "select")
+            SelectOnly(e->id);
+        else
+            ToggleSelection(e->id);
+        return JsonResult(selectionJson());
+    }
+    if (action == "box") {
+        auto uv = [&](const char* key, vec2& out) {
+            if (!args.contains(key) || !args[key].is_array() || args[key].size() != 2 ||
+                !args[key][0].is_number() || !args[key][1].is_number())
+                return false;
+            out = {(float)args[key][0], (float)args[key][1]};
+            return true;
+        };
+        vec2 mn, mx;
+        if (!uv("min", mn) || !uv("max", mx))
+            return Err("Provide min [u,v] and max [u,v] (viewport 0-1, y down)");
+        const RectUV rect{glm::min(mn, mx), glm::max(mn, mx)};
+        ApplyBoxSelect(rect, args.value("additive", false));
+        return JsonResult(selectionJson());
+    }
+    return Err("Unknown selection action \"" + action + "\"");
+}
+
+ToolResult EditorApp::ToolSceneStructure(const json& args)
+{
+    const std::string action = args.value("action", "");
+    std::string error;
+
+    if (action == "group") {
+        std::vector<Entity*> roots;
+        if (!ResolveEntityList(m_Scene, args, roots, error))
+            return Err(error);
+        if (roots.size() < 2)
+            return Err("Group needs at least two entities");
+        // Ids, not pointers: GroupSelection inserts the group entity, which
+        // can grow the vector and invalidate every Entity*.
+        std::vector<UUID> ids;
+        for (Entity* r : roots)
+            ids.push_back(r->id);
+        SelectOnly(ids[0]);
+        for (size_t i = 1; i < ids.size(); ++i)
+            ToggleSelection(ids[i]);
+        GroupSelection(); // one composite; leaves the new group selected
+        Entity* g = m_Scene.Find(m_Selected);
+        if (!g)
+            return Err("Group failed");
+        return JsonResult(EntityJson(m_Scene, *g));
+    }
+    if (action == "ungroup") {
+        Entity* e = FindToolTarget(m_Scene, args, error);
+        if (!e)
+            return Err(error);
+        const std::vector<UUID> children = m_Scene.ChildrenOf(e->id);
+        if (children.empty())
+            return Err("\"" + e->name + "\" has no children to ungroup");
+        SelectOnly(e->id);
+        UngroupSelected(); // one composite; deletes pure-container groups
+        json freed = json::array();
+        for (UUID c : children)
+            freed.push_back(std::to_string(c));
+        return JsonResult(json{{"ok", true}, {"children", std::move(freed)}});
+    }
+    if (action == "drop_to_ground") {
+        std::vector<UUID> ids;
+        if ((args.contains("ids") && args["ids"].is_array()) ||
+            (args.contains("names") && args["names"].is_array())) {
+            std::vector<Entity*> roots;
+            if (!ResolveEntityList(m_Scene, args, roots, error))
+                return Err(error);
+            for (Entity* r : roots)
+                ids.push_back(r->id);
+        } else {
+            Entity* e = FindToolTarget(m_Scene, args, error);
+            if (!e)
+                return Err(error);
+            ids.push_back(e->id);
+        }
+        SelectOnly(ids[0]);
+        for (size_t i = 1; i < ids.size(); ++i)
+            ToggleSelection(ids[i]);
+        DropSelectedToGround(); // one composite; sequential so drops stack
+        json moved = json::array();
+        for (UUID id : ids)
+            if (const Entity* r = m_Scene.Find(id))
+                moved.push_back(EntityJson(m_Scene, *r));
+        return JsonResult(json{{"dropped", std::move(moved)}});
+    }
+    return Err("Unknown action \"" + action + "\"");
+}
+
+ToolResult EditorApp::ToolSnapSettings(const json& args)
+{
+    // Editor preference, not scene state: not undoable, persists via the
+    // debounced settings save (same contract as the preferences window).
+    bool changed = false;
+    if (args.contains("enabled") && args["enabled"].is_boolean()) {
+        m_SnapEnabled = args["enabled"];
+        changed = true;
+    }
+    if (args.contains("translate") && args["translate"].is_number()) {
+        m_SnapTranslate = std::max(0.001f, (float)args["translate"]);
+        changed = true;
+    }
+    if (args.contains("rotateDeg") && args["rotateDeg"].is_number()) {
+        m_SnapRotateDeg = std::clamp((float)args["rotateDeg"], 0.1f, 180.0f);
+        changed = true;
+    }
+    if (args.contains("scale") && args["scale"].is_number()) {
+        m_SnapScale = std::max(0.001f, (float)args["scale"]);
+        changed = true;
+    }
+    if (changed)
+        QueueSettingsSave();
+    return JsonResult(json{{"enabled", m_SnapEnabled},
+                           {"translate", m_SnapTranslate},
+                           {"rotateDeg", m_SnapRotateDeg},
+                           {"scale", m_SnapScale}});
+}
+
+ToolResult EditorApp::ToolMeshElements(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->mesh)
+        return Err("Entity \"" + e->name + "\" has no mesh");
+    const std::string kind = args.value("kind", "face");
+    if (kind != "face" && kind != "edge")
+        return Err("kind must be face or edge");
+    const EditMesh em = BuildEditMesh(*e->mesh);
+    const mat4 world = m_Scene.WorldTransform(e->id);
+
+    // Edges bounding given faces — the bridge from a raycast face pick
+    // (triIndex / 3) to edge ops.
+    if (kind == "edge" && args.contains("ofFaces") && args["ofFaces"].is_array()) {
+        std::vector<uint32_t> faces;
+        for (const json& f : args["ofFaces"])
+            if (f.is_number_integer())
+                faces.push_back((uint32_t)(int64_t)f);
+        json ids = json::array();
+        for (uint32_t id : EdgesOfFaces(em, faces))
+            ids.push_back(id);
+        return JsonResult(json{{"kind", "edge"}, {"ids", std::move(ids)}});
+    }
+
+    vec3 center;
+    const bool filtered = GetVec3(args, "point", center);
+    const float radius = args.value("radius", 0.0f);
+    if (filtered && radius <= 0.0f)
+        return Err("Provide radius > 0 with point");
+    const size_t maxCount = (size_t)std::clamp(args.value("maxCount", 200), 1, 1000);
+
+    size_t total = 0;
+    std::vector<ElementInfo> list =
+        kind == "face"
+            ? ListFaceElements(em, world, filtered ? &center : nullptr, radius, maxCount, total)
+            : ListEdgeElements(em, world, filtered ? &center : nullptr, radius, maxCount, total);
+
+    json items = json::array();
+    for (const ElementInfo& el : list) {
+        json j{{"id", el.id}, {"center", Vec3Json(el.center)}};
+        if (kind == "face")
+            j["normal"] = Vec3Json(el.normal);
+        items.push_back(std::move(j));
+    }
+    return JsonResult(json{{"kind", kind},
+                           {"total", total},
+                           {"returned", items.size()},
+                           {"elements", std::move(items)}});
+}
+
+ToolResult EditorApp::ToolEditElements(const json& args)
+{
+    const std::string action = args.value("action", "");
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->mesh)
+        return Err("Entity \"" + e->name + "\" has no mesh");
+
+    // Shared tail: fresh Mesh, welded normals, one MeshSwapCommand.
+    auto swap = [&](std::vector<Vertex> verts, std::vector<uint32_t> indices, const char* what,
+                    json extra) -> ToolResult {
+        if (indices.empty())
+            return Err(std::string(what) +
+                       " produced no geometry (stale ids or degenerate selection?)");
+        auto after = std::make_shared<Mesh>(std::move(verts), std::move(indices));
+        RecomputeNormalsWelded(*after, MeshTopology::Build(*after));
+        std::shared_ptr<Mesh> before = e->mesh;
+        e->mesh = after;
+        m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
+        json j = EntityJson(m_Scene, *e);
+        j.update(extra);
+        return JsonResult(j);
+    };
+
+    if (action == "shade") {
+        // COW discipline: undo history shares the mesh pointer, so shading
+        // recomputes normals on a clone and swaps — never in place.
+        const bool smooth = args.value("smooth", true);
+        auto after = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        if (smooth)
+            RecomputeNormalsWelded(*after, MeshTopology::Build(*after));
+        else
+            RecomputeNormalsFlat(*after);
+        std::shared_ptr<Mesh> before = e->mesh;
+        e->mesh = after;
+        m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
+        json j = EntityJson(m_Scene, *e);
+        j["shading"] = smooth ? "smooth" : "flat";
+        return JsonResult(j);
+    }
+
+    std::vector<uint32_t> ids;
+    if (args.contains("ids") && args["ids"].is_array())
+        for (const json& v : args["ids"])
+            if (v.is_number_integer())
+                ids.push_back((uint32_t)(int64_t)v);
+    if (ids.empty())
+        return Err("Provide ids (from mesh_elements, or a raycast's triIndex / 3 for faces)");
+    const EditMesh em = BuildEditMesh(*e->mesh);
+
+    if (action == "extrude_faces" || action == "extrude_edges") {
+        if (!args.contains("distance") || !args["distance"].is_number())
+            return Err("Provide distance (world units along the region normal)");
+        const float distance = args["distance"];
+        if (action == "extrude_faces") {
+            FaceExtrusion ex =
+                BuildFaceExtrusion(em, e->mesh->Vertices(), e->mesh->Indices(), ids);
+            for (uint32_t vi : ex.capVerts)
+                ex.vertices[vi].position += ex.normal * distance;
+            return swap(std::move(ex.vertices), std::move(ex.indices), "Face extrude",
+                        json{{"extruded", ids.size()}});
+        }
+        EdgeExtrusion ex = BuildEdgeExtrusion(em, e->mesh->Vertices(), e->mesh->Indices(), ids);
+        for (uint32_t vi : ex.movingVerts)
+            ex.vertices[vi].position += ex.normal * distance;
+        return swap(std::move(ex.vertices), std::move(ex.indices), "Edge extrude",
+                    json{{"extruded", ids.size()}});
+    }
+    if (action == "subdivide_faces" || action == "subdivide_edges") {
+        MeshSubdivision sub =
+            action == "subdivide_faces"
+                ? BuildFaceSubdivision(em, e->mesh->Vertices(), e->mesh->Indices(), ids)
+                : BuildEdgeSubdivision(em, e->mesh->Vertices(), e->mesh->Indices(), ids);
+        return swap(std::move(sub.vertices), std::move(sub.indices), "Subdivide",
+                    json{{"newVertices", sub.newVerts.size()}});
+    }
+    return Err("Unknown element action \"" + action + "\"");
+}
+
+ToolResult EditorApp::ToolExportStl(const json& args)
+{
+    const std::string path = args.value("path", "");
+    if (path.empty())
+        return Err("Provide path (.stl)");
+
+    std::vector<UUID> ids;
+    if ((args.contains("ids") && args["ids"].is_array()) ||
+        (args.contains("names") && args["names"].is_array())) {
+        std::vector<Entity*> roots;
+        std::string error;
+        if (!ResolveEntityList(m_Scene, args, roots, error))
+            return Err(error);
+        for (Entity* r : roots)
+            for (UUID n : SubtreeOf(r->id))
+                ids.push_back(n);
+    } else {
+        for (const Entity& en : m_Scene.Entities())
+            ids.push_back(en.id);
+    }
+
+    const float scale = std::max(0.001f, args.value("scale", m_StlScale));
+    const StlExportResult r = ExportStl(m_Scene, ids, path, scale);
+    if (!r.ok)
+        return Err("Export failed: " + r.error);
+    return JsonResult(json{{"ok", true},
+                           {"path", path},
+                           {"triangles", r.triangles},
+                           {"watertight", r.watertight},
+                           {"openEdges", r.openEdges},
+                           {"millimetersPerUnit", scale}});
+}
+
 // --- actuation handlers -------------------------------------------------------
 
 ToolResult EditorApp::ToolManageEntity(const json& args)
@@ -1991,6 +2368,32 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
 
         add("look_at", call(&EditorApp::ToolManageScene, "look_at"));
         add("set_render_settings", call(&EditorApp::ToolManageScene, "set_render_settings"));
+
+        // #91: extended editor surface — script-only, no top-level MCP tools.
+        add("camera", call(&EditorApp::ToolCameraOp, "get"));
+        add("set_camera", call(&EditorApp::ToolCameraOp, "set"));
+        add("store_view", call(&EditorApp::ToolCameraOp, "store"));
+        add("recall_view", call(&EditorApp::ToolCameraOp, "recall"));
+
+        add("select", call(&EditorApp::ToolSelectOp, "select"));
+        add("toggle_select", call(&EditorApp::ToolSelectOp, "toggle"));
+        add("clear_selection", call(&EditorApp::ToolSelectOp, "clear"));
+        add("get_selection", call(&EditorApp::ToolSelectOp, "get"));
+        add("box_select", call(&EditorApp::ToolSelectOp, "box"));
+
+        add("group", call(&EditorApp::ToolSceneStructure, "group"));
+        add("ungroup", call(&EditorApp::ToolSceneStructure, "ungroup"));
+        add("drop_to_ground", call(&EditorApp::ToolSceneStructure, "drop_to_ground"));
+        add("snap_settings", call(&EditorApp::ToolSnapSettings, nullptr));
+
+        add("mesh_elements", call(&EditorApp::ToolMeshElements, nullptr));
+        add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces"));
+        add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges"));
+        add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces"));
+        add("subdivide_edges", call(&EditorApp::ToolEditElements, "subdivide_edges"));
+        add("shade", call(&EditorApp::ToolEditElements, "shade"));
+
+        add("export_stl", call(&EditorApp::ToolExportStl, nullptr));
     });
 
     std::unique_ptr<CompositeCommand> batch = m_Commands.EndBatch();
