@@ -132,6 +132,108 @@ void SmoothIsTwoPhase()
     CHECK(verts[4].position.y > 0.1f);
 }
 
+void MirroredMoveDoesNotDouble()
+{
+    // Both centers hit corner A of the seam quad. A summing implementation
+    // would move A by 2x; the merged kernel writes each group once and the
+    // mirrored side wins — interactive X-mirror's last-write-wins.
+    SeamQuad q = BuildSeamQuad();
+    // Differing offsets pin the winner: y == 2 proves the MIRRORED side wins
+    // on overlap (last-write-wins); a sum would give 3, primary-wins 1.
+    const size_t moved = SculptMoveMirrored(q.verts, q.topo, {0.0f, 0.0f, 0.0f},
+                                            {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f},
+                                            {0.0f, 2.0f, 0.0f}, 0.5f, SculptFalloff::Constant);
+    CHECK(moved == 1); // distinct groups, not per-application counts
+    CHECK(ApproxEq(q.verts[0].position.y, 2.0f, 1e-6f)); // mirrored offset, once
+    CHECK(ApproxEq(q.verts[3].position.y, 2.0f, 1e-6f)); // seam copy welded
+
+    // Disjoint regions: both applied, targets from pre-move positions.
+    SeamQuad d = BuildSeamQuad();
+    const size_t moved2 = SculptMoveMirrored(d.verts, d.topo, {0.0f, 0.0f, 0.0f},
+                                             {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 1.0f},
+                                             {0.0f, 2.0f, 0.0f}, 0.5f, SculptFalloff::Constant);
+    CHECK(moved2 == 2);
+    CHECK(ApproxEq(d.verts[0].position.y, 1.0f, 1e-6f)); // A got offsetA
+    CHECK(ApproxEq(d.verts[2].position.y, 2.0f, 1e-6f)); // C got offsetB
+
+    // One side missing entirely: only the reachable region moves.
+    SeamQuad m = BuildSeamQuad();
+    const size_t moved3 = SculptMoveMirrored(m.verts, m.topo, {0.0f, 0.0f, 0.0f},
+                                             {0.0f, 1.0f, 0.0f}, {50.0f, 0.0f, 0.0f},
+                                             {0.0f, 2.0f, 0.0f}, 0.5f, SculptFalloff::Constant);
+    CHECK(moved3 == 1);
+    CHECK(ApproxEq(m.verts[0].position.y, 1.0f, 1e-6f));
+}
+
+void SnapRespectsSideFilter()
+{
+    // Shift the quad fully onto the positive side (x in [1,2]): a snap
+    // restricted to the negative side must fail and leave the point untouched.
+    SeamQuad q = BuildSeamQuad();
+    for (Vertex& v : q.verts)
+        v.position.x += 1.0f;
+    vec3 p{-0.5f, 0.0f, 0.0f};
+    CHECK(!SnapToNearestVertex(q.verts, q.topo, p, -1));
+    CHECK(p == vec3(-0.5f, 0.0f, 0.0f));
+    CHECK(SnapToNearestVertex(q.verts, q.topo, p, +1));
+    CHECK(p == vec3(1.0f, 0.0f, 0.0f)); // shifted corner A
+
+    // On-plane verts (x == 0) qualify for BOTH sides: a center that mirrors
+    // onto the plane resolves to the same vertex, which the handler then
+    // collapses into a single application.
+    SeamQuad o = BuildSeamQuad(); // corner A sits exactly at x = 0
+    vec3 n{-0.1f, 0.0f, 0.1f};
+    CHECK(SnapToNearestVertex(o.verts, o.topo, n, -1));
+    CHECK(n == vec3(0.0f, 0.0f, 0.0f));
+}
+
+void SnapFindsNearestVertex()
+{
+    SeamQuad q = BuildSeamQuad();
+    // A point hovering off the surface snaps to the closest representative.
+    vec3 p{0.1f, 0.5f, -0.05f}; // nearest corner is A (0,0,0)
+    CHECK(SnapToNearestVertex(q.verts, q.topo, p));
+    CHECK(p == vec3(0.0f, 0.0f, 0.0f));
+
+    p = {1.1f, -0.2f, 1.05f}; // nearest is C (1,0,1)
+    CHECK(SnapToNearestVertex(q.verts, q.topo, p));
+    CHECK(p == vec3(1.0f, 0.0f, 1.0f));
+
+    // No valid groups -> false, point untouched.
+    MeshTopology empty;
+    vec3 keep{5.0f, 5.0f, 5.0f};
+    CHECK(!SnapToNearestVertex(q.verts, empty, keep));
+    CHECK(keep == vec3(5.0f, 5.0f, 5.0f));
+}
+
+void InvertedNormalDetector()
+{
+    // Quad in the y=0 plane with +y normals; interior reference below it.
+    SeamQuad sane = BuildSeamQuad();
+    const vec3 interior{0.5f, -1.0f, 0.5f}; // "inside" is under the sheet
+    CHECK(InvertedNormalFraction(sane.verts, sane.topo, {0.5f, 0.0f, 0.5f}, 2.0f, interior) ==
+          0.0f);
+
+    // Flip every normal: now the whole region reads folded.
+    SeamQuad folded = BuildSeamQuad();
+    for (Vertex& v : folded.verts)
+        v.normal = {0.0f, -1.0f, 0.0f};
+    CHECK(InvertedNormalFraction(folded.verts, folded.topo, {0.5f, 0.0f, 0.5f}, 2.0f, interior) ==
+          1.0f);
+
+    // Half flipped (groups A and B of 4) -> fraction 0.5.
+    SeamQuad half = BuildSeamQuad();
+    half.verts[0].normal = half.verts[3].normal = {0.0f, -1.0f, 0.0f}; // group A (both copies)
+    half.verts[1].normal = {0.0f, -1.0f, 0.0f};                       // group B
+    CHECK(ApproxEq(
+        InvertedNormalFraction(half.verts, half.topo, {0.5f, 0.0f, 0.5f}, 2.0f, interior), 0.5f,
+        1e-6f));
+
+    // Empty region -> 0, not NaN.
+    CHECK(InvertedNormalFraction(sane.verts, sane.topo, {50.0f, 0.0f, 0.0f}, 1.0f, interior) ==
+          0.0f);
+}
+
 void StaleTopologyIsSkippedNotFatal()
 {
     std::vector<Vertex> verts = {V({0.0f, 0.0f, 0.0f})};
@@ -161,6 +263,10 @@ void RunMcpSculptTests()
     EmptySelectionIsNoOp();
     InflateFollowsNormalsAndSign();
     SmoothIsTwoPhase();
+    MirroredMoveDoesNotDouble();
+    SnapRespectsSideFilter();
+    SnapFindsNearestVertex();
+    InvertedNormalDetector();
     StaleTopologyIsSkippedNotFatal();
     std::printf("[ok] mcp sculpt kernel tests done\n");
 }

@@ -44,4 +44,29 @@ size_t SculptInflate(std::vector<Vertex>& verts, const MeshTopology& topo, const
 size_t SculptSmooth(std::vector<Vertex>& verts, const MeshTopology& topo, const vec3& center,
                     float radius, float strength);
 
+// Moves `point` to the nearest weld-group representative position (#110
+// snap): brush centers guessed off the live surface land ON it instead of
+// hovering uselessly beside it. `sideSignX` restricts candidates to one side
+// of the local YZ plane (+1 / -1; on-plane verts always qualify; 0 = any) so
+// a mirrored snap cannot wander back across the plane and land a rogue second
+// stroke on the primary side. False when no candidate qualifies.
+bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& topo, vec3& point,
+                         int sideSignX = 0);
+
+// Mirrored move (#110): both applications computed from PRE-move positions
+// and each group written once — the mirrored side wins on overlap, matching
+// the interactive X-mirror's last-write-wins, instead of summing to a doubled
+// stroke along the mirror plane. Returns distinct groups moved.
+size_t SculptMoveMirrored(std::vector<Vertex>& verts, const MeshTopology& topo,
+                          const vec3& centerA, const vec3& offsetA, const vec3& centerB,
+                          const vec3& offsetB, float radius, SculptFalloff falloff);
+
+// Fraction [0,1] of brush-affected groups whose normal points TOWARD
+// `interior` (folded/inside-out surface detector, #110): stacked dents can
+// invert a region, after which normal-following brushes push the wrong way.
+// `interior` is any point inside the mesh (its AABB center works). Returns 0
+// for an empty region.
+float InvertedNormalFraction(const std::vector<Vertex>& verts, const MeshTopology& topo,
+                             const vec3& center, float radius, const vec3& interior);
+
 } // namespace forge
