@@ -628,11 +628,13 @@ void EditorApp::RegisterMcpTools()
         "world centers; face id = raycast triIndex/3; ofFaces maps faces to "
         "their edges), extrude_faces{}/extrude_edges{}/subdivide_faces{}/"
         "subdivide_edges{}/shade{} (edit-mode element ops by id), export_stl{}. "
-        "Writes return the affected entity as a table (use .id). "
+        "Entity writes return the affected entity as a table (use .id); camera/"
+        "selection/element/export calls return their own shapes. "
         "print() lines and the script's return value come back in the result. "
         "The whole script is ONE undo entry; on error the partial build rolls "
-        "back (sun/environment/camera changes excepted). Sandboxed: no os/io/"
-        "require; runaway loops and memory bombs abort.",
+        "back (sun/environment/camera/snap-settings changes and written files "
+        "excepted). Sandboxed: no os/io/require; runaway loops and memory "
+        "bombs abort.",
         {{"type", "object"},
          {"properties",
           {{"source", {{"type", "string"}, {"description", "Lua 5.4 source"}}}}},
