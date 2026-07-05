@@ -19,6 +19,7 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -52,7 +53,18 @@ static bool GetVec3(const json& args, const char* key, vec3& out)
     if (!a.is_array() || a.size() != 3 || !a[0].is_number() || !a[1].is_number() ||
         !a[2].is_number())
         return false;
-    out = {(float)a[0], (float)a[1], (float)a[2]};
+    // NaN/Inf and float-overflowing doubles pass is_number(); treat them as
+    // malformed and leave `out` untouched. Range-check before the float cast
+    // — casting an out-of-range double is itself UB. Note the false return
+    // makes a poisoned vec3 indistinguishable from an absent key at optional
+    // call sites; acceptable only because both entry paths (dispatch and the
+    // script binding wrapper) already reject non-finite args up front (#104).
+    const double x = a[0].get<double>(), y = a[1].get<double>(), z = a[2].get<double>();
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        std::fabs(x) > (double)FLT_MAX || std::fabs(y) > (double)FLT_MAX ||
+        std::fabs(z) > (double)FLT_MAX)
+        return false;
+    out = {(float)x, (float)y, (float)z};
     return true;
 }
 
@@ -2339,6 +2351,12 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
             json a = fnArgs;
             if (action)
                 a["action"] = action;
+            // Same front-door refusal as MCP dispatch: a Lua 0/0 or math.huge
+            // arrives as a well-typed number and survives every downstream
+            // range check. Throwing before the handler runs keeps the failed
+            // script's rollback trivially correct — nothing mutated (#104).
+            if (const std::string bad = NonFiniteArgPath(a); !bad.empty())
+                throw std::runtime_error("argument '" + bad + "' is NaN or infinite");
             ToolResult r = (this->*handler)(a);
             std::string text;
             if (!r.content.empty() && r.content[0].contains("text") &&

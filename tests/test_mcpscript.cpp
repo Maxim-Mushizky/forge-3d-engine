@@ -1,5 +1,6 @@
 #include "test_framework.h"
 
+#include "mcp/McpProtocol.h" // NonFiniteArgPath — the bindings' front-door guard
 #include "mcp/McpScript.h"
 
 #include <json.hpp>
@@ -195,6 +196,47 @@ static void MemoryCapAborts()
     CHECK(!r.error.empty());
 }
 
+static void NonFiniteArgsRejectedAtBridge()
+{
+    // Mirrors the guard execute_script wraps around every forge.* binding:
+    // NonFiniteArgPath runs before the handler. A Lua 0/0 or math.huge must
+    // round-trip through LuaToJson into the rejection path with the handler
+    // never entered (#104).
+    bool reached = false;
+    auto run = [&](const std::string& src) {
+        reached = false;
+        return RunSandboxedScript(src, [&](const ScriptInstall& add) {
+            add("apply", [&](const json& args) -> json {
+                if (const std::string bad = NonFiniteArgPath(args); !bad.empty())
+                    throw std::runtime_error("argument '" + bad + "' is NaN or infinite");
+                reached = true;
+                return json{{"ok", true}};
+            });
+        });
+    };
+
+    ScriptResult r = run("forge.apply{distance = 0/0}");
+    CHECK(!r.ok);
+    CHECK(r.error.find("distance") != std::string::npos);
+    CHECK(r.error.find("NaN or infinite") != std::string::npos);
+    CHECK(!reached);
+
+    r = run("forge.apply{position = {0/0, 0, 0}}");
+    CHECK(!r.ok);
+    CHECK(r.error.find("position[0]") != std::string::npos);
+    CHECK(!reached);
+
+    r = run("forge.apply{radius = math.huge}");
+    CHECK(!r.ok);
+    CHECK(r.error.find("radius") != std::string::npos);
+    CHECK(!reached);
+
+    // Ordinary finite arguments still go through.
+    r = run("forge.apply{distance = 1.5, position = {0, 2, 0}}");
+    CHECK(r.ok);
+    CHECK(reached);
+}
+
 static void ParametricBuildLoop()
 {
     // The shape of a real agent script: a loop of spawns with computed
@@ -228,6 +270,7 @@ void RunMcpScriptTests()
     InstructionBudgetAborts();
     BudgetSurvivesProtectedCalls();
     MemoryCapAborts();
+    NonFiniteArgsRejectedAtBridge();
     ParametricBuildLoop();
     std::printf("[ok] mcp script kernel tests\n");
 }

@@ -1,5 +1,7 @@
 #include "McpProtocol.h"
 
+#include <cfloat>
+#include <cmath>
 #include <exception>
 #include <memory>
 #include <utility>
@@ -30,7 +32,50 @@ json MakeResult(const json& id, json result)
     return json{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
 
+// Depth-first hunt for a poisonous leaf; builds the dotted path on unwind.
+// LuaToJson caps script tables at 32 levels, but the wire has no depth bound
+// (the nlohmann SAX parser is iterative), so the scan carries its own cap and
+// treats absurd nesting as a rejection rather than recursing toward a stack
+// overflow. The range check happens on the double — casting an out-of-float-
+// range value first would itself be UB — and rejects anything float storage
+// cannot hold: a 1e308 double is finite on the wire but lands as +inf in a
+// Transform, so it is just as poisonous as a literal Inf.
+bool FindNonFinite(const json& v, std::string& path, int depth = 0)
+{
+    if (depth > 64)
+        return true;
+    if (v.is_number_float()) {
+        const double d = v.get<double>();
+        if (!std::isfinite(d) || std::fabs(d) > (double)FLT_MAX)
+            return true;
+    }
+    if (v.is_array()) {
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (FindNonFinite(v[i], path, depth + 1)) {
+                path = "[" + std::to_string(i) + "]" + path;
+                return true;
+            }
+        }
+    } else if (v.is_object()) {
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (FindNonFinite(it.value(), path, depth + 1)) {
+                path = it.key() + (path.empty() || path[0] == '[' ? "" : ".") + path;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
+
+std::string NonFiniteArgPath(const json& args)
+{
+    std::string path;
+    if (!FindNonFinite(args, path))
+        return {};
+    return path.empty() ? "<value>" : path; // bare non-finite scalar has no key
+}
 
 ToolResult ToolResult::Text(std::string text, bool error)
 {
@@ -145,10 +190,19 @@ void McpProtocol::HandleMessage(const std::string& body,
                                             {"isError", r.isError}})
                             .dump());
             };
+            // Refuse NaN/Inf arguments before the handler runs: nothing has
+            // mutated yet, so "clean error, zero mutation" holds for every
+            // tool without per-handler checks (#104).
+            const json arguments = params.value("arguments", json::object());
+            if (const std::string bad = NonFiniteArgPath(arguments); !bad.empty()) {
+                responder(ToolResult::Text(
+                    "Argument '" + bad + "' is NaN or infinite — call rejected.", /*error=*/true));
+                return;
+            }
             // Execution failures become isError results so the agent can read
             // the message and retry; only protocol misuse gets JSON-RPC errors.
             try {
-                t.handler(params.value("arguments", json::object()), responder);
+                t.handler(arguments, responder);
             } catch (const std::exception& e) {
                 responder(ToolResult::Text(e.what(), /*error=*/true));
             }
