@@ -117,4 +117,40 @@ size_t SculptSmooth(std::vector<Vertex>& verts, const MeshTopology& topo, const 
     return moves.size();
 }
 
+bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& topo, vec3& point)
+{
+    float best = -1.0f;
+    vec3 bestPos(0.0f);
+    for (const auto& group : topo.groups) {
+        if (group.empty() || group[0] >= verts.size())
+            continue;
+        const vec3& rep = verts[group[0]].position;
+        const float d = glm::length(rep - point);
+        if (best < 0.0f || d < best) {
+            best = d;
+            bestPos = rep;
+        }
+    }
+    if (best < 0.0f)
+        return false;
+    point = bestPos;
+    return true;
+}
+
+float InvertedNormalFraction(const std::vector<Vertex>& verts, const MeshTopology& topo,
+                             const vec3& center, float radius, const vec3& interior)
+{
+    const std::vector<Affected> region = GatherRegion(verts, topo, center, radius,
+                                                      SculptFalloff::Smooth);
+    if (region.empty())
+        return 0.0f;
+    size_t inverted = 0;
+    for (const Affected& a : region) {
+        const Vertex& rep = verts[topo.groups[a.group][0]];
+        if (glm::dot(rep.normal, rep.position - interior) < 0.0f)
+            ++inverted;
+    }
+    return (float)inverted / (float)region.size();
+}
+
 } // namespace forge

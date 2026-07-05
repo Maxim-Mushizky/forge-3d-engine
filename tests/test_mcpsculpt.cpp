@@ -132,6 +132,53 @@ void SmoothIsTwoPhase()
     CHECK(verts[4].position.y > 0.1f);
 }
 
+void SnapFindsNearestVertex()
+{
+    SeamQuad q = BuildSeamQuad();
+    // A point hovering off the surface snaps to the closest representative.
+    vec3 p{0.1f, 0.5f, -0.05f}; // nearest corner is A (0,0,0)
+    CHECK(SnapToNearestVertex(q.verts, q.topo, p));
+    CHECK(p == vec3(0.0f, 0.0f, 0.0f));
+
+    p = {1.1f, -0.2f, 1.05f}; // nearest is C (1,0,1)
+    CHECK(SnapToNearestVertex(q.verts, q.topo, p));
+    CHECK(p == vec3(1.0f, 0.0f, 1.0f));
+
+    // No valid groups -> false, point untouched.
+    MeshTopology empty;
+    vec3 keep{5.0f, 5.0f, 5.0f};
+    CHECK(!SnapToNearestVertex(q.verts, empty, keep));
+    CHECK(keep == vec3(5.0f, 5.0f, 5.0f));
+}
+
+void InvertedNormalDetector()
+{
+    // Quad in the y=0 plane with +y normals; interior reference below it.
+    SeamQuad sane = BuildSeamQuad();
+    const vec3 interior{0.5f, -1.0f, 0.5f}; // "inside" is under the sheet
+    CHECK(InvertedNormalFraction(sane.verts, sane.topo, {0.5f, 0.0f, 0.5f}, 2.0f, interior) ==
+          0.0f);
+
+    // Flip every normal: now the whole region reads folded.
+    SeamQuad folded = BuildSeamQuad();
+    for (Vertex& v : folded.verts)
+        v.normal = {0.0f, -1.0f, 0.0f};
+    CHECK(InvertedNormalFraction(folded.verts, folded.topo, {0.5f, 0.0f, 0.5f}, 2.0f, interior) ==
+          1.0f);
+
+    // Half flipped (groups A and B of 4) -> fraction 0.5.
+    SeamQuad half = BuildSeamQuad();
+    half.verts[0].normal = half.verts[3].normal = {0.0f, -1.0f, 0.0f}; // group A (both copies)
+    half.verts[1].normal = {0.0f, -1.0f, 0.0f};                       // group B
+    CHECK(ApproxEq(
+        InvertedNormalFraction(half.verts, half.topo, {0.5f, 0.0f, 0.5f}, 2.0f, interior), 0.5f,
+        1e-6f));
+
+    // Empty region -> 0, not NaN.
+    CHECK(InvertedNormalFraction(sane.verts, sane.topo, {50.0f, 0.0f, 0.0f}, 1.0f, interior) ==
+          0.0f);
+}
+
 void StaleTopologyIsSkippedNotFatal()
 {
     std::vector<Vertex> verts = {V({0.0f, 0.0f, 0.0f})};
@@ -161,6 +208,8 @@ void RunMcpSculptTests()
     EmptySelectionIsNoOp();
     InflateFollowsNormalsAndSign();
     SmoothIsTwoPhase();
+    SnapFindsNearestVertex();
+    InvertedNormalDetector();
     StaleTopologyIsSkippedNotFatal();
     std::printf("[ok] mcp sculpt kernel tests done\n");
 }

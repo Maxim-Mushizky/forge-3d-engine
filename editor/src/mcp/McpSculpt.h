@@ -44,4 +44,17 @@ size_t SculptInflate(std::vector<Vertex>& verts, const MeshTopology& topo, const
 size_t SculptSmooth(std::vector<Vertex>& verts, const MeshTopology& topo, const vec3& center,
                     float radius, float strength);
 
+// Moves `point` to the nearest weld-group representative position (#110
+// snap): brush centers guessed off the live surface land ON it instead of
+// hovering uselessly beside it. False when the topology has no valid groups.
+bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& topo, vec3& point);
+
+// Fraction [0,1] of brush-affected groups whose normal points TOWARD
+// `interior` (folded/inside-out surface detector, #110): stacked dents can
+// invert a region, after which normal-following brushes push the wrong way.
+// `interior` is any point inside the mesh (its AABB center works). Returns 0
+// for an empty region.
+float InvertedNormalFraction(const std::vector<Vertex>& verts, const MeshTopology& topo,
+                             const vec3& center, float radius, const vec3& interior);
+
 } // namespace forge
