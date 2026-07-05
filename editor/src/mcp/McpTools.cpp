@@ -278,7 +278,8 @@ void EditorApp::RegisterMcpTools()
         "or nearest; bottoms aligned), facing (yaw toward the anchor, no move), around "
         "(ring of count copies — or of the listed ids/names — bottoms on the anchor's "
         "floor, each facing it). on/above/against auto-nudge out of collisions with "
-        "third parties and report residualOverlap when a nudge couldn't fully resolve. "
+        "third parties and report residualOverlap when a nudge couldn't fully resolve; "
+        "around reports residualOverlap when the ring is too crowded for the count. "
         "One undo entry.",
         {{"type", "object"},
          {"properties",
@@ -338,9 +339,10 @@ void EditorApp::RegisterMcpTools()
 
     m_McpProtocol.RegisterTool(
         "distribute_entities",
-        "Space several entities along one axis, keeping their current order: with "
-        "spacing, packs them gap-to-gap from the first; without, spreads centers "
-        "evenly between the current first and last. One undo entry.",
+        "Space several entities along one axis, keeping their current spatial order: "
+        "with spacing, packs them gap-to-gap starting from the box furthest toward "
+        "-axis (which stays put); without, spreads centers evenly between the current "
+        "outermost two. Listing order does not matter. One undo entry.",
         {{"type", "object"},
          {"properties",
           {{"ids", {{"type", "array"}, {"items", {{"type", "string"}}}}},
@@ -930,7 +932,6 @@ AABB EditorApp::SubtreeWorldBounds(UUID root, std::unordered_set<UUID>* members)
 static bool ResolveEntityList(Scene& scene, const json& args, std::vector<Entity*>& out,
                               std::string& error)
 {
-    std::vector<std::string> keys;
     const bool byId = args.contains("ids") && args["ids"].is_array();
     const char* key = byId ? "ids" : "names";
     if (!byId && !(args.contains("names") && args["names"].is_array())) {
@@ -972,6 +973,37 @@ static json BoundsJson(const AABB& b)
             {"center", Vec3Json((b.min + b.max) * 0.5f)}};
 }
 
+// Best-effort conversion of an absolute world yaw into a root's parent space:
+// subtract the yaw of the parent's world forward axis. Exact for unparented
+// roots and yaw-only parent rotations (mirrors ReparentKeepWorld's best-effort
+// decompose); a degenerate parent basis falls back to the world yaw.
+static float WorldYawToParent(const Scene& scene, UUID parent, float worldYaw)
+{
+    if (!parent)
+        return worldYaw;
+    const vec3 fwd = vec3(scene.WorldTransform(parent) * vec4(0.0f, 0.0f, 1.0f, 0.0f));
+    if (std::fabs(fwd.x) + std::fabs(fwd.z) < 1e-6f)
+        return worldYaw;
+    return worldYaw - std::atan2(fwd.x, fwd.z);
+}
+
+// Pairwise interpenetration among ring members (the radius only guarantees
+// clearance from the anchor — a crowded ring overlaps neighbor-to-neighbor).
+static bool RingOverlaps(const std::vector<AABB>& memberBounds,
+                         const std::vector<PlacedPose>& poses)
+{
+    std::vector<AABB> placed;
+    placed.reserve(memberBounds.size());
+    for (size_t i = 0; i < memberBounds.size(); ++i)
+        placed.push_back({memberBounds[i].min + poses[i].delta,
+                          memberBounds[i].max + poses[i].delta});
+    for (size_t i = 0; i < placed.size(); ++i)
+        for (size_t j = i + 1; j < placed.size(); ++j)
+            if (OverlapAABB(placed[i], placed[j]).overlap)
+                return true;
+    return false;
+}
+
 ToolResult EditorApp::ToolPlaceRelative(const json& args)
 {
     const std::string relation = args.value("relation", "");
@@ -996,8 +1028,12 @@ ToolResult EditorApp::ToolPlaceRelative(const json& args)
         if (members.empty())
             return Err("Empty entity list");
         const float clearance = args.value("clearance", 0.0f);
-        auto composite = std::make_unique<CompositeCommand>();
-        json placed = json::array();
+
+        // Validate everything BEFORE the first mutation: an Err after a
+        // partial apply would strand moved entities outside both the undo
+        // stack and a surrounding script batch's rollback.
+        std::vector<AABB> memberBounds;
+        std::vector<PlacedPose> poses(members.size());
         for (size_t i = 0; i < members.size(); ++i) {
             Entity* m = members[i];
             if (m->id == anchor->id || m_Scene.IsDescendantOf(m->id, anchor->id) ||
@@ -1006,19 +1042,28 @@ ToolResult EditorApp::ToolPlaceRelative(const json& args)
             const AABB mb = SubtreeWorldBounds(m->id, nullptr);
             if (!mb.Valid())
                 return Err("Entity \"" + m->name + "\" has no bounds");
-            const auto poses =
-                SolveAround(mb, anchorBounds, (int)members.size(), clearance);
+            memberBounds.push_back(mb);
+            poses[i] = SolveAround(mb, anchorBounds, (int)members.size(), clearance)[i];
+        }
+
+        auto composite = std::make_unique<CompositeCommand>();
+        json placed = json::array();
+        for (size_t i = 0; i < members.size(); ++i) {
+            Entity* m = members[i];
             Entity before = *m;
             ApplyWorldDelta(m_Scene, *m, poses[i].delta);
-            m->transform.rotation.y = poses[i].yawRad;
+            m->transform.rotation.y = WorldYawToParent(m_Scene, m->parent, poses[i].yawRad);
             composite->Add(std::make_unique<EditEntityCommand>(before, *m));
             placed.push_back({{"id", std::to_string(m->id)},
                               {"name", m->name},
                               {"yawDeg", glm::degrees(poses[i].yawRad)}});
         }
         m_Commands.Push(std::move(composite));
-        return JsonResult(json{{"relation", "around"}, {"count", placed.size()},
-                               {"placed", std::move(placed)}});
+        json j{{"relation", "around"}, {"count", placed.size()},
+               {"placed", std::move(placed)}};
+        if (RingOverlaps(memberBounds, poses))
+            j["residualOverlap"] = true;
+        return JsonResult(j);
     }
 
     Entity* e = FindToolTarget(m_Scene, args, error);
@@ -1037,12 +1082,11 @@ ToolResult EditorApp::ToolPlaceRelative(const json& args)
 
     if (relation == "facing") {
         Entity before = *e;
-        // Yaw applies in the root's parent space — exact for unparented roots
-        // (the common case for agent-built scenes).
-        e->transform.rotation.y = YawToward(center, anchorCenter);
+        const float worldYaw = YawToward(center, anchorCenter);
+        e->transform.rotation.y = WorldYawToParent(m_Scene, e->parent, worldYaw);
         m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
         json j = EntityJson(m_Scene, *e);
-        j["yawDeg"] = glm::degrees(e->transform.rotation.y);
+        j["yawDeg"] = glm::degrees(worldYaw);
         return JsonResult(j);
     }
 
@@ -1058,24 +1102,29 @@ ToolResult EditorApp::ToolPlaceRelative(const json& args)
 
         auto composite = std::make_unique<CompositeCommand>();
         const Entity preMove = *e;
+        const UUID protoParent = e->parent;
         ApplyWorldDelta(m_Scene, *e, poses[0].delta);
-        e->transform.rotation.y = poses[0].yawRad;
+        e->transform.rotation.y = WorldYawToParent(m_Scene, protoParent, poses[0].yawRad);
         composite->Add(std::make_unique<EditEntityCommand>(preMove, *e));
         json placed = json::array();
         placed.push_back({{"id", std::to_string(e->id)}, {"name", e->name}});
+        // NOTE: Insert can grow the entity vector — `e` is dead after the
+        // first iteration; only `preMove`/`protoParent` copies are used.
         for (int k = 1; k < count; ++k) {
             Entity copy = preMove;
             copy.id = GenerateUUID();
             copy.name = preMove.name + "_" + std::to_string(k + 1);
             ApplyWorldDelta(m_Scene, copy, poses[k].delta);
-            copy.transform.rotation.y = poses[k].yawRad;
+            copy.transform.rotation.y = WorldYawToParent(m_Scene, protoParent, poses[k].yawRad);
             m_Scene.Insert(copy);
             composite->Add(std::make_unique<AddEntityCommand>(copy));
             placed.push_back({{"id", std::to_string(copy.id)}, {"name", copy.name}});
         }
         m_Commands.Push(std::move(composite));
-        return JsonResult(json{{"relation", "around"}, {"count", count},
-                               {"placed", std::move(placed)}});
+        json j{{"relation", "around"}, {"count", count}, {"placed", std::move(placed)}};
+        if (RingOverlaps(std::vector<AABB>((size_t)count, bounds), poses))
+            j["residualOverlap"] = true;
+        return JsonResult(j);
     }
 
     vec3 delta;
@@ -1161,10 +1210,25 @@ ToolResult EditorApp::ToolSnapToSurface(const json& args)
         float tExit = 0.0f;
         RayIntersectsAABB(Ray{center, dir}, bounds, tExit);
         constexpr float kBump = 1e-3f;
-        const std::optional<RaycastHit> hit =
-            m_Scene.Raycast(Ray{center + dir * (tExit + kBump), dir});
+        Ray probe{center + dir * (tExit + kBump), dir};
+        std::optional<RaycastHit> hit;
+        float skipped = 0.0f; // distance consumed stepping past light gizmos
+        for (int guard = 0; guard < 8; ++guard) {
+            hit = m_Scene.Raycast(probe);
+            if (!hit)
+                break;
+            const Entity* h = m_Scene.Find(hit->entity);
+            if (!h || !h->light.enabled)
+                break; // a real surface
+            // Light gizmos are display-only (the drop path's obstacle set
+            // skips them too) — step just past and re-cast.
+            probe.origin += dir * (hit->distance + kBump);
+            skipped += hit->distance + kBump;
+            hit.reset();
+        }
         if (!hit)
             return Err("No surface along that direction");
+        hit->distance += skipped;
         // Land the leading face: the AABB's support extent along dir, not the
         // central-ray exit — a diagonal direction leads with a corner.
         const vec3 half = (bounds.max - bounds.min) * 0.5f;
