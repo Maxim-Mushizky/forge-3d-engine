@@ -272,6 +272,7 @@ private:
     struct McpRenderJob {
         bool active = false;
         int sppTarget = 256;
+        int bounces = 4;        // per-render override (#92); editor m_Bounces untouched
         mat4 viewProj{1.0f};    // frozen at start: requested aspect, current camera
         vec3 camPos{0.0f};      // frozen with viewProj — a live camera position
                                 // against a frozen matrix corrupts accumulation
