@@ -15,6 +15,7 @@ add_executable(ForgeEditor
     src/mcp/McpScript.cpp
     src/mcp/McpViews.cpp
     src/mcp/McpElements.cpp
+    src/mcp/McpSculpt.cpp
     src/mcp/McpTools.cpp)
 
 target_include_directories(ForgeEditor PRIVATE src vendor ${tinygltf_SOURCE_DIR}) # src: mcp/ includes editor roots; tinygltf dir: bundled json.hpp
