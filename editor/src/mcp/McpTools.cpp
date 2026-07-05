@@ -8,11 +8,13 @@
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
 #include <forge/geometry/MeshStats.h>
+#include <forge/geometry/Spatial.h>
 #include <forge/renderer/Texture2D.h>
 
 #include <json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -68,6 +70,14 @@ static json MaterialJson(const Material& m)
     return j;
 }
 
+// World-space AABB of an entity's mesh; invalid AABB for meshless nodes.
+static AABB WorldBoundsOf(const Scene& scene, const Entity& e)
+{
+    if (!e.mesh)
+        return AABB{};
+    return TransformAABB(e.mesh->Bounds(), scene.WorldTransform(e.id));
+}
+
 static json EntityJson(const Scene& scene, const Entity& e)
 {
     json j;
@@ -79,9 +89,16 @@ static json EntityJson(const Scene& scene, const Entity& e)
     j["rotationDeg"] = Vec3Json(glm::degrees(e.transform.rotation));
     j["scale"] = Vec3Json(e.transform.scale);
     j["worldPosition"] = Vec3Json(vec3(scene.WorldTransform(e.id)[3]));
-    if (e.mesh)
+    if (e.mesh) {
         j["mesh"] = {{"vertices", e.mesh->Vertices().size()},
                      {"triangles", e.mesh->Indices().size() / 3}};
+        const AABB wb = WorldBoundsOf(scene, e);
+        if (wb.Valid())
+            j["worldBounds"] = {{"min", Vec3Json(wb.min)},
+                                {"max", Vec3Json(wb.max)},
+                                {"center", Vec3Json((wb.min + wb.max) * 0.5f)},
+                                {"extents", Vec3Json(wb.max - wb.min)}};
+    }
     j["material"] = MaterialJson(e.material);
     if (e.light.enabled)
         j["light"] = {{"color", Vec3Json(e.light.color)},
@@ -135,7 +152,7 @@ static AABB SceneFocusBounds(Scene& scene)
     AABB all, solid;
     for (const Entity& e : scene.Entities())
         if (e.mesh) {
-            const AABB b = TransformAABB(e.mesh->Bounds(), scene.WorldTransform(e.id));
+            const AABB b = WorldBoundsOf(scene, e);
             all.Expand(b.min);
             all.Expand(b.max);
             const vec3 ext = b.max - b.min;
@@ -170,8 +187,9 @@ void EditorApp::RegisterMcpTools()
 
     m_McpProtocol.RegisterTool(
         "get_scene",
-        "Full scene snapshot: all entities (ids, names, hierarchy, transforms, material "
-        "summaries, lights) plus sun, environment, and current selection.",
+        "Full scene snapshot: all entities (ids, names, hierarchy, transforms, world-"
+        "space AABBs, material summaries, lights) plus sun, environment, and current "
+        "selection.",
         {{"type", "object"}, {"additionalProperties", false}},
         [this](const json& args) { return ToolGetScene(args); });
 
@@ -205,6 +223,47 @@ void EditorApp::RegisterMcpTools()
            {"v", {{"type", "number"}, {"description", "viewport y in [0,1], top = 0"}}}}},
          {"additionalProperties", false}},
         [this](const json& args) { return ToolRaycast(args); });
+
+    m_McpProtocol.RegisterTool(
+        "check_overlap",
+        "AABB overlap test between two entities (#94): overlap bool, penetration "
+        "vector (translate the first entity by it to separate), depth, and gap "
+        "distance when clear. Face contact counts as not overlapping. Use this to "
+        "detect interpenetrating parts numerically instead of squinting at pixels.",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}, {"description", "first entity id"}}},
+           {"name", {{"type", "string"}, {"description", "first entity name"}}},
+           {"otherId", {{"type", "string"}, {"description", "second entity id"}}},
+           {"otherName", {{"type", "string"}, {"description", "second entity name"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolCheckOverlap(args); });
+
+    m_McpProtocol.RegisterTool(
+        "query_spatial",
+        "Spatial queries over the scene (#94). Actions: within_radius (entities whose "
+        "bounds lie within radius of a point [point-to-bounds distance] or of another "
+        "entity's bounds [bounds-to-bounds distance; the center entity is excluded]; "
+        "point wins when both are given; sorted by distance), "
+        "above_height / below_height (entities entirely above/below a world y), "
+        "ground_height (top surface height at x,z via downward raycast — use before "
+        "placing something).",
+        {{"type", "object"},
+         {"properties",
+          {{"action",
+            {{"type", "string"},
+             {"enum", {"within_radius", "above_height", "below_height", "ground_height"}}}},
+           {"point", {{"type", "array"}, {"items", {{"type", "number"}}},
+                      {"description", "world [x,y,z] center for within_radius"}}},
+           {"id", {{"type", "string"}, {"description", "center entity for within_radius"}}},
+           {"name", {{"type", "string"}}},
+           {"radius", {{"type", "number"}}},
+           {"height", {{"type", "number"}, {"description", "world y for above/below"}}},
+           {"x", {{"type", "number"}, {"description", "ground_height sample x"}}},
+           {"z", {{"type", "number"}, {"description", "ground_height sample z"}}}}},
+         {"required", {"action"}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolQuerySpatial(args); });
 
     m_McpProtocol.RegisterTool(
         "viewport_screenshot",
@@ -460,7 +519,8 @@ void EditorApp::RegisterMcpTools()
         "variables for parametric builds that would take dozens of tool calls. "
         "The forge.* functions mirror the other tools and take one table of the "
         "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
-        "get_entity{}, mesh_stats{}, raycast{}. Writes: spawn{}, delete{}, "
+        "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}. "
+        "Writes: spawn{}, delete{}, "
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
@@ -564,6 +624,170 @@ ToolResult EditorApp::ToolRaycast(const json& args)
                            {"distance", hit->distance},
                            {"position", Vec3Json(hit->worldPos)},
                            {"normal", Vec3Json(hit->worldNormal)}});
+}
+
+ToolResult EditorApp::ToolCheckOverlap(const json& args)
+{
+    std::string error;
+    Entity* a = FindToolTarget(m_Scene, args, error);
+    if (!a)
+        return Err(error);
+    Entity* b = FindToolTargetKeyed(m_Scene, args, "otherId", "otherName", error);
+    if (!b)
+        return Err(error);
+    if (a->id == b->id)
+        return Err("Both references resolve to the same entity \"" + a->name + "\"");
+    const AABB wa = WorldBoundsOf(m_Scene, *a);
+    const AABB wb = WorldBoundsOf(m_Scene, *b);
+    if (!wa.Valid())
+        return Err("Entity \"" + a->name + "\" has no mesh (no bounds)");
+    if (!wb.Valid())
+        return Err("Entity \"" + b->name + "\" has no mesh (no bounds)");
+
+    const OverlapResult r = OverlapAABB(wa, wb);
+    json j{{"overlap", r.overlap},
+           {"a", {{"id", std::to_string(a->id)}, {"name", a->name},
+                  {"min", Vec3Json(wa.min)}, {"max", Vec3Json(wa.max)}}},
+           {"b", {{"id", std::to_string(b->id)}, {"name", b->name},
+                  {"min", Vec3Json(wb.min)}, {"max", Vec3Json(wb.max)}}}};
+    if (r.overlap) {
+        j["penetration"] = Vec3Json(r.penetration);
+        j["depth"] = r.depth;
+    } else {
+        j["distance"] = r.distance;
+    }
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolQuerySpatial(const json& args)
+{
+    const std::string action = args.value("action", "");
+
+    // Meshless nodes (groups) still have a pose: fall back to a point at the
+    // world position so queries don't silently drop them.
+    auto boundsOrPoint = [this](const Entity& e) {
+        AABB b = WorldBoundsOf(m_Scene, e);
+        if (!b.Valid()) {
+            const vec3 p = vec3(m_Scene.WorldTransform(e.id)[3]);
+            b.Expand(p);
+        }
+        return b;
+    };
+
+    if (action == "within_radius") {
+        if (!args.contains("radius") || !args["radius"].is_number())
+            return Err("Provide radius");
+        const float radius = args["radius"];
+        if (radius < 0.0f)
+            return Err("radius must be >= 0");
+
+        // Point form: point-to-box distance. Entity form: box-to-box distance
+        // (a chair touching the end of a 20-unit wall is at distance 0, not
+        // 10-from-the-midpoint). point wins when both forms are supplied.
+        vec3 center;
+        AABB centerBounds;
+        UUID selfId = 0; // exclude the center entity from its own neighborhood
+        const bool pointForm = GetVec3(args, "point", center);
+        if (!pointForm) {
+            std::string error;
+            Entity* e = FindToolTarget(m_Scene, args, error);
+            if (!e)
+                return Err("Provide point [x,y,z], or id/name of a center entity");
+            centerBounds = boundsOrPoint(*e);
+            center = (centerBounds.min + centerBounds.max) * 0.5f;
+            selfId = e->id;
+        }
+
+        std::vector<std::pair<float, const Entity*>> hits;
+        for (const Entity& e : m_Scene.Entities()) {
+            if (e.id == selfId)
+                continue;
+            const AABB wb = boundsOrPoint(e);
+            const float d =
+                pointForm ? DistanceToAABB(wb, center) : DistanceBetweenAABB(centerBounds, wb);
+            if (d <= radius)
+                hits.push_back({d, &e});
+        }
+        std::sort(hits.begin(), hits.end(),
+                  [](const auto& l, const auto& r) { return l.first < r.first; });
+
+        json matches = json::array();
+        for (const auto& [d, e] : hits) {
+            const AABB wb = boundsOrPoint(*e);
+            matches.push_back({{"id", std::to_string(e->id)},
+                               {"name", e->name},
+                               {"distance", d},
+                               {"center", Vec3Json((wb.min + wb.max) * 0.5f)}});
+        }
+        return JsonResult(json{{"center", Vec3Json(center)},
+                               {"radius", radius},
+                               {"count", matches.size()},
+                               {"matches", std::move(matches)}});
+    }
+
+    if (action == "above_height" || action == "below_height") {
+        if (!args.contains("height") || !args["height"].is_number())
+            return Err("Provide height");
+        const float height = args["height"];
+        const bool above = action == "above_height";
+
+        json matches = json::array();
+        for (const Entity& e : m_Scene.Entities()) {
+            const AABB wb = boundsOrPoint(e);
+            // "Above" means the whole box clears the height (and vice versa) —
+            // an entity straddling the plane matches neither direction.
+            const bool match = above ? wb.min.y >= height : wb.max.y <= height;
+            if (match)
+                matches.push_back({{"id", std::to_string(e.id)},
+                                   {"name", e.name},
+                                   {"minY", wb.min.y},
+                                   {"maxY", wb.max.y}});
+        }
+        return JsonResult(json{{"height", height},
+                               {"direction", above ? "above" : "below"},
+                               {"count", matches.size()},
+                               {"matches", std::move(matches)}});
+    }
+
+    if (action == "ground_height") {
+        if (!args.contains("x") || !args["x"].is_number() || !args.contains("z") ||
+            !args["z"].is_number())
+            return Err("Provide x and z");
+        const float x = args["x"];
+        const float z = args["z"];
+
+        // Cast from just above the scene's top so stacked geometry reports its
+        // highest surface, whatever the scene's vertical extent. The bump must
+        // survive float absorption at large |top| (past 2^24, top + 1 == top,
+        // and an on-surface origin skips the top face).
+        float top = 0.0f;
+        bool any = false;
+        for (const Entity& e : m_Scene.Entities())
+            if (e.mesh) {
+                const AABB wb = WorldBoundsOf(m_Scene, e);
+                if (wb.Valid()) {
+                    top = any ? std::max(top, wb.max.y) : wb.max.y;
+                    any = true;
+                }
+            }
+        if (!any)
+            return JsonResult(json{{"hit", false}});
+
+        Ray ray;
+        ray.origin = {x, top + std::max(1.0f, 1e-5f * std::fabs(top)), z};
+        ray.direction = {0.0f, -1.0f, 0.0f};
+        std::optional<RaycastHit> hit = m_Scene.Raycast(ray);
+        if (!hit)
+            return JsonResult(json{{"hit", false}});
+        const Entity* e = m_Scene.Find(hit->entity);
+        return JsonResult(json{{"hit", true},
+                               {"height", hit->worldPos.y},
+                               {"entityId", std::to_string(hit->entity)},
+                               {"entityName", e ? e->name : ""}});
+    }
+
+    return Err("Unknown action \"" + action +
+               "\" (within_radius, above_height, below_height, ground_height)");
 }
 
 // --- actuation handlers -------------------------------------------------------
@@ -1202,6 +1426,8 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("get_entity", call(&EditorApp::ToolGetEntity, nullptr));
         add("mesh_stats", call(&EditorApp::ToolGetMeshStats, nullptr));
         add("raycast", call(&EditorApp::ToolRaycast, nullptr));
+        add("check_overlap", call(&EditorApp::ToolCheckOverlap, nullptr));
+        add("query_spatial", call(&EditorApp::ToolQuerySpatial, nullptr));
 
         add("spawn", call(&EditorApp::ToolManageEntity, "spawn"));
         add("delete", call(&EditorApp::ToolManageEntity, "delete"));

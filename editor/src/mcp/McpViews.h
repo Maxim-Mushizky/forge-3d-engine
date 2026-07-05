@@ -2,6 +2,7 @@
 
 #include <forge/core/Geometry.h>
 #include <forge/core/Math.h>
+#include <forge/geometry/Spatial.h> // TransformAABB lives in the engine kernel (#94)
 
 #include <string>
 #include <vector>
@@ -30,9 +31,5 @@ mat4 ViewProjFor(const ViewSpec& spec, float aspect);
 // Golden-ratio hue walk: stable, visually distinct entity colors for the
 // object-id diagnostic mode.
 vec3 IdColor(size_t index);
-
-// World-space AABB of a local-space box under an affine transform (all 8
-// corners, not just min/max — rotations would break the shortcut).
-AABB TransformAABB(const AABB& box, const mat4& transform);
 
 } // namespace forge
