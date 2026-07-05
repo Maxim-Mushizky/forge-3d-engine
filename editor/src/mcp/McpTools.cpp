@@ -2,6 +2,7 @@
 #include "mcp/McpElements.h"
 #include "mcp/McpImage.h"
 #include "mcp/McpScript.h"
+#include "mcp/McpSculpt.h"
 #include "mcp/McpViews.h"
 
 #include <forge/assets/MeshFactory.h>
@@ -22,6 +23,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -639,7 +641,13 @@ void EditorApp::RegisterMcpTools()
         "drop_to_ground{}, snap_settings{}, mesh_elements{} (face/edge ids + "
         "world centers; face id = raycast triIndex/3; ofFaces maps faces to "
         "their edges), extrude_faces{}/extrude_edges{}/subdivide_faces{}/"
-        "subdivide_edges{}/shade{} (edit-mode element ops by id), export_stl{}. "
+        "subdivide_edges{}/shade{} (edit-mode element ops by id), "
+        "sculpt{id, brush='grab'|'inflate'|'smooth', center={x,y,z}, radius, "
+        "strength, direction (grab), strokes=N} (brush at a world point; "
+        "strength = world units for grab/inflate, negative inflate dents, "
+        "0..1 relax factor for smooth), move_verts{id, point, radius, offset, "
+        "falloff='smooth'|'linear'|'constant'} (falloff-weighted vertex "
+        "translation, weld-seam safe), export_stl{}. "
         "Entity writes return the affected entity as a table (use .id); camera/"
         "selection/element/export calls return their own shapes. "
         "print() lines and the script's return value come back in the result. "
@@ -1699,6 +1707,146 @@ ToolResult EditorApp::ToolEditElements(const json& args)
     return Err("Unknown element action \"" + action + "\"");
 }
 
+// #105: script-driven sculpting. forge.sculpt applies the interactive brush
+// math (grab/inflate/smooth) at a world-space point; forge.move_verts is the
+// general falloff-weighted vertex translation underneath. One sparse
+// SculptStrokeCommand per call — the same undo currency as a mouse stroke.
+ToolResult EditorApp::ToolSculpt(const json& args)
+{
+    const std::string action = args.value("action", "");
+    const bool moveVerts = action == "move_verts";
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->mesh)
+        return Err("Entity has no mesh");
+
+    // --- validate everything before touching the mesh (validate-then-mutate)
+    const char* centerKey = moveVerts ? "point" : "center";
+    vec3 worldCenter;
+    if (!GetVec3(args, centerKey, worldCenter))
+        return Err(std::string("Provide ") + centerKey + " as [x,y,z] (world space)");
+    if (!args.contains("radius") || !args["radius"].is_number())
+        return Err("Provide radius (world units)");
+    const float worldRadius = args["radius"];
+    if (!(worldRadius > 0.0f))
+        return Err("radius must be > 0");
+    const int strokes = std::clamp(args.value("strokes", 1), 1, 32);
+
+    std::string brush = args.value("brush", "grab");
+    SculptFalloff falloff = SculptFalloff::Smooth;
+    if (moveVerts) {
+        const std::string f = args.value("falloff", "smooth");
+        if (f == "linear")
+            falloff = SculptFalloff::Linear;
+        else if (f == "constant")
+            falloff = SculptFalloff::Constant;
+        else if (f != "smooth")
+            return Err("falloff must be smooth, linear or constant");
+    } else if (brush != "grab" && brush != "inflate" && brush != "smooth") {
+        return Err("brush must be grab, inflate or smooth");
+    }
+
+    // Per-brush strength contract: grab/inflate move the full-weight center by
+    // `strength` WORLD units (negative inflate dents); smooth's strength is a
+    // 0..1 relaxation factor per stroke. move_verts takes an explicit world
+    // offset vector instead.
+    float strength = args.value("strength", brush == "smooth" ? 0.5f : 0.25f);
+    vec3 worldOffset(0.0f);
+    if (moveVerts) {
+        if (!GetVec3(args, "offset", worldOffset) || glm::length(worldOffset) < 1e-6f)
+            return Err("Provide a non-zero offset [x,y,z] (world units)");
+    } else if (brush == "grab") {
+        vec3 dir;
+        if (!GetVec3(args, "direction", dir) || glm::length(dir) < 1e-6f)
+            return Err("grab needs a non-zero direction [x,y,z] (world space)");
+        if (std::fabs(strength) < 1e-6f)
+            return Err("strength must be non-zero (world units the center moves)");
+        worldOffset = glm::normalize(dir) * strength;
+    } else if (brush == "inflate") {
+        if (std::fabs(strength) < 1e-6f)
+            return Err("strength must be non-zero (world units; negative dents inward)");
+    } else { // smooth
+        strength = std::clamp(strength, 0.0f, 1.0f);
+    }
+
+    // World -> object: positions through the full inverse, vectors through
+    // mat3(inv); the radius (and inflate's normal-space amount) scale by the
+    // inverse x-basis length — the same uniform-scale approximation the
+    // interactive SculptTool uses.
+    const mat4 inv = glm::inverse(m_Scene.WorldTransform(e->id));
+    const vec3 localCenter = vec3(inv * vec4(worldCenter, 1.0f));
+    const float invScale = glm::length(vec3(inv[0]));
+    const float localRadius = worldRadius * invScale;
+    if (!(localRadius > 0.0f) || !std::isfinite(localRadius))
+        return Err("Entity world transform is degenerate (zero scale?)");
+    const vec3 localOffset = mat3(inv) * worldOffset;
+    const float localAmount = strength * invScale; // inflate: along object normals
+
+    // Copy-on-write (same as SculptTool::Enter): primitives are shared between
+    // sibling entities AND undo snapshots hold the same shared_ptr — editing
+    // in place would rewrite history.
+    if (e->mesh.use_count() > 1)
+        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+
+    const std::vector<Vertex> before = e->mesh->Vertices();
+    const MeshTopology topo = MeshTopology::Build(*e->mesh);
+    auto& verts = e->mesh->MutableVertices();
+
+    size_t movedGroups = 0;
+    for (int s = 0; s < strokes; ++s) {
+        size_t moved = 0;
+        if (moveVerts)
+            moved = SculptMove(verts, topo, localCenter, localRadius, localOffset, falloff);
+        else if (brush == "grab")
+            moved = SculptMove(verts, topo, localCenter, localRadius, localOffset,
+                               SculptFalloff::Smooth);
+        else if (brush == "inflate")
+            moved = SculptInflate(verts, topo, localCenter, localRadius, localAmount);
+        else
+            moved = SculptSmooth(verts, topo, localCenter, localRadius, strength);
+        movedGroups = std::max(movedGroups, moved);
+        if (moved == 0)
+            break;
+        // Inflate pushes along normals: refresh them between strokes so the
+        // accumulation follows the evolving surface.
+        if (!moveVerts && brush == "inflate" && s + 1 < strokes)
+            RecomputeNormalsWelded(*e->mesh, topo);
+    }
+
+    json out = EntityJson(m_Scene, *e);
+    out["movedGroups"] = movedGroups;
+    if (movedGroups == 0) {
+        out["changedVertices"] = 0;
+        return JsonResult(out); // brush missed the mesh: honest no-op, no undo entry
+    }
+
+    RecomputeNormalsWelded(*e->mesh, topo);
+    e->mesh->RecomputeBounds();
+    e->mesh->UploadVertices(); // VBO must follow CPU edits (#103 lesson)
+
+    // Sparse diff, same as SculptTool::EndStroke: only changed verts go on the
+    // undo stack.
+    const std::vector<Vertex>& after = e->mesh->Vertices();
+    std::vector<uint32_t> indices;
+    std::vector<Vertex> beforeDiff, afterDiff;
+    for (uint32_t i = 0; i < (uint32_t)after.size() && i < (uint32_t)before.size(); ++i) {
+        if (std::memcmp(&after[i], &before[i], sizeof(Vertex)) != 0) {
+            indices.push_back(i);
+            beforeDiff.push_back(before[i]);
+            afterDiff.push_back(after[i]);
+        }
+    }
+    out = EntityJson(m_Scene, *e); // re-read: bounds changed above
+    out["movedGroups"] = movedGroups;
+    out["changedVertices"] = indices.size();
+    if (!indices.empty())
+        m_Commands.Push(std::make_unique<SculptStrokeCommand>(
+            e->id, std::move(indices), std::move(beforeDiff), std::move(afterDiff)));
+    return JsonResult(out);
+}
+
 ToolResult EditorApp::ToolExportStl(const json& args)
 {
     const std::string path = args.value("path", "");
@@ -2423,6 +2571,8 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("snap_settings", call(&EditorApp::ToolSnapSettings, nullptr));
 
         add("mesh_elements", call(&EditorApp::ToolMeshElements, nullptr));
+        add("sculpt", call(&EditorApp::ToolSculpt, "sculpt"));
+        add("move_verts", call(&EditorApp::ToolSculpt, "move_verts"));
         add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces"));
         add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges"));
         add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces"));

@@ -148,6 +148,7 @@ private:
     ToolResult ToolSnapSettings(const nlohmann::json& args);    // gizmo snap prefs
     ToolResult ToolMeshElements(const nlohmann::json& args);    // face/edge id queries
     ToolResult ToolEditElements(const nlohmann::json& args);    // extrude/subdivide/shade
+    ToolResult ToolSculpt(const nlohmann::json& args);          // #105: sculpt / move_verts
     ToolResult ToolExportStl(const nlohmann::json& args);
     // Combined world AABB of an entity and its descendants; optionally
     // collects the subtree's ids (for excluding it from collision queries).
