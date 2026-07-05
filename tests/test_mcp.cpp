@@ -4,6 +4,8 @@
 
 #include <json.hpp>
 
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -167,6 +169,47 @@ void TestThrowingToolBecomesIsErrorResult()
     CHECK(r["result"]["content"][0]["text"] == "kaboom");
 }
 
+void TestNonFiniteArgPath()
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+
+    // Clean payloads — including integers and strings — report nothing.
+    CHECK(NonFiniteArgPath(json::object()).empty());
+    CHECK(NonFiniteArgPath(json{{"distance", 1.5}, {"count", 3}, {"name", "x"}}).empty());
+
+    // Top-level scalar, negative infinity, and float-range overflow: a 1e308
+    // double is finite but becomes +inf the moment a handler casts to float.
+    CHECK(NonFiniteArgPath(json{{"distance", nan}}) == "distance");
+    CHECK(NonFiniteArgPath(json{{"radius", -inf}}) == "radius");
+    CHECK(NonFiniteArgPath(json{{"big", 1e308}}) == "big");
+
+    // Nested paths name the offending leaf.
+    CHECK(NonFiniteArgPath(json{{"position", {0.0, nan, 0.0}}}) == "position[1]");
+    CHECK(NonFiniteArgPath(json{{"params", {{"depth", inf}}}}) == "params.depth");
+}
+
+void TestWireCannotSmuggleNonFinite()
+{
+    // The nlohmann lexer refuses NaN/Inf literals and overflowing float
+    // literals (out_of_range.406 -> parse error), so no HTTP body reaches a
+    // handler carrying a non-finite number. The dispatch guard in tools/call
+    // is defence in depth for in-process callers of HandleMessage; the Lua
+    // binding path (which really can produce NaN) is tested in
+    // test_mcpscript.cpp.
+    McpProtocol proto;
+    bool ran = false;
+    proto.RegisterTool("move", "Records being run.", json{{"type", "object"}},
+                       [&](const json&) {
+                           ran = true;
+                           return ToolResult::Text("ok");
+                       });
+    json r = Handle(proto, R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
+                           R"("params":{"name":"move","arguments":{"position":[1e999,0,0]}}})");
+    CHECK(r["error"]["code"] == -32700);
+    CHECK(!ran);
+}
+
 void TestResourcesListAndRead()
 {
     McpProtocol proto = MakeProtocolWithPing();
@@ -274,6 +317,8 @@ void RunMcpTests()
     TestUnknownToolIsProtocolError();
     TestMissingToolNameIsProtocolError();
     TestThrowingToolBecomesIsErrorResult();
+    TestNonFiniteArgPath();
+    TestWireCannotSmuggleNonFinite();
     TestResourcesListAndRead();
     TestUnknownResourceError();
     TestEmptyResourcesList();

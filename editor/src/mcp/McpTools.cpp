@@ -52,7 +52,13 @@ static bool GetVec3(const json& args, const char* key, vec3& out)
     if (!a.is_array() || a.size() != 3 || !a[0].is_number() || !a[1].is_number() ||
         !a[2].is_number())
         return false;
-    out = {(float)a[0], (float)a[1], (float)a[2]};
+    const vec3 v{(float)a[0], (float)a[1], (float)a[2]};
+    // NaN/Inf pass is_number(); treat them as malformed and leave `out`
+    // untouched. The dispatch/script guards reject such calls up front, so
+    // this is defence in depth for any future entry path (#104).
+    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+        return false;
+    out = v;
     return true;
 }
 
@@ -2339,6 +2345,12 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
             json a = fnArgs;
             if (action)
                 a["action"] = action;
+            // Same front-door refusal as MCP dispatch: a Lua 0/0 or math.huge
+            // arrives as a well-typed number and survives every downstream
+            // range check. Throwing before the handler runs keeps the failed
+            // script's rollback trivially correct — nothing mutated (#104).
+            if (const std::string bad = NonFiniteArgPath(a); !bad.empty())
+                throw std::runtime_error("argument '" + bad + "' is NaN or infinite");
             ToolResult r = (this->*handler)(a);
             std::string text;
             if (!r.content.empty() && r.content[0].contains("text") &&

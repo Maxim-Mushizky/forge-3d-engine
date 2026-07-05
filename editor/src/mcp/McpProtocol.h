@@ -18,6 +18,13 @@ struct ToolResult {
     static ToolResult Text(std::string text, bool error = false);
 };
 
+// Dotted path ("distance", "position[0]", "params.depth") of the first number
+// inside `args` that is not float-finite; empty when the value is clean. NaN
+// and Inf pass is_number() and every range check (fabs(NaN) < eps is false),
+// so both tool dispatch and the script bindings refuse arguments up front
+// instead of committing garbage into transforms and meshes (#104).
+std::string NonFiniteArgPath(const nlohmann::json& args);
+
 using ToolHandler = std::function<ToolResult(const nlohmann::json& args)>;
 // Async tools receive a responder they may store and call on a later frame
 // (e.g. an amortized path-traced render). Call it exactly once; extra calls
