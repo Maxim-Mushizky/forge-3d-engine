@@ -39,6 +39,13 @@ std::shared_ptr<Mesh> MeshFactory::Cube()
 
 std::shared_ptr<Mesh> MeshFactory::Sphere(uint32_t rings, uint32_t sectors)
 {
+    // Lower bounds: below these the pole-row emission yields no triangles / a
+    // flat sliver. Upper bounds: the MCP spawn params arrive as json ints, so
+    // a negative value wraps to ~4e9 here and an unbounded loop would OOM the
+    // exception-light editor.
+    rings = std::clamp(rings, 2u, 512u);
+    sectors = std::clamp(sectors, 3u, 1024u);
+
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
     vertices.reserve((rings + 1) * (sectors + 1));
@@ -53,11 +60,21 @@ std::shared_ptr<Mesh> MeshFactory::Sphere(uint32_t rings, uint32_t sectors)
         }
     }
 
+    // Counter-clockwise seen from outside, like every other primitive: winding
+    // is what RecomputeNormalsWelded derives normals from after any edit, so a
+    // backwards sphere shades dark and inflates inward the moment it is
+    // sculpted (#116). The pole rows collapse one quad edge (both r=0 verts
+    // share the pole position), so emit only the non-degenerate half there —
+    // zero-area slivers would pollute the welded normal accumulation at the
+    // poles.
     for (uint32_t r = 0; r < rings; ++r) {
         for (uint32_t s = 0; s < sectors; ++s) {
             uint32_t i0 = r * (sectors + 1) + s;
             uint32_t i1 = i0 + sectors + 1;
-            indices.insert(indices.end(), {i0, i1, i0 + 1, i0 + 1, i1, i1 + 1});
+            if (r > 0)
+                indices.insert(indices.end(), {i0, i0 + 1, i1});
+            if (r + 1 < rings)
+                indices.insert(indices.end(), {i0 + 1, i1 + 1, i1});
         }
     }
 
