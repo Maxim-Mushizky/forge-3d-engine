@@ -85,7 +85,13 @@ FetchContent_Declare(httplib
     GIT_TAG v0.48.0
     GIT_SHALLOW TRUE)
 
-FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold httplib)
+# --- Lua 5.4 (embedded agent scripting, #78; no upstream CMakeLists) ----------
+FetchContent_Declare(lua
+    GIT_REPOSITORY https://github.com/lua/lua.git
+    GIT_TAG v5.4.8
+    GIT_SHALLOW TRUE)
+
+FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold httplib lua)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -104,3 +110,17 @@ target_link_libraries(imgui PUBLIC glfw opengl32)
 # wire our imgui build into it and expose the headers.
 target_link_libraries(imguizmo PUBLIC imgui)
 target_include_directories(imguizmo PUBLIC ${imguizmo_SOURCE_DIR})
+
+# Lua interpreter core as a static lib (the lua.c / luac.c hosts and the
+# internal-test ltests.c are excluded). Compiled as C++ so Lua errors unwind
+# as exceptions instead of longjmp — the script bindings in editor/src/mcp
+# hold RAII objects across lua_error, which longjmp would leak.
+set(LUA_SOURCES
+    lapi.c lauxlib.c lbaselib.c lcode.c lcorolib.c lctype.c ldblib.c ldebug.c
+    ldo.c ldump.c lfunc.c lgc.c linit.c liolib.c llex.c lmathlib.c lmem.c
+    loadlib.c lobject.c lopcodes.c loslib.c lparser.c lstate.c lstring.c
+    lstrlib.c ltable.c ltablib.c ltm.c lundump.c lutf8lib.c lvm.c lzio.c)
+list(TRANSFORM LUA_SOURCES PREPEND ${lua_SOURCE_DIR}/)
+add_library(lua STATIC ${LUA_SOURCES})
+set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
+target_include_directories(lua PUBLIC ${lua_SOURCE_DIR})

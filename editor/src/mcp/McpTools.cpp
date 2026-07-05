@@ -1,5 +1,6 @@
 #include "EditorApp.h"
 #include "mcp/McpImage.h"
+#include "mcp/McpScript.h"
 
 #include <forge/assets/MeshFactory.h>
 #include <forge/geometry/MeshBoolean.h>
@@ -12,12 +13,14 @@
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
-// MCP tool surface (#76 perception, #77 actuation). Registered handlers run on
-// the GL main thread between frames (McpServer drains the queue there), so
-// they may touch Scene/Renderer freely. Every mutating action goes through the
-// CommandStack — agent ops sit in the editor's Ctrl+Z history like any other.
+// MCP tool surface (#76 perception, #77 actuation, #78 scripting). Registered
+// handlers run on the GL main thread between frames (McpServer drains the
+// queue there), so they may touch Scene/Renderer freely. Every mutating action
+// goes through the CommandStack — agent ops sit in the editor's Ctrl+Z history
+// like any other.
 
 namespace forge {
 
@@ -145,25 +148,8 @@ void EditorApp::RegisterMcpTools()
         "get_scene",
         "Full scene snapshot: all entities (ids, names, hierarchy, transforms, material "
         "summaries, lights) plus sun, environment, and current selection.",
-        {{"type", "object"}, {"additionalProperties", false}}, [this](const json&) {
-            json j;
-            j["entities"] = json::array();
-            for (const Entity& e : m_Scene.Entities())
-                j["entities"].push_back(EntityJson(m_Scene, e));
-            j["sun"] = {{"azimuthDeg", m_SunAzimuth},
-                        {"elevationDeg", m_SunElevation},
-                        {"color", Vec3Json(m_Sun.color)},
-                        {"intensity", m_Sun.intensity}};
-            if (m_Env && m_Env->Valid())
-                j["environment"] = {{"path", m_EnvPath},
-                                    {"intensity", m_Env->intensity},
-                                    {"rotationDeg", m_Env->rotationDegrees}};
-            json sel = json::array();
-            for (UUID id : m_Selection)
-                sel.push_back(std::to_string(id));
-            j["selection"] = std::move(sel);
-            return JsonResult(j);
-        });
+        {{"type", "object"}, {"additionalProperties", false}},
+        [this](const json& args) { return ToolGetScene(args); });
 
     m_McpProtocol.RegisterTool(
         "get_entity", "Full detail for one entity, looked up by id (or name).",
@@ -172,23 +158,7 @@ void EditorApp::RegisterMcpTools()
           {{"id", {{"type", "string"}, {"description", "Entity id from get_scene"}}},
            {"name", {{"type", "string"}, {"description", "Entity name (first match)"}}}}},
          {"additionalProperties", false}},
-        [this](const json& args) {
-            std::string error;
-            Entity* e = FindToolTarget(m_Scene, args, error);
-            if (!e)
-                return Err(error);
-            json j = EntityJson(m_Scene, *e);
-            if (e->mesh) {
-                const AABB& b = e->mesh->Bounds();
-                j["mesh"]["boundsMin"] = Vec3Json(b.min);
-                j["mesh"]["boundsMax"] = Vec3Json(b.max);
-            }
-            json children = json::array();
-            for (UUID id : m_Scene.ChildrenOf(e->id))
-                children.push_back(std::to_string(id));
-            j["children"] = std::move(children);
-            return JsonResult(j);
-        });
+        [this](const json& args) { return ToolGetEntity(args); });
 
     m_McpProtocol.RegisterTool(
         "get_mesh_stats",
@@ -197,26 +167,7 @@ void EditorApp::RegisterMcpTools()
         {{"type", "object"},
          {"properties", {{"id", {{"type", "string"}}}, {"name", {{"type", "string"}}}}},
          {"additionalProperties", false}},
-        [this](const json& args) {
-            std::string error;
-            Entity* e = FindToolTarget(m_Scene, args, error);
-            if (!e)
-                return Err(error);
-            if (!e->mesh)
-                return Err("Entity \"" + e->name + "\" has no mesh");
-            MeshStats s = ComputeMeshStats(e->mesh->Vertices(), e->mesh->Indices());
-            json j{{"vertices", s.vertexCount},
-                   {"triangles", s.triangleCount},
-                   {"degenerateTriangles", s.degenerateTriangles},
-                   {"boundaryEdges", s.boundaryEdges},
-                   {"nonManifoldEdges", s.nonManifoldEdges},
-                   {"watertight", s.watertight},
-                   {"hasUVs", s.hasUVs},
-                   {"boundsMin", Vec3Json(s.bounds.min)},
-                   {"boundsMax", Vec3Json(s.bounds.max)},
-                   {"extents", Vec3Json(s.bounds.max - s.bounds.min)}};
-            return JsonResult(j);
-        });
+        [this](const json& args) { return ToolGetMeshStats(args); });
 
     m_McpProtocol.RegisterTool(
         "raycast",
@@ -229,28 +180,7 @@ void EditorApp::RegisterMcpTools()
            {"u", {{"type", "number"}, {"description", "viewport x in [0,1]"}}},
            {"v", {{"type", "number"}, {"description", "viewport y in [0,1], top = 0"}}}}},
          {"additionalProperties", false}},
-        [this](const json& args) {
-            Ray ray;
-            vec3 origin, direction;
-            if (GetVec3(args, "origin", origin) && GetVec3(args, "direction", direction)) {
-                ray.origin = origin;
-                ray.direction = glm::normalize(direction);
-            } else if (args.contains("u") && args.contains("v")) {
-                ray = ViewportRay(vec2((float)args.value("u", 0.5), (float)args.value("v", 0.5)));
-            } else {
-                return Err("Provide origin+direction or u+v");
-            }
-            std::optional<RaycastHit> hit = m_Scene.Raycast(ray);
-            if (!hit)
-                return JsonResult(json{{"hit", false}});
-            const Entity* e = m_Scene.Find(hit->entity);
-            return JsonResult(json{{"hit", true},
-                                   {"entityId", std::to_string(hit->entity)},
-                                   {"entityName", e ? e->name : ""},
-                                   {"distance", hit->distance},
-                                   {"position", Vec3Json(hit->worldPos)},
-                                   {"normal", Vec3Json(hit->worldNormal)}});
-        });
+        [this](const json& args) { return ToolRaycast(args); });
 
     m_McpProtocol.RegisterTool(
         "viewport_screenshot",
@@ -440,6 +370,118 @@ void EditorApp::RegisterMcpTools()
            {"distance", {{"type", "number"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolManageScene(args); });
+
+    // --- scripting (#78): code-as-actuation escape hatch ----------------------
+
+    m_McpProtocol.RegisterTool(
+        "execute_script",
+        "Run a sandboxed Lua 5.4 script against the scene — loops, math, and "
+        "variables for parametric builds that would take dozens of tool calls. "
+        "The forge.* functions mirror the other tools and take one table of the "
+        "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
+        "get_entity{}, mesh_stats{}, raycast{}. Writes: spawn{}, delete{}, "
+        "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{}, "
+        "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
+        "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
+        "look_at{}. Writes return the affected entity as a table (use .id). "
+        "print() lines and the script's return value come back in the result. "
+        "The whole script is ONE undo entry; on error the partial build rolls "
+        "back (sun/environment/camera changes excepted). Sandboxed: no os/io/"
+        "require; runaway loops and memory bombs abort.",
+        {{"type", "object"},
+         {"properties",
+          {{"source", {{"type", "string"}, {"description", "Lua 5.4 source"}}}}},
+         {"required", {"source"}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolExecuteScript(args); });
+}
+
+// --- perception handlers --------------------------------------------------------
+
+ToolResult EditorApp::ToolGetScene(const json&)
+{
+    json j;
+    j["entities"] = json::array();
+    for (const Entity& e : m_Scene.Entities())
+        j["entities"].push_back(EntityJson(m_Scene, e));
+    j["sun"] = {{"azimuthDeg", m_SunAzimuth},
+                {"elevationDeg", m_SunElevation},
+                {"color", Vec3Json(m_Sun.color)},
+                {"intensity", m_Sun.intensity}};
+    if (m_Env && m_Env->Valid())
+        j["environment"] = {{"path", m_EnvPath},
+                            {"intensity", m_Env->intensity},
+                            {"rotationDeg", m_Env->rotationDegrees}};
+    json sel = json::array();
+    for (UUID id : m_Selection)
+        sel.push_back(std::to_string(id));
+    j["selection"] = std::move(sel);
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolGetEntity(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    json j = EntityJson(m_Scene, *e);
+    if (e->mesh) {
+        const AABB& b = e->mesh->Bounds();
+        j["mesh"]["boundsMin"] = Vec3Json(b.min);
+        j["mesh"]["boundsMax"] = Vec3Json(b.max);
+    }
+    json children = json::array();
+    for (UUID id : m_Scene.ChildrenOf(e->id))
+        children.push_back(std::to_string(id));
+    j["children"] = std::move(children);
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolGetMeshStats(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->mesh)
+        return Err("Entity \"" + e->name + "\" has no mesh");
+    MeshStats s = ComputeMeshStats(e->mesh->Vertices(), e->mesh->Indices());
+    json j{{"vertices", s.vertexCount},
+           {"triangles", s.triangleCount},
+           {"degenerateTriangles", s.degenerateTriangles},
+           {"boundaryEdges", s.boundaryEdges},
+           {"nonManifoldEdges", s.nonManifoldEdges},
+           {"watertight", s.watertight},
+           {"hasUVs", s.hasUVs},
+           {"boundsMin", Vec3Json(s.bounds.min)},
+           {"boundsMax", Vec3Json(s.bounds.max)},
+           {"extents", Vec3Json(s.bounds.max - s.bounds.min)}};
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolRaycast(const json& args)
+{
+    Ray ray;
+    vec3 origin, direction;
+    if (GetVec3(args, "origin", origin) && GetVec3(args, "direction", direction)) {
+        ray.origin = origin;
+        ray.direction = glm::normalize(direction);
+    } else if (args.contains("u") && args.contains("v")) {
+        ray = ViewportRay(vec2((float)args.value("u", 0.5), (float)args.value("v", 0.5)));
+    } else {
+        return Err("Provide origin+direction or u+v");
+    }
+    std::optional<RaycastHit> hit = m_Scene.Raycast(ray);
+    if (!hit)
+        return JsonResult(json{{"hit", false}});
+    const Entity* e = m_Scene.Find(hit->entity);
+    return JsonResult(json{{"hit", true},
+                           {"entityId", std::to_string(hit->entity)},
+                           {"entityName", e ? e->name : ""},
+                           {"distance", hit->distance},
+                           {"position", Vec3Json(hit->worldPos)},
+                           {"normal", Vec3Json(hit->worldNormal)}});
 }
 
 // --- actuation handlers -------------------------------------------------------
@@ -604,8 +646,10 @@ ToolResult EditorApp::ToolManageMaterial(const json& args)
             m.albedoMap = nullptr;
         } else {
             auto tex = Texture2D::FromFile(path, /*srgb=*/true, /*flipV=*/false);
-            if (!tex)
+            if (!tex) {
+                *e = before; // no partial edit: earlier fields already changed
                 return Err("Couldn't load texture: " + path);
+            }
             m.albedoMap = tex;
         }
         any = true;
@@ -850,6 +894,102 @@ ToolResult EditorApp::ToolManageScene(const json& args)
         return JsonResult(json{{"ok", ok}, {"entities", m_Scene.Entities().size()}});
     }
     return Err("Unknown action: \"" + action + "\"");
+}
+
+// --- scripting (#78) ------------------------------------------------------------
+
+ToolResult EditorApp::ToolExecuteScript(const json& args)
+{
+    if (!args.contains("source") || !args["source"].is_string())
+        return Err("Provide source (Lua)");
+    const std::string source = args["source"];
+
+    // Every command a binding pushes collects into one composite: the whole
+    // script is a single undo entry, and a failed script rolls back atomically
+    // (selection included).
+    const UUID selectedBefore = m_Selected;
+    const std::vector<UUID> selectionBefore = m_Selection;
+    m_Commands.BeginBatch();
+
+    // Each forge.* function re-enters an existing tool handler with the same
+    // JSON contract; an isError result becomes a Lua error (aborting the
+    // script), a JSON result comes back as a table.
+    auto call = [this](ToolResult (EditorApp::*handler)(const json&), const char* action) {
+        return [this, handler, action](const json& fnArgs) -> json {
+            json a = fnArgs;
+            if (action)
+                a["action"] = action;
+            ToolResult r = (this->*handler)(a);
+            std::string text;
+            if (!r.content.empty() && r.content[0].contains("text") &&
+                r.content[0]["text"].is_string())
+                text = r.content[0]["text"];
+            if (r.isError)
+                throw std::runtime_error(text.empty() ? "tool failed" : text);
+            json parsed = json::parse(text, nullptr, /*allow_exceptions=*/false);
+            return parsed.is_discarded() ? json(text) : parsed;
+        };
+    };
+
+    ScriptResult run = RunSandboxedScript(source, [&](const ScriptInstall& add) {
+        add("scene", call(&EditorApp::ToolGetScene, nullptr));
+        add("get_entity", call(&EditorApp::ToolGetEntity, nullptr));
+        add("mesh_stats", call(&EditorApp::ToolGetMeshStats, nullptr));
+        add("raycast", call(&EditorApp::ToolRaycast, nullptr));
+
+        add("spawn", call(&EditorApp::ToolManageEntity, "spawn"));
+        add("delete", call(&EditorApp::ToolManageEntity, "delete"));
+        add("duplicate", call(&EditorApp::ToolManageEntity, "duplicate"));
+        add("rename", call(&EditorApp::ToolManageEntity, "rename"));
+        add("set_transform", call(&EditorApp::ToolManageEntity, "set_transform"));
+        add("set_parent", call(&EditorApp::ToolManageEntity, "set_parent"));
+
+        add("set_material", call(&EditorApp::ToolManageMaterial, nullptr));
+        add("spawn_point_light", call(&EditorApp::ToolManageLight, "spawn_point"));
+        add("set_point_light", call(&EditorApp::ToolManageLight, "set_point"));
+        add("set_sun", call(&EditorApp::ToolManageLight, "set_sun"));
+        add("set_environment", call(&EditorApp::ToolManageLight, "set_environment"));
+
+        add("subdivide", call(&EditorApp::ToolEditMesh, "subdivide"));
+        add("smooth", call(&EditorApp::ToolEditMesh, "smooth"));
+        add("boolean", call(&EditorApp::ToolEditMesh, "boolean"));
+        add("remesh", call(&EditorApp::ToolEditMesh, "remesh"));
+        add("mirror", call(&EditorApp::ToolEditMesh, "mirror"));
+        add("extrude_face", call(&EditorApp::ToolEditMesh, "extrude_face"));
+
+        add("look_at", call(&EditorApp::ToolManageScene, "look_at"));
+    });
+
+    std::unique_ptr<CompositeCommand> batch = m_Commands.EndBatch();
+    if (!run.ok) {
+        if (batch && !batch->Empty())
+            batch->Undo(m_Scene); // roll back the partial build
+        // The undo restores every entity the script touched, so the pre-script
+        // selection is valid again.
+        m_Selected = selectedBefore;
+        m_Selection = selectionBefore;
+        if (!m_Scene.Find(m_Selected)) {
+            m_Selection.clear();
+            m_Selected = 0;
+        }
+        std::string msg = run.error;
+        if (!run.output.empty())
+            msg += "\n--- script output ---\n" + run.output;
+        return Err(std::move(msg));
+    }
+    if (batch && !batch->Empty())
+        m_Commands.Push(std::move(batch));
+    if (!m_Scene.Find(m_Selected)) { // script may end on a delete
+        m_Selection.clear();
+        m_Selected = 0;
+    }
+
+    json out{{"ok", true}, {"entities", m_Scene.Entities().size()}};
+    if (!run.output.empty())
+        out["output"] = run.output;
+    if (!run.returned.is_null())
+        out["returned"] = run.returned;
+    return JsonResult(out);
 }
 
 void EditorApp::UpdateMcpRender()

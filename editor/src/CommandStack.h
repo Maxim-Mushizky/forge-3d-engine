@@ -1,5 +1,6 @@
 #pragma once
 
+#include <forge/core/Log.h>
 #include <forge/scene/Scene.h>
 
 #include <memory>
@@ -138,13 +139,29 @@ private:
 
 class CommandStack {
 public:
-    // The action has already been applied; Push only records it.
+    // The action has already been applied; Push only records it. While a
+    // scripted batch (#78) is open, commands collect into it instead so a
+    // whole agent script lands as a single undo entry.
     void Push(std::unique_ptr<Command> command)
     {
+        if (m_Batch) {
+            m_Batch->Add(std::move(command));
+            return;
+        }
         m_UndoStack.push_back(std::move(command));
         m_RedoStack.clear();
         ++m_Revision;
     }
+
+    // Scripted batches (#78). Begin routes subsequent Pushes into a composite;
+    // End hands it back — the caller Pushes it on success, or Undoes and drops
+    // it so a failed script rolls back atomically.
+    void BeginBatch()
+    {
+        FORGE_ASSERT(!m_Batch, "CommandStack batch already open");
+        m_Batch = std::make_unique<CompositeCommand>();
+    }
+    std::unique_ptr<CompositeCommand> EndBatch() { return std::move(m_Batch); }
 
     bool Undo(Scene& scene)
     {
@@ -188,6 +205,7 @@ public:
 private:
     std::vector<std::unique_ptr<Command>> m_UndoStack;
     std::vector<std::unique_ptr<Command>> m_RedoStack;
+    std::unique_ptr<CompositeCommand> m_Batch; // non-null while a script batch is open
     uint64_t m_Revision = 0;
 };
 
