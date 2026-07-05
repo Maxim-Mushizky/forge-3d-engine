@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 
 struct ImFont;
 struct ForgeGifWriter; // wraps gif-h's GifWriter; gif.h is included only in EditorApp.cpp
@@ -137,6 +138,12 @@ private:
     ToolResult ToolRaycast(const nlohmann::json& args);
     ToolResult ToolCheckOverlap(const nlohmann::json& args);  // #94: AABB interpenetration
     ToolResult ToolQuerySpatial(const nlohmann::json& args);  // #94: radius/height/ground queries
+    ToolResult ToolPlaceRelative(const nlohmann::json& args); // #95: on/above/against/facing/around
+    ToolResult ToolSnapToSurface(const nlohmann::json& args); // #95: rest on surface (down or ray)
+    ToolResult ToolArrangeEntities(const nlohmann::json& args); // #95: align / distribute
+    // Combined world AABB of an entity and its descendants; optionally
+    // collects the subtree's ids (for excluding it from collision queries).
+    AABB SubtreeWorldBounds(UUID root, std::unordered_set<UUID>* members);
     ToolResult ToolManageEntity(const nlohmann::json& args);
     ToolResult ToolManageMaterial(const nlohmann::json& args);
     ToolResult ToolManageLight(const nlohmann::json& args);

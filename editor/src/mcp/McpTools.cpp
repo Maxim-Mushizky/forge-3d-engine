@@ -8,8 +8,10 @@
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
 #include <forge/geometry/MeshStats.h>
+#include <forge/geometry/Placement.h>
 #include <forge/geometry/Spatial.h>
 #include <forge/renderer/Texture2D.h>
+#include <forge/scene/DropToGround.h>
 
 #include <json.hpp>
 
@@ -264,6 +266,94 @@ void EditorApp::RegisterMcpTools()
          {"required", {"action"}},
          {"additionalProperties", false}},
         [this](const json& args) { return ToolQuerySpatial(args); });
+
+    // --- relational placement (#95): declarative relations, engine-solved ------
+
+    m_McpProtocol.RegisterTool(
+        "place_relative",
+        "Place an entity by relation to an anchor — the engine solves the transform "
+        "from world AABBs, so don't compute coordinates. Relations: on (rest on the "
+        "anchor's top; keeps the entity's XZ when already over the footprint), above "
+        "(same but floating, clearance default 0.25), against (abut a side: +x/-x/+z/-z "
+        "or nearest; bottoms aligned), facing (yaw toward the anchor, no move), around "
+        "(ring of count copies — or of the listed ids/names — bottoms on the anchor's "
+        "floor, each facing it). on/above/against auto-nudge out of collisions with "
+        "third parties and report residualOverlap when a nudge couldn't fully resolve. "
+        "One undo entry.",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}, {"description", "entity to place"}}},
+           {"name", {{"type", "string"}}},
+           {"otherId", {{"type", "string"}, {"description", "anchor entity"}}},
+           {"otherName", {{"type", "string"}}},
+           {"relation",
+            {{"type", "string"}, {"enum", {"on", "above", "against", "facing", "around"}}}},
+           {"clearance", {{"type", "number"}, {"description", "gap in world units"}}},
+           {"side",
+            {{"type", "string"}, {"enum", {"+x", "-x", "+z", "-z"}},
+             {"description", "against only; default nearest"}}},
+           {"count", {{"type", "integer"}, {"description", "around only: copies of the entity"}}},
+           {"ids", {{"type", "array"}, {"items", {{"type", "string"}}},
+                    {"description", "around only: arrange these existing entities instead"}}},
+           {"names", {{"type", "array"}, {"items", {{"type", "string"}}}}}}},
+         {"required", {"relation"}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolPlaceRelative(args); });
+
+    m_McpProtocol.RegisterTool(
+        "snap_to_surface",
+        "Rest an entity (with children) on the nearest surface: straight down by "
+        "default (AABB drop onto whatever is underneath, ground plane at y=0 as "
+        "fallback), or cast along an explicit direction and land the leading face on "
+        "the first surface hit. Undoable.",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}}},
+           {"name", {{"type", "string"}}},
+           {"direction", {{"type", "array"}, {"items", {{"type", "number"}}},
+                          {"description", "world [x,y,z]; omit for straight down"}}},
+           {"clearance", {{"type", "number"}, {"description", "gap from the surface, default 0"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolSnapToSurface(args); });
+
+    m_McpProtocol.RegisterTool(
+        "align_entities",
+        "Align several entities on one axis: bring each one's min face / center / max "
+        "face (mode, default center) to the first entity's — or to an explicit target "
+        "coordinate. One undo entry.",
+        {{"type", "object"},
+         {"properties",
+          {{"ids", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+           {"names", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+           {"axis", {{"type", "string"}, {"enum", {"x", "y", "z"}}}},
+           {"mode", {{"type", "string"}, {"enum", {"min", "center", "max"}}}},
+           {"target", {{"type", "number"}, {"description", "world coordinate; default = first entity's"}}}}},
+         {"required", {"axis"}},
+         {"additionalProperties", false}},
+        [this](const json& args) {
+            json a = args;
+            a["action"] = "align";
+            return ToolArrangeEntities(a);
+        });
+
+    m_McpProtocol.RegisterTool(
+        "distribute_entities",
+        "Space several entities along one axis, keeping their current order: with "
+        "spacing, packs them gap-to-gap from the first; without, spreads centers "
+        "evenly between the current first and last. One undo entry.",
+        {{"type", "object"},
+         {"properties",
+          {{"ids", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+           {"names", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+           {"axis", {{"type", "string"}, {"enum", {"x", "y", "z"}}}},
+           {"spacing", {{"type", "number"}, {"description", "gap between bounds; omit to spread evenly"}}}}},
+         {"required", {"axis"}},
+         {"additionalProperties", false}},
+        [this](const json& args) {
+            json a = args;
+            a["action"] = "distribute";
+            return ToolArrangeEntities(a);
+        });
 
     m_McpProtocol.RegisterTool(
         "viewport_screenshot",
@@ -523,6 +613,7 @@ void EditorApp::RegisterMcpTools()
         "Writes: spawn{}, delete{}, "
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
+        "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
         "look_at{}, set_render_settings{}. Writes return the affected entity as a "
         "table (use .id). "
@@ -788,6 +879,386 @@ ToolResult EditorApp::ToolQuerySpatial(const json& args)
 
     return Err("Unknown action \"" + action +
                "\" (within_radius, above_height, below_height, ground_height)");
+}
+
+// --- relational placement (#95) ---------------------------------------------------
+
+// Move a root by a world-space delta, expressed in its parent's space so the
+// hierarchy stays intact (same trick as DropToGroundSelected).
+static void ApplyWorldDelta(Scene& scene, Entity& root, const vec3& worldDelta)
+{
+    const mat4 parentWorld = scene.WorldTransform(root.parent);
+    root.transform.translation += vec3(glm::inverse(parentWorld) * vec4(worldDelta, 0.0f));
+}
+
+// Collision candidates: every meshed entity except light gizmos and the given
+// exclusions (the moving subtree, and usually the anchor — contact with the
+// anchor is the point of the relation).
+static std::vector<AABB> ObstacleBounds(const Scene& scene,
+                                        const std::unordered_set<UUID>& exclude)
+{
+    std::vector<AABB> out;
+    for (const Entity& e : scene.Entities())
+        if (e.mesh && !e.light.enabled && !exclude.count(e.id)) {
+            const AABB b = WorldBoundsOf(scene, e);
+            if (b.Valid())
+                out.push_back(b);
+        }
+    return out;
+}
+
+AABB EditorApp::SubtreeWorldBounds(UUID root, std::unordered_set<UUID>* members)
+{
+    AABB box;
+    for (UUID node : SubtreeOf(root)) {
+        if (members)
+            members->insert(node);
+        if (Entity* e = m_Scene.Find(node); e && e->mesh) {
+            const AABB b = WorldBoundsOf(m_Scene, *e);
+            if (b.Valid()) {
+                box.Expand(b.min);
+                box.Expand(b.max);
+            }
+        }
+    }
+    return box;
+}
+
+// Resolve {"ids": [...]} / {"names": [...]} into root entities. Rejects
+// duplicates and nested picks (moving an ancestor and its descendant in one
+// arrangement double-moves the descendant).
+static bool ResolveEntityList(Scene& scene, const json& args, std::vector<Entity*>& out,
+                              std::string& error)
+{
+    std::vector<std::string> keys;
+    const bool byId = args.contains("ids") && args["ids"].is_array();
+    const char* key = byId ? "ids" : "names";
+    if (!byId && !(args.contains("names") && args["names"].is_array())) {
+        error = "Provide ids or names (array)";
+        return false;
+    }
+    for (const json& v : args[key]) {
+        if (!v.is_string()) {
+            error = std::string(key) + " must be an array of strings";
+            return false;
+        }
+        json one;
+        one[byId ? "id" : "name"] = v;
+        Entity* e = FindToolTarget(scene, one, error);
+        if (!e)
+            return false;
+        out.push_back(e);
+    }
+    for (size_t i = 0; i < out.size(); ++i)
+        for (size_t j = i + 1; j < out.size(); ++j) {
+            if (out[i]->id == out[j]->id) {
+                error = "Entity \"" + out[i]->name + "\" listed twice";
+                return false;
+            }
+            if (scene.IsDescendantOf(out[i]->id, out[j]->id) ||
+                scene.IsDescendantOf(out[j]->id, out[i]->id)) {
+                error = "\"" + out[i]->name + "\" and \"" + out[j]->name +
+                        "\" are nested — list only the roots you want moved";
+                return false;
+            }
+        }
+    return true;
+}
+
+static json BoundsJson(const AABB& b)
+{
+    return {{"min", Vec3Json(b.min)},
+            {"max", Vec3Json(b.max)},
+            {"center", Vec3Json((b.min + b.max) * 0.5f)}};
+}
+
+ToolResult EditorApp::ToolPlaceRelative(const json& args)
+{
+    const std::string relation = args.value("relation", "");
+
+    std::string error;
+    Entity* anchor = FindToolTargetKeyed(m_Scene, args, "otherId", "otherName", error);
+    if (!anchor)
+        return Err(error);
+    std::unordered_set<UUID> anchorIds;
+    const AABB anchorBounds = SubtreeWorldBounds(anchor->id, &anchorIds);
+    if (!anchorBounds.Valid())
+        return Err("Anchor \"" + anchor->name + "\" has no bounds (no mesh in its subtree)");
+    const vec3 anchorCenter = (anchorBounds.min + anchorBounds.max) * 0.5f;
+
+    // around arranges a list of existing entities when one is given.
+    if (relation == "around" &&
+        ((args.contains("ids") && args["ids"].is_array()) ||
+         (args.contains("names") && args["names"].is_array()))) {
+        std::vector<Entity*> members;
+        if (!ResolveEntityList(m_Scene, args, members, error))
+            return Err(error);
+        if (members.empty())
+            return Err("Empty entity list");
+        const float clearance = args.value("clearance", 0.0f);
+        auto composite = std::make_unique<CompositeCommand>();
+        json placed = json::array();
+        for (size_t i = 0; i < members.size(); ++i) {
+            Entity* m = members[i];
+            if (m->id == anchor->id || m_Scene.IsDescendantOf(m->id, anchor->id) ||
+                m_Scene.IsDescendantOf(anchor->id, m->id))
+                return Err("\"" + m->name + "\" overlaps the anchor's hierarchy");
+            const AABB mb = SubtreeWorldBounds(m->id, nullptr);
+            if (!mb.Valid())
+                return Err("Entity \"" + m->name + "\" has no bounds");
+            const auto poses =
+                SolveAround(mb, anchorBounds, (int)members.size(), clearance);
+            Entity before = *m;
+            ApplyWorldDelta(m_Scene, *m, poses[i].delta);
+            m->transform.rotation.y = poses[i].yawRad;
+            composite->Add(std::make_unique<EditEntityCommand>(before, *m));
+            placed.push_back({{"id", std::to_string(m->id)},
+                              {"name", m->name},
+                              {"yawDeg", glm::degrees(poses[i].yawRad)}});
+        }
+        m_Commands.Push(std::move(composite));
+        return JsonResult(json{{"relation", "around"}, {"count", placed.size()},
+                               {"placed", std::move(placed)}});
+    }
+
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (e->id == anchor->id)
+        return Err("Entity and anchor are the same");
+    if (m_Scene.IsDescendantOf(e->id, anchor->id) || m_Scene.IsDescendantOf(anchor->id, e->id))
+        return Err("Entity and anchor must not be in the same hierarchy branch");
+
+    std::unordered_set<UUID> movingIds;
+    const AABB bounds = SubtreeWorldBounds(e->id, &movingIds);
+    if (!bounds.Valid())
+        return Err("Entity \"" + e->name + "\" has no bounds (no mesh in its subtree)");
+    const vec3 center = (bounds.min + bounds.max) * 0.5f;
+
+    if (relation == "facing") {
+        Entity before = *e;
+        // Yaw applies in the root's parent space — exact for unparented roots
+        // (the common case for agent-built scenes).
+        e->transform.rotation.y = YawToward(center, anchorCenter);
+        m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+        json j = EntityJson(m_Scene, *e);
+        j["yawDeg"] = glm::degrees(e->transform.rotation.y);
+        return JsonResult(j);
+    }
+
+    if (relation == "around") {
+        const int count = std::clamp(args.value("count", 0), 0, 64);
+        if (count <= 0)
+            return Err("around needs count (copies) or ids/names (existing entities)");
+        if (SubtreeOf(e->id).size() > 1)
+            return Err("\"" + e->name + "\" has children; duplication copies only the root — "
+                       "spawn the instances first and pass them via ids/names");
+        const float clearance = args.value("clearance", 0.0f);
+        const auto poses = SolveAround(bounds, anchorBounds, count, clearance);
+
+        auto composite = std::make_unique<CompositeCommand>();
+        const Entity preMove = *e;
+        ApplyWorldDelta(m_Scene, *e, poses[0].delta);
+        e->transform.rotation.y = poses[0].yawRad;
+        composite->Add(std::make_unique<EditEntityCommand>(preMove, *e));
+        json placed = json::array();
+        placed.push_back({{"id", std::to_string(e->id)}, {"name", e->name}});
+        for (int k = 1; k < count; ++k) {
+            Entity copy = preMove;
+            copy.id = GenerateUUID();
+            copy.name = preMove.name + "_" + std::to_string(k + 1);
+            ApplyWorldDelta(m_Scene, copy, poses[k].delta);
+            copy.transform.rotation.y = poses[k].yawRad;
+            m_Scene.Insert(copy);
+            composite->Add(std::make_unique<AddEntityCommand>(copy));
+            placed.push_back({{"id", std::to_string(copy.id)}, {"name", copy.name}});
+        }
+        m_Commands.Push(std::move(composite));
+        return JsonResult(json{{"relation", "around"}, {"count", count},
+                               {"placed", std::move(placed)}});
+    }
+
+    vec3 delta;
+    if (relation == "on" || relation == "above") {
+        const float clearance = args.value("clearance", relation == "above" ? 0.25f : 0.0f);
+        delta = SolveOn(bounds, anchorBounds, clearance);
+    } else if (relation == "against") {
+        const float clearance = args.value("clearance", 0.0f);
+        const std::string sideStr = args.value("side", "");
+        int side = NearestSide(bounds, anchorBounds);
+        if (sideStr == "+x") side = 0;
+        else if (sideStr == "-x") side = 1;
+        else if (sideStr == "+z") side = 2;
+        else if (sideStr == "-z") side = 3;
+        else if (!sideStr.empty())
+            return Err("side must be +x, -x, +z, or -z");
+        delta = SolveAgainst(bounds, anchorBounds, side, clearance);
+    } else {
+        return Err("Unknown relation \"" + relation +
+                   "\" (on, above, against, facing, around)");
+    }
+
+    // Nudge out of third-party collisions, horizontally only — the relation's
+    // vertical constraint stays authoritative (a nudge must not lift the lamp
+    // off the desk).
+    std::unordered_set<UUID> exclude = movingIds;
+    exclude.insert(anchorIds.begin(), anchorIds.end());
+    const std::vector<AABB> obstacles = ObstacleBounds(m_Scene, exclude);
+    AABB placedBox{bounds.min + delta, bounds.max + delta};
+    vec3 nudge = NudgeOut(placedBox, obstacles);
+    nudge.y = 0.0f;
+    placedBox.min += nudge;
+    placedBox.max += nudge;
+    bool residual = false;
+    for (const AABB& o : obstacles)
+        if (OverlapAABB(placedBox, o).overlap) {
+            residual = true;
+            break;
+        }
+    delta += nudge;
+
+    Entity before = *e;
+    ApplyWorldDelta(m_Scene, *e, delta);
+    m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+
+    json j{{"relation", relation},
+           {"moved", Vec3Json(delta)},
+           {"worldBounds", BoundsJson(placedBox)}};
+    if (glm::length(nudge) > 0.0f)
+        j["nudged"] = Vec3Json(nudge);
+    if (residual)
+        j["residualOverlap"] = true;
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolSnapToSurface(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    std::unordered_set<UUID> movingIds;
+    const AABB bounds = SubtreeWorldBounds(e->id, &movingIds);
+    if (!bounds.Valid())
+        return Err("Entity \"" + e->name + "\" has no bounds (no mesh in its subtree)");
+    const float clearance = args.value("clearance", 0.0f);
+
+    vec3 delta(0.0f);
+    json extra = json::object(); // stays empty on the drop path; update(null) throws
+    vec3 dir;
+    if (!GetVec3(args, "direction", dir)) {
+        // Straight down: AABB drop onto whatever is underneath (robust against
+        // raycasting through gaps in the mesh; matches the editor's End key).
+        const float dy = DropOffsetY(bounds, ObstacleBounds(m_Scene, movingIds));
+        delta.y = dy + clearance;
+    } else {
+        if (glm::length(dir) < 1e-6f)
+            return Err("direction must be non-zero");
+        dir = glm::normalize(dir);
+        const vec3 center = (bounds.min + bounds.max) * 0.5f;
+        // Probe from just outside the subtree's own box — the box is convex,
+        // so a ray leaving it can't hit the subtree's meshes, only the world.
+        float tExit = 0.0f;
+        RayIntersectsAABB(Ray{center, dir}, bounds, tExit);
+        constexpr float kBump = 1e-3f;
+        const std::optional<RaycastHit> hit =
+            m_Scene.Raycast(Ray{center + dir * (tExit + kBump), dir});
+        if (!hit)
+            return Err("No surface along that direction");
+        // Land the leading face: the AABB's support extent along dir, not the
+        // central-ray exit — a diagonal direction leads with a corner.
+        const vec3 half = (bounds.max - bounds.min) * 0.5f;
+        const float support = half.x * std::fabs(dir.x) + half.y * std::fabs(dir.y) +
+                              half.z * std::fabs(dir.z);
+        const float centerToSurface = tExit + kBump + hit->distance;
+        delta = dir * (centerToSurface - support - clearance);
+        const Entity* hitEntity = m_Scene.Find(hit->entity);
+        extra["surfaceEntity"] = hitEntity ? hitEntity->name : "";
+        extra["surfacePoint"] = Vec3Json(hit->worldPos);
+    }
+
+    Entity before = *e;
+    ApplyWorldDelta(m_Scene, *e, delta);
+    m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+
+    json j{{"moved", Vec3Json(delta)},
+           {"worldBounds", BoundsJson({bounds.min + delta, bounds.max + delta})}};
+    j.update(extra);
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolArrangeEntities(const json& args)
+{
+    const std::string action = args.value("action", "");
+    const std::string axisStr = args.value("axis", "");
+    if (axisStr != "x" && axisStr != "y" && axisStr != "z")
+        return Err("axis must be x, y, or z");
+    const int axis = axisStr == "x" ? 0 : axisStr == "y" ? 1 : 2;
+
+    std::string error;
+    std::vector<Entity*> roots;
+    if (!ResolveEntityList(m_Scene, args, roots, error))
+        return Err(error);
+    if (roots.size() < 2)
+        return Err("Need at least two entities");
+
+    std::vector<AABB> boxes;
+    boxes.reserve(roots.size());
+    for (Entity* r : roots) {
+        AABB b = SubtreeWorldBounds(r->id, nullptr);
+        if (!b.Valid()) // meshless group: degrade to its world position
+            b.Expand(vec3(m_Scene.WorldTransform(r->id)[3]));
+        boxes.push_back(b);
+    }
+
+    std::vector<float> deltas;
+    if (action == "align") {
+        const std::string modeStr = args.value("mode", "center");
+        AlignMode mode = AlignMode::Center;
+        if (modeStr == "min") mode = AlignMode::Min;
+        else if (modeStr == "max") mode = AlignMode::Max;
+        else if (modeStr != "center")
+            return Err("mode must be min, center, or max");
+        float target;
+        if (args.contains("target") && args["target"].is_number()) {
+            target = args["target"];
+        } else {
+            const AABB& f = boxes[0];
+            target = mode == AlignMode::Min      ? f.min[axis]
+                     : mode == AlignMode::Max    ? f.max[axis]
+                                                 : (f.min[axis] + f.max[axis]) * 0.5f;
+        }
+        deltas = SolveAlign(boxes, axis, mode, target);
+    } else if (action == "distribute") {
+        float spacing = -1.0f; // sentinel: spread evenly
+        if (args.contains("spacing")) {
+            if (!args["spacing"].is_number() || (float)args["spacing"] < 0.0f)
+                return Err("spacing must be a number >= 0");
+            spacing = args["spacing"];
+        }
+        deltas = SolveDistribute(boxes, axis, spacing);
+    } else {
+        return Err("Unknown action \"" + action + "\"");
+    }
+
+    auto composite = std::make_unique<CompositeCommand>();
+    json moved = json::array();
+    for (size_t i = 0; i < roots.size(); ++i) {
+        if (std::fabs(deltas[i]) < 1e-7f)
+            continue;
+        Entity before = *roots[i];
+        vec3 wd(0.0f);
+        wd[axis] = deltas[i];
+        ApplyWorldDelta(m_Scene, *roots[i], wd);
+        composite->Add(std::make_unique<EditEntityCommand>(before, *roots[i]));
+        moved.push_back({{"id", std::to_string(roots[i]->id)},
+                         {"name", roots[i]->name},
+                         {"delta", deltas[i]}});
+    }
+    if (!composite->Empty())
+        m_Commands.Push(std::move(composite));
+    return JsonResult(json{{"action", action}, {"axis", axisStr},
+                           {"movedCount", moved.size()}, {"moved", std::move(moved)}});
 }
 
 // --- actuation handlers -------------------------------------------------------
@@ -1448,6 +1919,11 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("remesh", call(&EditorApp::ToolEditMesh, "remesh"));
         add("mirror", call(&EditorApp::ToolEditMesh, "mirror"));
         add("extrude_face", call(&EditorApp::ToolEditMesh, "extrude_face"));
+
+        add("place_relative", call(&EditorApp::ToolPlaceRelative, nullptr));
+        add("snap_to_surface", call(&EditorApp::ToolSnapToSurface, nullptr));
+        add("align", call(&EditorApp::ToolArrangeEntities, "align"));
+        add("distribute", call(&EditorApp::ToolArrangeEntities, "distribute"));
 
         add("look_at", call(&EditorApp::ToolManageScene, "look_at"));
         add("set_render_settings", call(&EditorApp::ToolManageScene, "set_render_settings"));
