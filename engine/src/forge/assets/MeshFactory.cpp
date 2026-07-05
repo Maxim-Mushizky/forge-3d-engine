@@ -39,8 +39,12 @@ std::shared_ptr<Mesh> MeshFactory::Cube()
 
 std::shared_ptr<Mesh> MeshFactory::Sphere(uint32_t rings, uint32_t sectors)
 {
-    rings = std::max(rings, 2u);   // below this the pole-row emission yields
-    sectors = std::max(sectors, 3u); // no triangles / a flat sliver
+    // Lower bounds: below these the pole-row emission yields no triangles / a
+    // flat sliver. Upper bounds: the MCP spawn params arrive as json ints, so
+    // a negative value wraps to ~4e9 here and an unbounded loop would OOM the
+    // exception-light editor.
+    rings = std::clamp(rings, 2u, 512u);
+    sectors = std::clamp(sectors, 3u, 1024u);
 
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
