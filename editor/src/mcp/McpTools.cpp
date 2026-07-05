@@ -19,6 +19,7 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -52,13 +53,18 @@ static bool GetVec3(const json& args, const char* key, vec3& out)
     if (!a.is_array() || a.size() != 3 || !a[0].is_number() || !a[1].is_number() ||
         !a[2].is_number())
         return false;
-    const vec3 v{(float)a[0], (float)a[1], (float)a[2]};
-    // NaN/Inf pass is_number(); treat them as malformed and leave `out`
-    // untouched. The dispatch/script guards reject such calls up front, so
-    // this is defence in depth for any future entry path (#104).
-    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+    // NaN/Inf and float-overflowing doubles pass is_number(); treat them as
+    // malformed and leave `out` untouched. Range-check before the float cast
+    // — casting an out-of-range double is itself UB. Note the false return
+    // makes a poisoned vec3 indistinguishable from an absent key at optional
+    // call sites; acceptable only because both entry paths (dispatch and the
+    // script binding wrapper) already reject non-finite args up front (#104).
+    const double x = a[0].get<double>(), y = a[1].get<double>(), z = a[2].get<double>();
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        std::fabs(x) > (double)FLT_MAX || std::fabs(y) > (double)FLT_MAX ||
+        std::fabs(z) > (double)FLT_MAX)
         return false;
-    out = v;
+    out = {(float)x, (float)y, (float)z};
     return true;
 }
 

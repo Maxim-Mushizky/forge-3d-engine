@@ -187,16 +187,23 @@ void TestNonFiniteArgPath()
     // Nested paths name the offending leaf.
     CHECK(NonFiniteArgPath(json{{"position", {0.0, nan, 0.0}}}) == "position[1]");
     CHECK(NonFiniteArgPath(json{{"params", {{"depth", inf}}}}) == "params.depth");
+
+    // Absurd nesting is refused rather than recursed toward a stack overflow
+    // (the wire has no parser-level depth bound).
+    json deep = 1.0;
+    for (int i = 0; i < 100; ++i)
+        deep = json::array({deep});
+    CHECK(!NonFiniteArgPath(json{{"a", deep}}).empty());
 }
 
 void TestWireCannotSmuggleNonFinite()
 {
-    // The nlohmann lexer refuses NaN/Inf literals and overflowing float
-    // literals (out_of_range.406 -> parse error), so no HTTP body reaches a
-    // handler carrying a non-finite number. The dispatch guard in tools/call
-    // is defence in depth for in-process callers of HandleMessage; the Lua
-    // binding path (which really can produce NaN) is tested in
-    // test_mcpscript.cpp.
+    // The nlohmann lexer refuses NaN/Inf and double-overflow literals like
+    // 1e999 (out_of_range.406 -> parse error). But 1e308 parses cleanly as a
+    // finite double and DOES reach dispatch — there the guard is the only
+    // wire defence, since the value overflows the float storage every
+    // handler uses. The Lua binding path (which really can produce NaN) is
+    // tested in test_mcpscript.cpp.
     McpProtocol proto;
     bool ran = false;
     proto.RegisterTool("move", "Records being run.", json{{"type", "object"}},
@@ -207,6 +214,13 @@ void TestWireCannotSmuggleNonFinite()
     json r = Handle(proto, R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
                            R"("params":{"name":"move","arguments":{"position":[1e999,0,0]}}})");
     CHECK(r["error"]["code"] == -32700);
+    CHECK(!ran);
+
+    r = Handle(proto, R"({"jsonrpc":"2.0","id":2,"method":"tools/call",)"
+                      R"("params":{"name":"move","arguments":{"position":[1e308,0,0]}}})");
+    CHECK(r["result"]["isError"] == true);
+    const std::string text = r["result"]["content"][0]["text"];
+    CHECK(text.find("position[0]") != std::string::npos);
     CHECK(!ran);
 }
 

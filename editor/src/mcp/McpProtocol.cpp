@@ -1,5 +1,6 @@
 #include "McpProtocol.h"
 
+#include <cfloat>
 #include <cmath>
 #include <exception>
 #include <memory>
@@ -31,25 +32,33 @@ json MakeResult(const json& id, json result)
     return json{{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}};
 }
 
-// Depth-first hunt for a non-finite leaf; builds the dotted path on unwind.
-// Recursion depth is bounded by input that already survived json::parse (wire)
-// or LuaToJson's 32-level cap (scripts). The check casts to float because
-// that is what every consumer stores: a 1e308 double is finite but lands as
-// +inf in a Transform, so it is just as poisonous as a literal Inf.
-bool FindNonFinite(const json& v, std::string& path)
+// Depth-first hunt for a poisonous leaf; builds the dotted path on unwind.
+// LuaToJson caps script tables at 32 levels, but the wire has no depth bound
+// (the nlohmann SAX parser is iterative), so the scan carries its own cap and
+// treats absurd nesting as a rejection rather than recursing toward a stack
+// overflow. The range check happens on the double — casting an out-of-float-
+// range value first would itself be UB — and rejects anything float storage
+// cannot hold: a 1e308 double is finite on the wire but lands as +inf in a
+// Transform, so it is just as poisonous as a literal Inf.
+bool FindNonFinite(const json& v, std::string& path, int depth = 0)
 {
-    if (v.is_number_float() && !std::isfinite((float)v.get<double>()))
+    if (depth > 64)
         return true;
+    if (v.is_number_float()) {
+        const double d = v.get<double>();
+        if (!std::isfinite(d) || std::fabs(d) > (double)FLT_MAX)
+            return true;
+    }
     if (v.is_array()) {
         for (size_t i = 0; i < v.size(); ++i) {
-            if (FindNonFinite(v[i], path)) {
+            if (FindNonFinite(v[i], path, depth + 1)) {
                 path = "[" + std::to_string(i) + "]" + path;
                 return true;
             }
         }
     } else if (v.is_object()) {
         for (auto it = v.begin(); it != v.end(); ++it) {
-            if (FindNonFinite(it.value(), path)) {
+            if (FindNonFinite(it.value(), path, depth + 1)) {
                 path = it.key() + (path.empty() || path[0] == '[' ? "" : ".") + path;
                 return true;
             }
