@@ -194,8 +194,8 @@ static void RadiusQuerySemantics()
 {
     // Kernel-level mirror of the 20-entity acceptance test: unit boxes strung
     // along x at 0,2,4,...,38; radius 5 from the origin reaches the boxes at
-    // x=0,2,4 (surface distances 0,1,3) and excludes x=6 (distance 5... its
-    // near face is at 5.5). Exact set, not "roughly nearby".
+    // x=0,2,4 (surface distances 0, 1.5, 3.5) and excludes x=6 (its near face
+    // is at 5.5). Exact set, not "roughly nearby".
     std::vector<AABB> boxes;
     for (int i = 0; i < 20; ++i)
         boxes.push_back(BoxAt({2.0f * (float)i, 0.0f, 0.0f}, vec3(0.5f)));
