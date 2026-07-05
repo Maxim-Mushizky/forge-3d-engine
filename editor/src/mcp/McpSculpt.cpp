@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 
+#include <unordered_map>
 #include <utility>
 
 namespace forge {
@@ -117,7 +118,8 @@ size_t SculptSmooth(std::vector<Vertex>& verts, const MeshTopology& topo, const 
     return moves.size();
 }
 
-bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& topo, vec3& point)
+bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& topo, vec3& point,
+                         int sideSignX)
 {
     float best = -1.0f;
     vec3 bestPos(0.0f);
@@ -125,6 +127,10 @@ bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& t
         if (group.empty() || group[0] >= verts.size())
             continue;
         const vec3& rep = verts[group[0]].position;
+        if (sideSignX > 0 && rep.x < -1e-6f)
+            continue;
+        if (sideSignX < 0 && rep.x > 1e-6f)
+            continue;
         const float d = glm::length(rep - point);
         if (best < 0.0f || d < best) {
             best = d;
@@ -135,6 +141,23 @@ bool SnapToNearestVertex(const std::vector<Vertex>& verts, const MeshTopology& t
         return false;
     point = bestPos;
     return true;
+}
+
+size_t SculptMoveMirrored(std::vector<Vertex>& verts, const MeshTopology& topo,
+                          const vec3& centerA, const vec3& offsetA, const vec3& centerB,
+                          const vec3& offsetB, float radius, SculptFalloff falloff)
+{
+    const std::vector<Affected> a = GatherRegion(verts, topo, centerA, radius, falloff);
+    const std::vector<Affected> b = GatherRegion(verts, topo, centerB, radius, falloff);
+    std::unordered_map<uint32_t, vec3> target;
+    target.reserve(a.size() + b.size());
+    for (const Affected& x : a)
+        target[x.group] = verts[topo.groups[x.group][0]].position + offsetA * x.weight;
+    for (const Affected& x : b) // mirrored side wins where the radii overlap
+        target[x.group] = verts[topo.groups[x.group][0]].position + offsetB * x.weight;
+    for (const auto& [g, pos] : target)
+        WriteGroup(verts, topo, g, pos);
+    return target.size();
 }
 
 float InvertedNormalFraction(const std::vector<Vertex>& verts, const MeshTopology& topo,

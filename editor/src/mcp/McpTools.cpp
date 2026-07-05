@@ -651,8 +651,8 @@ void EditorApp::RegisterMcpTools()
         "of guessing coordinates, relax smooths the region first; a warning "
         "field flags folded regions whose normals oppose the brush), "
         "move_verts{id, point, radius, offset, "
-        "falloff='smooth'|'linear'|'constant', mirror, snap} (falloff-weighted "
-        "vertex translation, weld-seam safe), export_stl{}. "
+        "falloff='smooth'|'linear'|'constant', mirror, snap, relax} "
+        "(falloff-weighted vertex translation, weld-seam safe), export_stl{}. "
         "Entity writes return the affected entity as a table (use .id); camera/"
         "selection/element/export calls return their own shapes. "
         "print() lines and the script's return value come back in the result. "
@@ -1833,13 +1833,23 @@ ToolResult EditorApp::ToolSculpt(const json& args)
     auto& verts = e->mesh->MutableVertices();
 
     // Snap: re-center on the nearest actual vertex so a center guessed off
-    // the live surface lands on it (each side independently when mirrored).
+    // the live surface lands on it. The mirrored center is re-derived from
+    // the SNAPPED primary and snapped only to its own side of the plane — an
+    // unrestricted search on a mesh with no geometry across the plane would
+    // wander back and land a rogue second stroke on the primary side.
     bool snapped = false;
+    bool mirrorActive = mirror;
     if (snap) {
         snapped = SnapToNearestVertex(verts, topo, localCenter);
-        if (mirror)
-            SnapToNearestVertex(verts, topo, mirrorCenter);
+        if (mirror) {
+            mirrorCenter = vec3(-localCenter.x, localCenter.y, localCenter.z);
+            mirrorActive = SnapToNearestVertex(verts, topo, mirrorCenter,
+                                               localCenter.x >= 0.0f ? -1 : +1);
+        }
     }
+    // Both sides resolving to the same spot (center on the plane): one stroke.
+    if (mirrorActive && glm::length(mirrorCenter - localCenter) < 1e-6f)
+        mirrorActive = false;
 
     // Folded-surface detector: if most of the region's normals point into the
     // mesh, a normal-following brush will push the wrong way (the #105 face
@@ -1850,7 +1860,7 @@ ToolResult EditorApp::ToolSculpt(const json& args)
         const AABB& b = e->mesh->Bounds();
         const vec3 interior = (b.min + b.max) * 0.5f;
         float frac = InvertedNormalFraction(verts, topo, localCenter, localRadius, interior);
-        if (mirror)
+        if (mirrorActive)
             frac = std::max(frac,
                             InvertedNormalFraction(verts, topo, mirrorCenter, localRadius,
                                                    interior));
@@ -1860,27 +1870,34 @@ ToolResult EditorApp::ToolSculpt(const json& args)
     }
 
     // Optional pre-relax: one smooth pass over the region before the brush.
+    size_t relaxedGroups = 0;
     if (relax) {
-        SculptSmooth(verts, topo, localCenter, localRadius, 0.4f);
-        if (mirror)
-            SculptSmooth(verts, topo, mirrorCenter, localRadius, 0.4f);
+        relaxedGroups = SculptSmooth(verts, topo, localCenter, localRadius, 0.4f);
+        if (mirrorActive)
+            relaxedGroups += SculptSmooth(verts, topo, mirrorCenter, localRadius, 0.4f);
     }
 
     size_t movedGroups = 0;
     for (int s = 0; s < strokes; ++s) {
-        auto apply = [&](const vec3& center, const vec3& offset) -> size_t {
-            if (moveVerts)
-                return SculptMove(verts, topo, center, localRadius, offset, falloff);
-            if (brush == "grab")
-                return SculptMove(verts, topo, center, localRadius, offset,
-                                  SculptFalloff::Smooth);
-            if (brush == "inflate")
-                return SculptInflate(verts, topo, center, localRadius, localAmount);
-            return SculptSmooth(verts, topo, center, localRadius, strength);
-        };
-        size_t moved = apply(localCenter, localOffset);
-        if (mirror)
-            moved += apply(mirrorCenter, mirrorOffset);
+        size_t moved = 0;
+        if (moveVerts || brush == "grab") {
+            // Mirrored moves go through the merged kernel: each group written
+            // once, mirrored side wins on overlap — a center on the plane
+            // must move geometry by `strength`, not 2x (interactive parity).
+            const SculptFalloff f = moveVerts ? falloff : SculptFalloff::Smooth;
+            moved = mirrorActive
+                        ? SculptMoveMirrored(verts, topo, localCenter, localOffset,
+                                             mirrorCenter, mirrorOffset, localRadius, f)
+                        : SculptMove(verts, topo, localCenter, localRadius, localOffset, f);
+        } else if (brush == "inflate") {
+            moved = SculptInflate(verts, topo, localCenter, localRadius, localAmount);
+            if (mirrorActive)
+                moved += SculptInflate(verts, topo, mirrorCenter, localRadius, localAmount);
+        } else {
+            moved = SculptSmooth(verts, topo, localCenter, localRadius, strength);
+            if (mirrorActive)
+                moved += SculptSmooth(verts, topo, mirrorCenter, localRadius, strength);
+        }
         movedGroups = std::max(movedGroups, moved);
         if (moved == 0)
             break;
@@ -1893,13 +1910,15 @@ ToolResult EditorApp::ToolSculpt(const json& args)
     auto annotate = [&](json& j) {
         if (snapped)
             j["snappedCenter"] = Vec3Json(vec3(world * vec4(localCenter, 1.0f)));
+        if (snap && mirrorActive)
+            j["snappedMirrorCenter"] = Vec3Json(vec3(world * vec4(mirrorCenter, 1.0f)));
         if (!warning.empty())
             j["warning"] = warning;
     };
 
     json out = EntityJson(m_Scene, *e);
     out["movedGroups"] = movedGroups;
-    if (movedGroups == 0 && !relax) {
+    if (movedGroups == 0 && relaxedGroups == 0) {
         out["changedVertices"] = 0;
         annotate(out);
         return JsonResult(out); // brush missed the mesh: honest no-op, no undo entry
