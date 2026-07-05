@@ -1788,8 +1788,9 @@ ToolResult EditorApp::ToolSculpt(const json& args)
 
     // A brush that cannot reach the mesh's AABB is a no-op: bail before the
     // copy-on-write clone, so probing far from the surface costs neither a
-    // mesh copy nor a path-tracer scene re-upload.
-    if (DistanceToAABB(e->mesh->Bounds(), localCenter) > localRadius) {
+    // mesh copy nor a path-tracer scene re-upload. Skipped while a stroke is
+    // open — bounds only recompute at stroke end, so they may lag a live drag.
+    if (!m_Sculpt.Active() && DistanceToAABB(e->mesh->Bounds(), localCenter) > localRadius) {
         json out = EntityJson(m_Scene, *e);
         out["movedGroups"] = 0;
         out["changedVertices"] = 0;
