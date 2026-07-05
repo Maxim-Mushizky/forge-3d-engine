@@ -26,9 +26,10 @@ std::vector<ElementInfo> ListFaceElements(const EditMesh& mesh, const mat4& worl
                                           size_t& total)
 {
     std::vector<ElementInfo> out;
-    // Normals transform by the inverse-transpose; for the uniform-ish scales
-    // agents build with, normalize(mat3 * n) is exact enough for filtering.
-    const mat3 normalMat = mat3(world);
+    // Normals transform by the inverse-transpose (plain mat3 skews them under
+    // non-uniform scale — scripts filter on normal.y to find "top" faces, so
+    // this must be exact, not uniform-scale-approximate).
+    const mat3 normalMat = glm::transpose(glm::inverse(mat3(world)));
     FilterElements(
         mesh.faces.size(), center, radius, maxCount, total,
         [&](size_t i) { return vec3(world * vec4(mesh.faces[i].centroid, 1.0f)); },

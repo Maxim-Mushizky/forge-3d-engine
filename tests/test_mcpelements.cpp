@@ -46,6 +46,25 @@ static void FaceListing()
     CHECK(ApproxEq(glm::length(faces[0].normal), 1.0f, 1e-4f));
     CHECK(ApproxEq(faces[0].normal.y, -1.0f, 1e-4f));
 
+    // Tilted face under non-uniform scale: normals need the inverse-transpose.
+    // Triangle with object normal (1,1,0)/sqrt(2); scaling x by 3 must tip the
+    // world normal TOWARD y — normalize((1/3, 1, 0)) — where the plain mat3
+    // would tip it toward x (normalize((3, 1, 0))). Scripts pick "top" faces
+    // by normal.y, so the wrong formula misclassifies both ways.
+    const std::vector<Vertex> tiltedVerts = {
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+        {{0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f}},
+        {{1.0f, -1.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f}}};
+    const std::vector<uint32_t> tiltedIdx = {0, 1, 2};
+    const EditMesh tilted = BuildEditMesh(tiltedVerts, tiltedIdx);
+    const mat4 aniso = glm::scale(mat4(1.0f), {3.0f, 1.0f, 1.0f});
+    auto tiltedFaces = ListFaceElements(tilted, aniso, nullptr, 0.0f, 100, total);
+    CHECK(tiltedFaces.size() == 1);
+    const vec3 expected = glm::normalize(vec3(1.0f / 3.0f, 1.0f, 0.0f));
+    CHECK(ApproxEq(tiltedFaces[0].normal.x, expected.x, 1e-4f));
+    CHECK(ApproxEq(tiltedFaces[0].normal.y, expected.y, 1e-4f));
+    CHECK(tiltedFaces[0].normal.y > 0.9f);
+
     // Radius filter: only face 0's centroid sits within 0.01 of it.
     const vec3 c0{10.0f + 2.0f / 3.0f, 0.0f, 1.0f / 3.0f};
     faces = ListFaceElements(em, world, &c0, 0.01f, 100, total);

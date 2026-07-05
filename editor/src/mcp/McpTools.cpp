@@ -1550,8 +1550,9 @@ ToolResult EditorApp::ToolMeshElements(const json& args)
     const mat4 world = m_Scene.WorldTransform(e->id);
 
     // Edges bounding given faces — the bridge from a raycast face pick
-    // (triIndex / 3) to edge ops.
-    if (kind == "edge" && args.contains("ofFaces") && args["ofFaces"].is_array()) {
+    // (triIndex / 3) to edge ops. ofFaces only makes sense for edges, so its
+    // presence implies the kind rather than being silently ignored.
+    if (args.contains("ofFaces") && args["ofFaces"].is_array()) {
         std::vector<uint32_t> faces;
         for (const json& f : args["ofFaces"])
             if (f.is_number_integer())
@@ -1606,6 +1607,7 @@ ToolResult EditorApp::ToolEditElements(const json& args)
                        " produced no geometry (stale ids or degenerate selection?)");
         auto after = std::make_shared<Mesh>(std::move(verts), std::move(indices));
         RecomputeNormalsWelded(*after, MeshTopology::Build(*after));
+        after->UploadVertices(); // recompute touches CPU verts only; the VBO must follow
         std::shared_ptr<Mesh> before = e->mesh;
         e->mesh = after;
         m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
@@ -1623,6 +1625,7 @@ ToolResult EditorApp::ToolEditElements(const json& args)
             RecomputeNormalsWelded(*after, MeshTopology::Build(*after));
         else
             RecomputeNormalsFlat(*after);
+        after->UploadVertices(); // normals changed on the CPU side only
         std::shared_ptr<Mesh> before = e->mesh;
         e->mesh = after;
         m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
@@ -1644,17 +1647,30 @@ ToolResult EditorApp::ToolEditElements(const json& args)
         if (!args.contains("distance") || !args["distance"].is_number())
             return Err("Provide distance (world units along the region normal)");
         const float distance = args["distance"];
+        if (std::fabs(distance) < 1e-5f)
+            return Err("distance must be non-zero (a zero extrude leaves doubled "
+                       "coincident geometry)");
+        // The kernels build in object space; `distance` is a world-space
+        // promise. Same world->object mapping as the interactive tools
+        // (ExtrudeTool / edit-mode drag): scale by the normal's world length.
+        auto objectDistance = [&](const vec3& objectNormal) {
+            const float worldPerLocal = std::max(
+                glm::length(mat3(m_Scene.WorldTransform(e->id)) * objectNormal), 1e-6f);
+            return distance / worldPerLocal;
+        };
         if (action == "extrude_faces") {
             FaceExtrusion ex =
                 BuildFaceExtrusion(em, e->mesh->Vertices(), e->mesh->Indices(), ids);
+            const float d = objectDistance(ex.normal);
             for (uint32_t vi : ex.capVerts)
-                ex.vertices[vi].position += ex.normal * distance;
+                ex.vertices[vi].position += ex.normal * d;
             return swap(std::move(ex.vertices), std::move(ex.indices), "Face extrude",
                         json{{"extruded", ids.size()}});
         }
         EdgeExtrusion ex = BuildEdgeExtrusion(em, e->mesh->Vertices(), e->mesh->Indices(), ids);
+        const float d = objectDistance(ex.normal);
         for (uint32_t vi : ex.movingVerts)
-            ex.vertices[vi].position += ex.normal * distance;
+            ex.vertices[vi].position += ex.normal * d;
         return swap(std::move(ex.vertices), std::move(ex.indices), "Edge extrude",
                     json{{"extruded", ids.size()}});
     }
