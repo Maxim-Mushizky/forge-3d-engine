@@ -207,12 +207,22 @@ void EditorApp::RegisterMcpTools()
     m_McpProtocol.RegisterToolAsync(
         "render_image",
         "Path-traced render of the scene from the current camera at the given resolution "
-        "and samples-per-pixel. Runs in the background; the editor stays responsive.",
+        "and samples-per-pixel. Runs in the background; the editor stays responsive. "
+        "Optional per-render quality overrides (#92): bounces 1-16 (raise to 8+ for glass "
+        "interiors), denoise + denoiseStrength 0-1, and thin-lens depth of field via "
+        "aperture (world units, 0 = pinhole) + focusDist (distance to the sharp plane; "
+        "omit to focus on the camera's orbit point). Overrides apply to this render only "
+        "- the editor's interactive settings are untouched.",
         {{"type", "object"},
          {"properties",
           {{"width", {{"type", "integer"}, {"description", "px, default 512, max 1024"}}},
            {"height", {{"type", "integer"}, {"description", "px, default 512, max 1024"}}},
-           {"spp", {{"type", "integer"}, {"description", "samples per pixel, default 256, max 4096"}}}}},
+           {"spp", {{"type", "integer"}, {"description", "samples per pixel, default 256, max 4096"}}},
+           {"bounces", {{"type", "integer"}, {"description", "path depth 1-16, default = editor setting"}}},
+           {"denoise", {{"type", "boolean"}, {"description", "default = editor setting"}}},
+           {"denoiseStrength", {{"type", "number"}, {"description", "0-1, default = editor setting"}}},
+           {"aperture", {{"type", "number"}, {"description", "lens radius, 0-1, 0 = no DoF"}}},
+           {"focusDist", {{"type", "number"}, {"description", "focus distance in world units"}}}}},
          {"additionalProperties", false}},
         [this](const json& args, ToolResponder respond) {
             if (m_McpRender.active || m_Turntable.active) {
@@ -225,13 +235,24 @@ void EditorApp::RegisterMcpTools()
             m_PathTracer.Resize((uint32_t)w, (uint32_t)h);
             m_PathTracer.Upload(m_Scene);
             GatherLights();
+            // Per-render overrides live on the job (or one-shot PathTracer state);
+            // editor members stay untouched, and the first interactive
+            // UpdateRayTracer after the job re-applies them anyway.
+            const float aperture = std::clamp(args.value("aperture", 0.0f), 0.0f, 1.0f);
+            float focusDist = args.value("focusDist", -1.0f);
+            if (focusDist <= 0.0f)
+                focusDist = glm::length(m_Camera.FocalPoint() - m_Camera.Position());
             const mat4& view = m_Camera.View();
-            m_PathTracer.SetLens(0.0f, 1.0f, vec3(view[0][0], view[1][0], view[2][0]),
+            m_PathTracer.SetLens(aperture, focusDist,
+                                 vec3(view[0][0], view[1][0], view[2][0]),
                                  vec3(view[0][1], view[1][1], view[2][1]));
-            m_PathTracer.SetDenoise(m_Denoise, m_DenoiseStrength);
+            m_PathTracer.SetDenoise(args.value("denoise", m_Denoise),
+                                    std::clamp(args.value("denoiseStrength", m_DenoiseStrength),
+                                               0.0f, 1.0f));
             m_PathTracer.ResetAccumulation();
 
             m_McpRender.active = true;
+            m_McpRender.bounces = std::clamp(args.value("bounces", m_Bounces), 1, 16);
             m_McpRender.sppTarget = std::clamp(args.value("spp", 256), 8, 4096);
             // Projection rebuilt for the requested aspect; the viewport's own
             // matrix would letterbox-stretch anything non-viewport-shaped.
@@ -357,17 +378,27 @@ void EditorApp::RegisterMcpTools()
         "Scene-level ops. Actions: new (clears the scene, discards unsaved changes), open "
         "(path to .forge), save (optional path; required when untitled), import_model (path "
         "to .gltf/.glb/.obj), look_at (frame an entity by id/name or a point, optional "
-        "distance), undo, redo.",
+        "distance), undo, redo, set_render_settings (viewer state, saved with the scene, "
+        "not undoable: rayTracing on/off, bounces 1-16, rtScale 0.25-1, denoise, "
+        "denoiseStrength 0-1, aperture, focusDist; any subset; returns current values).",
         {{"type", "object"},
          {"properties",
           {{"action",
             {{"type", "string"},
-             {"enum", {"new", "open", "save", "import_model", "look_at", "undo", "redo"}}}},
+             {"enum", {"new", "open", "save", "import_model", "look_at", "undo", "redo",
+                       "set_render_settings"}}}},
            {"path", {{"type", "string"}}},
            {"id", {{"type", "string"}}},
            {"name", {{"type", "string"}}},
            {"point", {{"type", "array"}, {"items", {{"type", "number"}}}}},
-           {"distance", {{"type", "number"}}}}},
+           {"distance", {{"type", "number"}}},
+           {"rayTracing", {{"type", "boolean"}}},
+           {"bounces", {{"type", "integer"}}},
+           {"rtScale", {{"type", "number"}}},
+           {"denoise", {{"type", "boolean"}}},
+           {"denoiseStrength", {{"type", "number"}}},
+           {"aperture", {{"type", "number"}}},
+           {"focusDist", {{"type", "number"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolManageScene(args); });
 
@@ -383,7 +414,8 @@ void EditorApp::RegisterMcpTools()
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
-        "look_at{}. Writes return the affected entity as a table (use .id). "
+        "look_at{}, set_render_settings{}. Writes return the affected entity as a "
+        "table (use .id). "
         "print() lines and the script's return value come back in the result. "
         "The whole script is ONE undo entry; on error the partial build rolls "
         "back (sun/environment/camera changes excepted). Sandboxed: no os/io/"
@@ -885,6 +917,32 @@ ToolResult EditorApp::ToolManageScene(const json& args)
         }
         return JsonResult(json{{"ok", true}, {"focalPoint", Vec3Json(point)}});
     }
+    if (action == "set_render_settings") {
+        // Viewer state (#92): saved with the scene like the sun/sky sliders,
+        // deliberately outside the CommandStack. Startup defaults stay in
+        // Preferences; this adjusts the live session.
+        if (args.contains("rayTracing") && args["rayTracing"].is_boolean())
+            SetRayTracing(args["rayTracing"]);
+        if (args.contains("bounces") && args["bounces"].is_number_integer())
+            m_Bounces = std::clamp((int)args["bounces"], 1, 16);
+        if (args.contains("rtScale") && args["rtScale"].is_number())
+            m_RTScale = std::clamp((float)args["rtScale"], 0.25f, 1.0f);
+        if (args.contains("denoise") && args["denoise"].is_boolean())
+            m_Denoise = args["denoise"];
+        if (args.contains("denoiseStrength") && args["denoiseStrength"].is_number())
+            m_DenoiseStrength = std::clamp((float)args["denoiseStrength"], 0.0f, 1.0f);
+        if (args.contains("aperture") && args["aperture"].is_number())
+            m_Aperture = std::clamp((float)args["aperture"], 0.0f, 1.0f);
+        if (args.contains("focusDist") && args["focusDist"].is_number())
+            m_FocusDist = (float)args["focusDist"]; // <=0 re-derives from orbit distance
+        return JsonResult(json{{"rayTracing", m_RayTracing},
+                               {"bounces", m_Bounces},
+                               {"rtScale", m_RTScale},
+                               {"denoise", m_Denoise},
+                               {"denoiseStrength", m_DenoiseStrength},
+                               {"aperture", m_Aperture},
+                               {"focusDist", m_FocusDist}});
+    }
     if (action == "undo") {
         const bool ok = m_Commands.Undo(m_Scene);
         return JsonResult(json{{"ok", ok}, {"entities", m_Scene.Entities().size()}});
@@ -958,6 +1016,7 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("extrude_face", call(&EditorApp::ToolEditMesh, "extrude_face"));
 
         add("look_at", call(&EditorApp::ToolManageScene, "look_at"));
+        add("set_render_settings", call(&EditorApp::ToolManageScene, "set_render_settings"));
     });
 
     std::unique_ptr<CompositeCommand> batch = m_Commands.EndBatch();
@@ -998,7 +1057,7 @@ void EditorApp::UpdateMcpRender()
     if (!job.active)
         return;
 
-    m_PathTracer.Dispatch(job.viewProj, job.camPos, m_Sun, m_Bounces, m_FrameLights,
+    m_PathTracer.Dispatch(job.viewProj, job.camPos, m_Sun, job.bounces, m_FrameLights,
                           m_Env.get(), 8);
     if (m_PathTracer.SampleCount() < job.sppTarget)
         return;
