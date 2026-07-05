@@ -1768,7 +1768,9 @@ ToolResult EditorApp::ToolSculpt(const json& args)
         if (std::fabs(strength) < 1e-6f)
             return Err("strength must be non-zero (world units; negative dents inward)");
     } else { // smooth
-        strength = std::clamp(strength, 0.0f, 1.0f);
+        if (strength < 1e-6f)
+            return Err("smooth strength must be > 0 (0..1 relaxation factor)");
+        strength = std::min(strength, 1.0f);
     }
 
     // World -> object: positions through the full inverse, vectors through
@@ -1783,6 +1785,23 @@ ToolResult EditorApp::ToolSculpt(const json& args)
         return Err("Entity world transform is degenerate (zero scale?)");
     const vec3 localOffset = mat3(inv) * worldOffset;
     const float localAmount = strength * invScale; // inflate: along object normals
+
+    // A brush that cannot reach the mesh's AABB is a no-op: bail before the
+    // copy-on-write clone, so probing far from the surface costs neither a
+    // mesh copy nor a path-tracer scene re-upload.
+    if (DistanceToAABB(e->mesh->Bounds(), localCenter) > localRadius) {
+        json out = EntityJson(m_Scene, *e);
+        out["movedGroups"] = 0;
+        out["changedVertices"] = 0;
+        return JsonResult(out);
+    }
+
+    // An open interactive stroke holds absolute vertex snapshots (grab start
+    // positions, the stroke-begin diff base) — in-place edits underneath it
+    // would double-record into two commands and break undo. Same guard every
+    // topology op uses before pulling the mesh out from under the tool.
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit();
 
     // Copy-on-write (same as SculptTool::Enter): primitives are shared between
     // sibling entities AND undo snapshots hold the same shared_ptr — editing
