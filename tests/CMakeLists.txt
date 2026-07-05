@@ -17,11 +17,13 @@ add_executable(forge_tests
     test_settings.cpp
     test_mcp.cpp
     test_mcpscript.cpp
+    test_mcpviews.cpp
     test_meshstats.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/Settings.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpProtocol.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpScript.cpp
+    ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpViews.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/MeshStats.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp

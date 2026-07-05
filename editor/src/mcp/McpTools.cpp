@@ -1,6 +1,7 @@
 #include "EditorApp.h"
 #include "mcp/McpImage.h"
 #include "mcp/McpScript.h"
+#include "mcp/McpViews.h"
 
 #include <forge/assets/MeshFactory.h>
 #include <forge/geometry/MeshBoolean.h>
@@ -12,9 +13,11 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 // MCP tool surface (#76 perception, #77 actuation, #78 scripting). Registered
 // handlers run on the GL main thread between frames (McpServer drains the
@@ -121,6 +124,26 @@ static Entity* FindToolTargetKeyed(Scene& scene, const json& args, const char* i
 static Entity* FindToolTarget(Scene& scene, const json& args, std::string& error)
 {
     return FindToolTargetKeyed(scene, args, "id", "name", error);
+}
+
+// Whole-scene framing bounds (#93). A ground plane dominates the raw union
+// and shrinks everything else to dots, so essentially-flat meshes are ignored
+// when anything with volume exists.
+static AABB SceneFocusBounds(Scene& scene)
+{
+    AABB all, solid;
+    for (const Entity& e : scene.Entities())
+        if (e.mesh) {
+            const AABB b = TransformAABB(e.mesh->Bounds(), scene.WorldTransform(e.id));
+            all.Expand(b.min);
+            all.Expand(b.max);
+            const vec3 ext = b.max - b.min;
+            if (ext.y > 0.02f * std::max(ext.x, ext.z)) {
+                solid.Expand(b.min);
+                solid.Expand(b.max);
+            }
+        }
+    return solid.Valid() ? solid : all;
 }
 
 static ToolResult JsonResult(const json& j)
@@ -377,8 +400,9 @@ void EditorApp::RegisterMcpTools()
         "manage_scene",
         "Scene-level ops. Actions: new (clears the scene, discards unsaved changes), open "
         "(path to .forge), save (optional path; required when untitled), import_model (path "
-        "to .gltf/.glb/.obj), look_at (frame an entity by id/name or a point, optional "
-        "distance), undo, redo, set_render_settings (viewer state, saved with the scene, "
+        "to .gltf/.glb/.obj), look_at (frame an entity by id/name, a point, or with no "
+        "target the whole scene; optional distance), undo, redo, set_render_settings "
+        "(viewer state, saved with the scene, "
         "not undoable: rayTracing on/off, bounces 1-16, rtScale 0.25-1, denoise, "
         "denoiseStrength 0-1, aperture, focusDist; any subset; returns current values).",
         {{"type", "object"},
@@ -401,6 +425,31 @@ void EditorApp::RegisterMcpTools()
            {"focusDist", {{"type", "number"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolManageScene(args); });
+
+    m_McpProtocol.RegisterTool(
+        "render_views",
+        "Fast raster multi-view diagnostics (#93) — the critic's eyes. Presets: "
+        "turntable (front/right/back/left), 4up (front/right/top-ortho/three-"
+        "quarter), top_ortho (plan view). Modes: beauty (lit raster), clay (uniform "
+        "gray, geometry-only), wireframe, normals (RGB-encoded world normals — "
+        "spot inverted faces), object_id (flat unique color per entity + legend — "
+        "name what you see). Frames one entity (id/name, with children) or the "
+        "whole scene. Returns one PNG per view with labels. Use after every build "
+        "step: single-view checks miss floating/interpenetrating parts.",
+        {{"type", "object"},
+         {"properties",
+          {{"preset",
+            {{"type", "string"}, {"enum", {"turntable", "4up", "top_ortho"}},
+             {"description", "default 4up"}}},
+           {"mode",
+            {{"type", "string"},
+             {"enum", {"beauty", "clay", "wireframe", "normals", "object_id"}},
+             {"description", "default clay"}}},
+           {"id", {{"type", "string"}}},
+           {"name", {{"type", "string"}}},
+           {"size", {{"type", "integer"}, {"description", "px per view, 128-768, default 448"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolRenderViews(args); });
 
     // --- scripting (#78): code-as-actuation escape hatch ----------------------
 
@@ -901,6 +950,15 @@ ToolResult EditorApp::ToolManageScene(const json& args)
         float radius = args.value("distance", 4.0f);
         if (GetVec3(args, "point", point)) {
             m_Camera.Focus(point, radius);
+        } else if (!args.contains("id") && !args.contains("name")) {
+            // No target at all: frame the whole scene (#93).
+            const AABB box = SceneFocusBounds(m_Scene);
+            if (!box.Valid())
+                return Err("Nothing to frame (empty scene)");
+            point = (box.min + box.max) * 0.5f;
+            if (!args.contains("distance"))
+                radius = std::max(glm::length(box.max - box.min) * 0.6f, 1.0f);
+            m_Camera.Focus(point, radius);
         } else {
             std::string error;
             Entity* e = FindToolTarget(m_Scene, args, error);
@@ -952,6 +1010,130 @@ ToolResult EditorApp::ToolManageScene(const json& args)
         return JsonResult(json{{"ok", ok}, {"entities", m_Scene.Entities().size()}});
     }
     return Err("Unknown action: \"" + action + "\"");
+}
+
+// --- multi-view diagnostics (#93) -------------------------------------------------
+
+ToolResult EditorApp::ToolRenderViews(const json& args)
+{
+    const std::string preset = args.value("preset", "4up");
+    const std::string mode = args.value("mode", "clay");
+    const int size = std::clamp(args.value("size", 448), 128, 768);
+    const bool beauty = mode == "beauty", clay = mode == "clay", wire = mode == "wireframe",
+               normals = mode == "normals", objectId = mode == "object_id";
+    if (!(beauty || clay || wire || normals || objectId))
+        return Err("Unknown mode: \"" + mode + "\"");
+
+    AABB box;
+    if (args.contains("id") || args.contains("name")) {
+        std::string error;
+        Entity* e = FindToolTarget(m_Scene, args, error);
+        if (!e)
+            return Err(error);
+        for (UUID node : SubtreeOf(e->id))
+            if (Entity* n = m_Scene.Find(node); n && n->mesh) {
+                const AABB b = TransformAABB(n->mesh->Bounds(), m_Scene.WorldTransform(node));
+                box.Expand(b.min);
+                box.Expand(b.max);
+            }
+    } else {
+        box = SceneFocusBounds(m_Scene);
+    }
+    if (!box.Valid())
+        return Err("Nothing to frame (no meshes)");
+
+    const std::vector<ViewSpec> specs = BuildViewSpecs(preset, box);
+    if (specs.empty())
+        return Err("Unknown preset: \"" + preset + "\"");
+
+    // Stable object-id colors in scene order, with a legend the critic can name.
+    std::unordered_map<UUID, vec3> idColors;
+    json legend = json::array();
+    if (objectId) {
+        size_t k = 0;
+        for (const Entity& e : m_Scene.Entities())
+            if (e.mesh) {
+                const vec3 c = IdColor(k++);
+                idColors[e.id] = c;
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "#%02X%02X%02X", (int)(c.r * 255.0f + 0.5f),
+                              (int)(c.g * 255.0f + 0.5f), (int)(c.b * 255.0f + 0.5f));
+                legend.push_back({{"id", std::to_string(e.id)}, {"name", e.name}, {"color", hex}});
+            }
+    }
+
+    const ShadingMode prevShading = m_Renderer.GetShadingMode();
+    auto restore = [&]() {
+        m_Renderer.SetDebugView(DebugView::None);
+        m_Renderer.SetShadingMode(prevShading);
+        m_Renderer.SetEnvironment(m_Env.get());
+        m_Renderer.SetGridEnabled(true);
+    };
+    m_Renderer.SetGridEnabled(false); // agent views: geometry only
+    m_Renderer.SetDebugView(wire      ? DebugView::Wireframe
+                            : normals ? DebugView::Normals
+                            : objectId ? DebugView::Unlit
+                                       : DebugView::None);
+    if (beauty || clay)
+        m_Renderer.SetShadingMode(ShadingMode::PBR);
+    m_Renderer.SetEnvironment(beauty ? m_Env.get() : nullptr); // sky only in beauty
+
+    Material clayMat;
+    clayMat.albedo = {0.72f, 0.72f, 0.70f};
+    clayMat.metallic = 0.0f;
+    clayMat.roughness = 0.6f;
+
+    Framebuffer fbo((uint32_t)size, (uint32_t)size, /*hdr=*/true);
+    ToolResult result;
+    json views = json::array();
+    for (const ViewSpec& spec : specs) {
+        m_Renderer.BeginScene(ViewProjFor(spec, 1.0f), spec.eye, m_Sun);
+        for (const Entity& e : m_Scene.Entities()) {
+            const mat4 world = m_Scene.WorldTransform(e.id);
+            if ((beauty || clay) && e.light.enabled)
+                m_Renderer.SubmitLight(vec3(world[3]), e.light.color, e.light.intensity,
+                                       e.light.range);
+            if (!e.mesh)
+                continue;
+            Material mat = e.material;
+            if (clay)
+                mat = clayMat;
+            else if (wire)
+                mat.albedo = {0.75f, 0.85f, 1.0f};
+            else if (objectId)
+                mat.albedo = idColors[e.id];
+            if (!beauty) { // diagnostics want opaque geometry, no texture noise
+                mat.transmission = 0.0f;
+                mat.albedoMap = nullptr;
+                mat.metallicRoughnessMap = nullptr;
+            }
+            m_Renderer.Submit(*e.mesh, world, mat, !e.light.enabled);
+        }
+        m_Renderer.EndScene(fbo);
+        fbo.Unbind();
+        // Lit modes go through the post stack (tonemap); diagnostic modes are
+        // already display-encoded and read straight from the HDR attachment.
+        const uint32_t tex = (beauty || clay)
+                                 ? m_Post.Process(fbo.ColorAttachment(), (uint32_t)size,
+                                                  (uint32_t)size)
+                                 : fbo.ColorAttachment();
+        std::string b64 = TextureToPngBase64(tex, size);
+        if (b64.empty()) {
+            restore();
+            return Err("View readback failed");
+        }
+        result.content.push_back({{"type", "text"}, {"text", "view: " + spec.label}});
+        result.content.push_back(
+            {{"type", "image"}, {"data", std::move(b64)}, {"mimeType", "image/png"}});
+        views.push_back(spec.label);
+    }
+    restore();
+
+    json info{{"preset", preset}, {"mode", mode}, {"views", views}};
+    if (objectId)
+        info["legend"] = legend;
+    result.content.push_back({{"type", "text"}, {"text", info.dump(2)}});
+    return result;
 }
 
 // --- scripting (#78) ------------------------------------------------------------

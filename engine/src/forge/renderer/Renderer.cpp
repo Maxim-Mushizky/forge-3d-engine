@@ -20,6 +20,7 @@ void Renderer::Init()
 
     m_BlinnPhong = std::make_unique<Shader>(AssetPath("shaders/blinnphong.vert"), AssetPath("shaders/blinnphong.frag"));
     m_Flat = std::make_unique<Shader>(AssetPath("shaders/flat.vert"), AssetPath("shaders/flat.frag"));
+    m_Normals = std::make_unique<Shader>(AssetPath("shaders/normals.vert"), AssetPath("shaders/normals.frag"));
     m_PBR = std::make_unique<Shader>(AssetPath("shaders/pbr.vert"), AssetPath("shaders/pbr.frag"));
     m_GridShader = std::make_unique<Shader>(AssetPath("shaders/grid.vert"), AssetPath("shaders/grid.frag"));
     m_ShadowDepth = std::make_unique<Shader>(AssetPath("shaders/shadow.vert"), AssetPath("shaders/shadow.frag"));
@@ -138,6 +139,29 @@ void Renderer::SkyPass()
 
 void Renderer::DrawItemMain(const DrawItem& item)
 {
+    // Debug views (#93) bypass the lit shaders entirely; the flat shader's
+    // color uniform is u_Color (the outline pass uses the same one).
+    if (m_DebugView != DebugView::None) {
+        if (m_DebugView == DebugView::Normals) {
+            m_Normals->Bind();
+            m_Normals->SetMat4("u_ViewProj", m_ViewProjection);
+            m_Normals->SetMat4("u_Model", item.transform);
+            m_Normals->SetMat3("u_NormalMatrix", mat3(glm::transpose(glm::inverse(item.transform))));
+        } else {
+            m_Flat->Bind();
+            m_Flat->SetMat4("u_ViewProj", m_ViewProjection);
+            m_Flat->SetMat4("u_Model", item.transform);
+            m_Flat->SetVec3("u_Color", item.material.albedo);
+            m_Flat->SetInt("u_HasAlbedoMap", 0);
+        }
+        if (m_DebugView == DebugView::Wireframe)
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        item.mesh->Draw();
+        if (m_DebugView == DebugView::Wireframe)
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        return;
+    }
+
     const Material& material = item.material;
     bool hasAlbedoMap = material.albedoMap != nullptr;
     bool hasMRMap = material.metallicRoughnessMap != nullptr;
@@ -201,7 +225,8 @@ void Renderer::DrawItemMain(const DrawItem& item)
 
 void Renderer::EndScene(const Framebuffer& target)
 {
-    m_ShadowsThisFrame = m_ShadowsEnabled && !m_Queue.empty() && m_Mode != ShadingMode::Flat;
+    m_ShadowsThisFrame = m_ShadowsEnabled && !m_Queue.empty() && m_Mode != ShadingMode::Flat &&
+                         m_DebugView == DebugView::None;
     if (m_ShadowsThisFrame)
         ShadowPass();
 
@@ -214,7 +239,7 @@ void Renderer::EndScene(const Framebuffer& target)
         if (item.material.transmission <= 0.0f)
             DrawItemMain(item);
 
-    if (m_Environment && m_Environment->Valid())
+    if (m_Environment && m_Environment->Valid() && m_DebugView == DebugView::None)
         SkyPass(); // after opaques: fills only background pixels (depth = 1)
 
     // Transmissive pass: after the sky so the background shows through, blended
@@ -254,6 +279,9 @@ void Renderer::EndScene(const Framebuffer& target)
         glDisable(GL_POLYGON_OFFSET_LINE);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     }
+
+    if (m_DebugView != DebugView::None || !m_GridEnabled)
+        return; // diagnostic views (#93): geometry only, no grid
 
     // Grid: blended, two-sided, drawn last so it composites over the background.
     glEnable(GL_BLEND);
