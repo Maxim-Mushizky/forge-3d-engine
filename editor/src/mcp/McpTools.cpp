@@ -923,8 +923,8 @@ ToolResult EditorApp::ToolManageScene(const json& args)
         // Preferences; this adjusts the live session.
         if (args.contains("rayTracing") && args["rayTracing"].is_boolean())
             SetRayTracing(args["rayTracing"]);
-        if (args.contains("bounces") && args["bounces"].is_number_integer())
-            m_Bounces = std::clamp((int)args["bounces"], 1, 16);
+        if (args.contains("bounces") && args["bounces"].is_number())
+            m_Bounces = std::clamp((int)(double)args["bounces"], 1, 16);
         if (args.contains("rtScale") && args["rtScale"].is_number())
             m_RTScale = std::clamp((float)args["rtScale"], 0.25f, 1.0f);
         if (args.contains("denoise") && args["denoise"].is_boolean())
