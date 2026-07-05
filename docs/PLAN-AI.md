@@ -107,8 +107,8 @@ hair strands (mesh cards v1), UV *editing* tools (unwrap only).
 
 Epic #74, restructured 2026-07-05 into two sub-epics after #75–#77 shipped: **#96 Draftsman I
 (code-as-actuation)** = #78 Lua `execute_script` → #91 extended `forge.*` bindings → #79 skill
-library + RAG resources; **#97 Draftsman II (eyes & spatial sense)** = #92 render controls →
-#93 multi-view/diagnostic renders → #94 spatial introspection → #95 relational placement.
+library + RAG resources; **#97 Draftsman II (eyes & spatial sense)** = #92 render controls
+→ #93 multi-view/diagnostic renders → #94 spatial introspection → #95 relational placement.
 
 Order: #75 ✅ → #76 ✅ → #77 ✅ → #78 → #92 → #93 → #94 → #95 → #91 → #79 (agent builds prop
 scenes) → #80 → #16 → #81 → #82 → #17 (complex-asset engine floor) → #83 → #84 (generation)

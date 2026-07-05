@@ -188,6 +188,20 @@ int Print(lua_State* L)
     return 0;
 }
 
+// Wraps the stock pcall/xpcall (upvalue 1): a script must not be able to
+// catch the instruction-budget error and keep looping, so if the budget
+// tripped inside the protected call, the guard re-raises after it returns.
+int GuardedProtectedCall(lua_State* L)
+{
+    const int nargs = lua_gettop(L);
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    lua_call(L, nargs, LUA_MULTRET);
+    if (CtxSlot(L)->instructionsLeft <= 0)
+        return luaL_error(L, "instruction budget exceeded (runaway loop?)");
+    return lua_gettop(L);
+}
+
 // Trampoline for every forge.* binding; upvalue 1 = index into RunCtx::fns.
 int CallBinding(lua_State* L)
 {
@@ -255,6 +269,11 @@ ScriptResult RunSandboxedScript(const std::string& source,
         lua_pushnil(L);
         lua_setglobal(L, gate);
     }
+    for (const char* guarded : {"pcall", "xpcall"}) {
+        lua_getglobal(L, guarded);
+        lua_pushcclosure(L, GuardedProtectedCall, 1);
+        lua_setglobal(L, guarded);
+    }
     lua_pushcfunction(L, Print);
     lua_setglobal(L, "print"); // print goes to the tool result, not stdout
 
@@ -284,6 +303,11 @@ ScriptResult RunSandboxedScript(const std::string& source,
         size_t len = 0;
         const char* msg = luaL_tolstring(L, -1, &len);
         result.error.assign(msg, len);
+        result.output = std::move(ctx.output);
+        return result;
+    }
+    if (ctx.instructionsLeft <= 0) { // belt for any future catch path
+        result.error = "instruction budget exceeded (runaway loop?)";
         result.output = std::move(ctx.output);
         return result;
     }

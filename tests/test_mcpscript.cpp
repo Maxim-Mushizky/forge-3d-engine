@@ -158,6 +158,34 @@ static void InstructionBudgetAborts()
     CHECK(r.returned == json(5050));
 }
 
+static void BudgetSurvivesProtectedCalls()
+{
+    // pcall/xpcall must not swallow the kill switch: the wrapped versions
+    // re-raise after the protected call if the budget tripped inside it.
+    ScriptLog log;
+    ScriptResult r = RunWithStubs("local ok = pcall(function() while true do end end)\n"
+                                  "forge.echo{caught = ok}",
+                                  &log, /*budget=*/500'000);
+    CHECK(!r.ok);
+    CHECK(r.error.find("instruction budget") != std::string::npos);
+    CHECK(log.empty()); // nothing runs past the re-raise
+
+    r = RunWithStubs("local ok = xpcall(function() while true do end end,\n"
+                     "                  function(e) return e end)\n"
+                     "forge.echo{caught = ok}",
+                     &log, /*budget=*/500'000);
+    CHECK(!r.ok);
+    CHECK(r.error.find("instruction budget") != std::string::npos);
+    CHECK(log.empty());
+
+    // Ordinary errors stay catchable through the wrappers.
+    r = RunWithStubs("local ok, err = pcall(function() error('soft') end)\n"
+                     "return {ok = ok, err = err}");
+    CHECK(r.ok);
+    CHECK(r.returned["ok"] == false);
+    CHECK(r.returned["err"].get<std::string>().find("soft") != std::string::npos);
+}
+
 static void MemoryCapAborts()
 {
     // Doubling string.rep would hit gigabytes fast; the capped allocator must
@@ -198,6 +226,7 @@ void RunMcpScriptTests()
     BindingErrorAbortsScript();
     BindingArgsRoundTrip();
     InstructionBudgetAborts();
+    BudgetSurvivesProtectedCalls();
     MemoryCapAborts();
     ParametricBuildLoop();
     std::printf("[ok] mcp script kernel tests\n");

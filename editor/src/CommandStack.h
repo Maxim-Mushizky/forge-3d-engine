@@ -1,5 +1,6 @@
 #pragma once
 
+#include <forge/core/Log.h>
 #include <forge/scene/Scene.h>
 
 #include <memory>
@@ -155,7 +156,11 @@ public:
     // Scripted batches (#78). Begin routes subsequent Pushes into a composite;
     // End hands it back — the caller Pushes it on success, or Undoes and drops
     // it so a failed script rolls back atomically.
-    void BeginBatch() { m_Batch = std::make_unique<CompositeCommand>(); }
+    void BeginBatch()
+    {
+        FORGE_ASSERT(!m_Batch, "CommandStack batch already open");
+        m_Batch = std::make_unique<CompositeCommand>();
+    }
     std::unique_ptr<CompositeCommand> EndBatch() { return std::move(m_Batch); }
 
     bool Undo(Scene& scene)

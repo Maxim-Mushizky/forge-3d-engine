@@ -646,8 +646,10 @@ ToolResult EditorApp::ToolManageMaterial(const json& args)
             m.albedoMap = nullptr;
         } else {
             auto tex = Texture2D::FromFile(path, /*srgb=*/true, /*flipV=*/false);
-            if (!tex)
+            if (!tex) {
+                *e = before; // no partial edit: earlier fields already changed
                 return Err("Couldn't load texture: " + path);
+            }
             m.albedoMap = tex;
         }
         any = true;
@@ -903,7 +905,10 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
     const std::string source = args["source"];
 
     // Every command a binding pushes collects into one composite: the whole
-    // script is a single undo entry, and a failed script rolls back atomically.
+    // script is a single undo entry, and a failed script rolls back atomically
+    // (selection included).
+    const UUID selectedBefore = m_Selected;
+    const std::vector<UUID> selectionBefore = m_Selection;
     m_Commands.BeginBatch();
 
     // Each forge.* function re-enters an existing tool handler with the same
@@ -959,6 +964,10 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
     if (!run.ok) {
         if (batch && !batch->Empty())
             batch->Undo(m_Scene); // roll back the partial build
+        // The undo restores every entity the script touched, so the pre-script
+        // selection is valid again.
+        m_Selected = selectedBefore;
+        m_Selection = selectionBefore;
         if (!m_Scene.Find(m_Selected)) {
             m_Selection.clear();
             m_Selected = 0;
