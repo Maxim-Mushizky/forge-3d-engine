@@ -19,6 +19,7 @@ add_executable(forge_tests
     test_mcpscript.cpp
     test_mcpviews.cpp
     test_meshstats.cpp
+    test_spatial.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/Settings.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpProtocol.cpp
@@ -26,6 +27,7 @@ add_executable(forge_tests
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpViews.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/MeshStats.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/Spatial.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/raytrace/BVH.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/scene/BoxSelect.cpp

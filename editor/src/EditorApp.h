@@ -135,6 +135,8 @@ private:
     ToolResult ToolGetEntity(const nlohmann::json& args);
     ToolResult ToolGetMeshStats(const nlohmann::json& args);
     ToolResult ToolRaycast(const nlohmann::json& args);
+    ToolResult ToolCheckOverlap(const nlohmann::json& args);  // #94: AABB interpenetration
+    ToolResult ToolQuerySpatial(const nlohmann::json& args);  // #94: radius/height/ground queries
     ToolResult ToolManageEntity(const nlohmann::json& args);
     ToolResult ToolManageMaterial(const nlohmann::json& args);
     ToolResult ToolManageLight(const nlohmann::json& args);

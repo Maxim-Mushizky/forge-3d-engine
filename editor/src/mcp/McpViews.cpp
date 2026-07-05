@@ -96,18 +96,4 @@ vec3 IdColor(size_t index)
     return rgb + vec3(m);
 }
 
-AABB TransformAABB(const AABB& box, const mat4& transform)
-{
-    AABB out;
-    if (!box.Valid())
-        return out; // never launder FLT_MAX sentinels into a "valid" universe box
-    for (int i = 0; i < 8; ++i) {
-        const vec3 corner{i & 1 ? box.max.x : box.min.x,
-                          i & 2 ? box.max.y : box.min.y,
-                          i & 4 ? box.max.z : box.min.z};
-        out.Expand(vec3(transform * vec4(corner, 1.0f)));
-    }
-    return out;
-}
-
 } // namespace forge
