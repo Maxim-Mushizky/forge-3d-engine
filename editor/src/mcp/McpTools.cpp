@@ -1840,11 +1840,22 @@ ToolResult EditorApp::ToolSculpt(const json& args)
     bool snapped = false;
     bool mirrorActive = mirror;
     if (snap) {
+        const vec3 preSnap = localCenter;
         snapped = SnapToNearestVertex(verts, topo, localCenter);
         if (mirror) {
-            mirrorCenter = vec3(-localCenter.x, localCenter.y, localCenter.z);
+            const vec3 reflected{-localCenter.x, localCenter.y, localCenter.z};
+            mirrorCenter = reflected;
             mirrorActive = SnapToNearestVertex(verts, topo, mirrorCenter,
                                                localCenter.x >= 0.0f ? -1 : +1);
+            // A same-side snap is still unbounded: on an asymmetric mesh the
+            // nearest mirror-side vertex may sit far from the reflection (a
+            // stray boolean leftover). Allow the mirrored snap only as much
+            // travel as the primary needed, plus a brush radius of slack —
+            // beyond that there is no mirror-image surface to sculpt.
+            if (mirrorActive &&
+                glm::length(mirrorCenter - reflected) >
+                    glm::length(localCenter - preSnap) + localRadius)
+                mirrorActive = false;
         }
     }
     // Both sides resolving to the same spot (center on the plane): one stroke.
@@ -1890,6 +1901,8 @@ ToolResult EditorApp::ToolSculpt(const json& args)
                                              mirrorCenter, mirrorOffset, localRadius, f)
                         : SculptMove(verts, topo, localCenter, localRadius, localOffset, f);
         } else if (brush == "inflate") {
+            // Sequential double-apply matches the interactive tool; the sum
+            // below is a per-application count (overlap groups count twice).
             moved = SculptInflate(verts, topo, localCenter, localRadius, localAmount);
             if (mirrorActive)
                 moved += SculptInflate(verts, topo, mirrorCenter, localRadius, localAmount);

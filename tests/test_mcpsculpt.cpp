@@ -138,12 +138,14 @@ void MirroredMoveDoesNotDouble()
     // would move A by 2x; the merged kernel writes each group once and the
     // mirrored side wins — interactive X-mirror's last-write-wins.
     SeamQuad q = BuildSeamQuad();
+    // Differing offsets pin the winner: y == 2 proves the MIRRORED side wins
+    // on overlap (last-write-wins); a sum would give 3, primary-wins 1.
     const size_t moved = SculptMoveMirrored(q.verts, q.topo, {0.0f, 0.0f, 0.0f},
                                             {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f},
-                                            {0.0f, 1.0f, 0.0f}, 0.5f, SculptFalloff::Constant);
+                                            {0.0f, 2.0f, 0.0f}, 0.5f, SculptFalloff::Constant);
     CHECK(moved == 1); // distinct groups, not per-application counts
-    CHECK(ApproxEq(q.verts[0].position.y, 1.0f, 1e-6f)); // 1x, not 2x
-    CHECK(ApproxEq(q.verts[3].position.y, 1.0f, 1e-6f)); // seam copy welded
+    CHECK(ApproxEq(q.verts[0].position.y, 2.0f, 1e-6f)); // mirrored offset, once
+    CHECK(ApproxEq(q.verts[3].position.y, 2.0f, 1e-6f)); // seam copy welded
 
     // Disjoint regions: both applied, targets from pre-move positions.
     SeamQuad d = BuildSeamQuad();
