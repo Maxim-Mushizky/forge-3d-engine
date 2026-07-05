@@ -16,13 +16,15 @@ AABB TransformAABB(const AABB& box, const mat4& transform);
 struct OverlapResult {
     bool overlap = false;
     vec3 penetration{0.0f}; // MTV: translate A by this to just separate it from B
-    float depth = 0.0f;     // |penetration| (smallest-axis overlap)
+    float depth = 0.0f;     // |penetration| — smallest escape distance, not the raw overlap extent
     float distance = 0.0f;  // gap between the boxes when not overlapping, else 0
 };
 
 // AABB-vs-AABB. Face contact (zero-width intersection on some axis) counts as
 // NOT overlapping — stacked/abutting placements are legitimate, only actual
-// interpenetration should alarm an agent. Invalid boxes never overlap.
+// interpenetration should alarm an agent. A flat box (zero extent on an axis,
+// e.g. a ground plane) crossing a solid one IS overlap; resting on its face
+// is not. Invalid boxes never overlap.
 OverlapResult OverlapAABB(const AABB& a, const AABB& b);
 
 // Distance from a point to the box surface; 0 inside. FLT_MAX for invalid

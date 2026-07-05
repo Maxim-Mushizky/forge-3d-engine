@@ -122,6 +122,53 @@ static void OverlapPenetration()
     CHECK(ApproxEq(r.depth, 1.0f));
 }
 
+static void OverlapFlatBoxes()
+{
+    // A ground plane's AABB is zero-thick on y: its zero-width intersection
+    // with anything must not read as face contact when a solid box genuinely
+    // crosses it.
+    AABB plane;
+    plane.Expand({-8.0f, 0.0f, -8.0f});
+    plane.Expand({8.0f, 0.0f, 8.0f});
+
+    // Cube half-buried in the ground: pierced, and the MTV lifts it out.
+    OverlapResult r = OverlapAABB(BoxAt({0.0f, 0.3f, 0.0f}, vec3(0.5f)), plane);
+    CHECK(r.overlap);
+    CHECK(ApproxEq(r.depth, 0.2f));
+    CHECK(ApproxEq(r.penetration.y, 0.2f));
+
+    // Symmetric argument order: the plane escapes downward.
+    r = OverlapAABB(plane, BoxAt({0.0f, 0.3f, 0.0f}, vec3(0.5f)));
+    CHECK(r.overlap);
+    CHECK(ApproxEq(r.penetration.y, -0.2f));
+
+    // Cube resting exactly on the plane: contact, not interpenetration.
+    r = OverlapAABB(BoxAt({0.0f, 0.5f, 0.0f}, vec3(0.5f)), plane);
+    CHECK(!r.overlap);
+    CHECK(ApproxEq(r.distance, 0.0f));
+
+    // Two coplanar flat boxes: contact, not overlap.
+    CHECK(!OverlapAABB(plane, plane).overlap);
+
+    // Flat box hovering above the ground: plain gap.
+    r = OverlapAABB(BoxAt({0.0f, 2.0f, 0.0f}, vec3(0.5f)), plane);
+    CHECK(!r.overlap);
+    CHECK(ApproxEq(r.distance, 1.5f));
+
+    // Contact on one axis + gap on another: the gap must win the distance
+    // report (an early "touching -> distance 0" return would lie here).
+    r = OverlapAABB(BoxAt({0.0f, 0.5f, 0.0f}, vec3(0.5f)),
+                    BoxAt({3.0f, 1.5f, 0.0f}, vec3(0.5f)));
+    CHECK(!r.overlap);
+    CHECK(ApproxEq(r.distance, 2.0f));
+
+    // Degenerate-thin box sandwiched inside a solid one.
+    AABB sliver;
+    sliver.Expand({-0.1f, 0.25f, -0.1f});
+    sliver.Expand({0.1f, 0.25f, 0.1f});
+    CHECK(OverlapAABB(sliver, BoxAt(vec3(0.0f), vec3(0.5f))).overlap);
+}
+
 static void PointAndBoxDistance()
 {
     const AABB box = BoxAt(vec3(0.0f), vec3(1.0f));
@@ -133,6 +180,14 @@ static void PointAndBoxDistance()
     CHECK(ApproxEq(DistanceBetweenAABB(box, BoxAt({4.0f, 0.0f, 0.0f}, vec3(1.0f))), 2.0f));
     CHECK(ApproxEq(DistanceBetweenAABB(box, BoxAt({0.5f, 0.0f, 0.0f}, vec3(1.0f))), 0.0f));
     CHECK(DistanceBetweenAABB(box, AABB{}) == FLT_MAX);
+
+    // Elongated center: a chair abutting the far end of a 20-unit wall is at
+    // bounds-to-bounds distance 0 — the midpoint-distance shortcut would call
+    // it ~9 away and drop it from radius queries.
+    const AABB wall = BoxAt(vec3(0.0f), {10.0f, 1.0f, 0.5f});
+    const AABB chair = BoxAt({10.5f, 0.5f, 0.0f}, vec3(0.5f));
+    CHECK(ApproxEq(DistanceBetweenAABB(wall, chair), 0.0f));
+    CHECK(DistanceToAABB(chair, vec3(0.0f)) > 9.0f); // the shortcut's answer
 }
 
 static void RadiusQuerySemantics()
@@ -160,6 +215,7 @@ void RunSpatialTests()
     TransformTRS();
     OverlapSeparatedAndTouching();
     OverlapPenetration();
+    OverlapFlatBoxes();
     PointAndBoxDistance();
     RadiusQuerySemantics();
     std::printf("[ok] spatial kernel tests done\n");

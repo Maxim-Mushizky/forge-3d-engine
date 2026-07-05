@@ -14,6 +14,7 @@
 #include <json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -241,7 +242,9 @@ void EditorApp::RegisterMcpTools()
     m_McpProtocol.RegisterTool(
         "query_spatial",
         "Spatial queries over the scene (#94). Actions: within_radius (entities whose "
-        "bounds lie within radius of a point or of another entity, sorted by distance), "
+        "bounds lie within radius of a point [point-to-bounds distance] or of another "
+        "entity's bounds [bounds-to-bounds distance; the center entity is excluded]; "
+        "point wins when both are given; sorted by distance), "
         "above_height / below_height (entities entirely above/below a world y), "
         "ground_height (top surface height at x,z via downward raycast — use before "
         "placing something).",
@@ -678,15 +681,20 @@ ToolResult EditorApp::ToolQuerySpatial(const json& args)
         if (radius < 0.0f)
             return Err("radius must be >= 0");
 
+        // Point form: point-to-box distance. Entity form: box-to-box distance
+        // (a chair touching the end of a 20-unit wall is at distance 0, not
+        // 10-from-the-midpoint). point wins when both forms are supplied.
         vec3 center;
+        AABB centerBounds;
         UUID selfId = 0; // exclude the center entity from its own neighborhood
-        if (!GetVec3(args, "point", center)) {
+        const bool pointForm = GetVec3(args, "point", center);
+        if (!pointForm) {
             std::string error;
             Entity* e = FindToolTarget(m_Scene, args, error);
             if (!e)
                 return Err("Provide point [x,y,z], or id/name of a center entity");
-            const AABB wb = boundsOrPoint(*e);
-            center = (wb.min + wb.max) * 0.5f;
+            centerBounds = boundsOrPoint(*e);
+            center = (centerBounds.min + centerBounds.max) * 0.5f;
             selfId = e->id;
         }
 
@@ -694,7 +702,9 @@ ToolResult EditorApp::ToolQuerySpatial(const json& args)
         for (const Entity& e : m_Scene.Entities()) {
             if (e.id == selfId)
                 continue;
-            const float d = DistanceToAABB(boundsOrPoint(e), center);
+            const AABB wb = boundsOrPoint(e);
+            const float d =
+                pointForm ? DistanceToAABB(wb, center) : DistanceBetweenAABB(centerBounds, wb);
             if (d <= radius)
                 hits.push_back({d, &e});
         }
@@ -747,7 +757,9 @@ ToolResult EditorApp::ToolQuerySpatial(const json& args)
         const float z = args["z"];
 
         // Cast from just above the scene's top so stacked geometry reports its
-        // highest surface, whatever the scene's vertical extent.
+        // highest surface, whatever the scene's vertical extent. The bump must
+        // survive float absorption at large |top| (past 2^24, top + 1 == top,
+        // and an on-surface origin skips the top face).
         float top = 0.0f;
         bool any = false;
         for (const Entity& e : m_Scene.Entities())
@@ -762,7 +774,7 @@ ToolResult EditorApp::ToolQuerySpatial(const json& args)
             return JsonResult(json{{"hit", false}});
 
         Ray ray;
-        ray.origin = {x, top + 1.0f, z};
+        ray.origin = {x, top + std::max(1.0f, 1e-5f * std::fabs(top)), z};
         ray.direction = {0.0f, -1.0f, 0.0f};
         std::optional<RaycastHit> hit = m_Scene.Raycast(ray);
         if (!hit)

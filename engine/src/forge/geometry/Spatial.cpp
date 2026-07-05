@@ -30,9 +30,27 @@ OverlapResult OverlapAABB(const AABB& a, const AABB& b)
     // Per-axis signed overlap; negative = gap of that size on that axis.
     const vec3 overlap = glm::min(a.max, b.max) - glm::max(a.min, b.min);
 
-    if (overlap.x <= 0.0f || overlap.y <= 0.0f || overlap.z <= 0.0f) {
+    // An axis penetrates when the intersection has width — or when it is
+    // zero-width but the shared coordinate sits strictly inside one of the
+    // boxes: a flat box (ground plane) piercing a solid one also produces a
+    // zero, and must not read as the face contact of two solid boxes.
+    bool penetratesAll = true;
+    for (int i = 0; i < 3 && penetratesAll; ++i) {
+        if (overlap[i] > 0.0f)
+            continue;
+        if (overlap[i] < 0.0f) {
+            penetratesAll = false; // real gap
+            continue;
+        }
+        const float c = a.min[i] > b.min[i] ? a.min[i] : b.min[i];
+        const bool insideA = a.min[i] < c && c < a.max[i];
+        const bool insideB = b.min[i] < c && c < b.max[i];
+        if (!insideA && !insideB)
+            penetratesAll = false; // resting contact on this axis
+    }
+    if (!penetratesAll) {
         const vec3 gap = glm::max(-overlap, vec3(0.0f));
-        r.distance = glm::length(gap);
+        r.distance = glm::length(gap); // 0 for pure face contact
         return r;
     }
 
