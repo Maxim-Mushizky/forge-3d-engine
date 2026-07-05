@@ -141,6 +141,7 @@ private:
     ToolResult ToolEditMesh(const nlohmann::json& args);
     ToolResult ToolManageScene(const nlohmann::json& args);
     ToolResult ToolExecuteScript(const nlohmann::json& args); // #78: Lua, one undo entry
+    ToolResult ToolRenderViews(const nlohmann::json& args);   // #93: multi-view raster diagnostics
 
     Window m_Window;
     Renderer m_Renderer;

@@ -32,6 +32,16 @@ enum class ShadingMode {
     PBR,        // Cook-Torrance metallic/roughness + IBL
 };
 
+// Diagnostic overrides for agent multi-view renders (#93). While active,
+// DrawItemMain takes a dedicated path (unlit/wireframe/normals) and EndScene
+// skips shadows, sky, and grid — geometry only, nothing decorative.
+enum class DebugView {
+    None,
+    Unlit,     // flat material.albedo — object-id passes feed id colors here
+    Wireframe, // unlit + GL_LINE polygons
+    Normals,   // world-space normal * 0.5 + 0.5
+};
+
 inline constexpr int kMaxPointLights = 8;
 
 // The only class that issues draw calls (raster path).
@@ -43,8 +53,12 @@ public:
 
     void SetShadingMode(ShadingMode mode) { m_Mode = mode; }
     ShadingMode GetShadingMode() const { return m_Mode; }
+    void SetDebugView(DebugView view) { m_DebugView = view; }
+    DebugView GetDebugView() const { return m_DebugView; }
     void SetShadowsEnabled(bool enabled) { m_ShadowsEnabled = enabled; }
     bool ShadowsEnabled() const { return m_ShadowsEnabled; }
+    void SetGridEnabled(bool enabled) { m_GridEnabled = enabled; } // off for agent views (#93)
+    bool GridEnabled() const { return m_GridEnabled; }
     void SetEnvironment(const Environment* env) { m_Environment = env; } // null = procedural background
 
     void BeginScene(const mat4& viewProjection, const vec3& cameraPosition, const DirectionalLight& light);
@@ -70,6 +84,7 @@ private:
 
     std::unique_ptr<Shader> m_BlinnPhong;
     std::unique_ptr<Shader> m_Flat;
+    std::unique_ptr<Shader> m_Normals;
     std::unique_ptr<Shader> m_PBR;
     std::unique_ptr<Shader> m_GridShader;
     std::unique_ptr<Shader> m_ShadowDepth;
@@ -82,8 +97,10 @@ private:
     mat4 m_LightSpace{1.0f};
     bool m_ShadowsEnabled = true;
     bool m_ShadowsThisFrame = false;
+    bool m_GridEnabled = true;
 
     ShadingMode m_Mode = ShadingMode::PBR;
+    DebugView m_DebugView = DebugView::None;
     mat4 m_ViewProjection{1.0f};
     vec3 m_CameraPosition{0.0f};
     DirectionalLight m_Light;
