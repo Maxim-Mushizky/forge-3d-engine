@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 // MCP tool surface (#76 perception, #77 actuation, #78 scripting). Registered
 // handlers run on the GL main thread between frames (McpServer drains the
@@ -1024,18 +1025,24 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
     if (!(beauty || clay || wire || normals || objectId))
         return Err("Unknown mode: \"" + mode + "\"");
 
+    // A targeted call frames AND renders only that subtree — mixing in the
+    // rest of the scene puts geometry past the fitted far plane, and a hard
+    // clip reads as a tear to the critic.
     AABB box;
+    std::unordered_set<UUID> subtree;
     if (args.contains("id") || args.contains("name")) {
         std::string error;
         Entity* e = FindToolTarget(m_Scene, args, error);
         if (!e)
             return Err(error);
-        for (UUID node : SubtreeOf(e->id))
+        for (UUID node : SubtreeOf(e->id)) {
+            subtree.insert(node);
             if (Entity* n = m_Scene.Find(node); n && n->mesh) {
                 const AABB b = TransformAABB(n->mesh->Bounds(), m_Scene.WorldTransform(node));
                 box.Expand(b.min);
                 box.Expand(b.max);
             }
+        }
     } else {
         box = SceneFocusBounds(m_Scene);
     }
@@ -1062,13 +1069,30 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
             }
     }
 
-    const ShadingMode prevShading = m_Renderer.GetShadingMode();
-    auto restore = [&]() {
-        m_Renderer.SetDebugView(DebugView::None);
-        m_Renderer.SetShadingMode(prevShading);
-        m_Renderer.SetEnvironment(m_Env.get());
-        m_Renderer.SetGridEnabled(true);
-    };
+    // Scope guard, not a lambda: tool handlers may throw (the protocol layer
+    // converts to isError and the app keeps running), and leaked DebugView /
+    // grid state would stick to the interactive viewport until the next
+    // successful call. The destructor also drops m_DisplayTex once the shared
+    // post stack has been resized under it — the recorded GL name is deleted,
+    // and DrawViewport's ==0 fallback shows the raw attachment instead.
+    struct RendererStateGuard {
+        EditorApp& app;
+        ShadingMode shading;
+        DebugView debug;
+        bool grid;
+        bool postResized = false;
+        ~RendererStateGuard()
+        {
+            app.m_Renderer.SetDebugView(debug);
+            app.m_Renderer.SetShadingMode(shading);
+            app.m_Renderer.SetEnvironment(app.m_Env.get());
+            app.m_Renderer.SetGridEnabled(grid);
+            if (postResized)
+                app.m_DisplayTex = 0;
+        }
+    } guard{*this, m_Renderer.GetShadingMode(), m_Renderer.GetDebugView(),
+            m_Renderer.GridEnabled()};
+
     m_Renderer.SetGridEnabled(false); // agent views: geometry only
     m_Renderer.SetDebugView(wire      ? DebugView::Wireframe
                             : normals ? DebugView::Normals
@@ -1095,6 +1119,10 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
                                        e.light.range);
             if (!e.mesh)
                 continue;
+            if (!subtree.empty() && !subtree.count(e.id))
+                continue; // targeted call: render the subtree only
+            if (!beauty && e.light.enabled)
+                continue; // gizmo spheres read as floating-part false positives
             Material mat = e.material;
             if (clay)
                 mat = clayMat;
@@ -1113,21 +1141,19 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
         fbo.Unbind();
         // Lit modes go through the post stack (tonemap); diagnostic modes are
         // already display-encoded and read straight from the HDR attachment.
-        const uint32_t tex = (beauty || clay)
-                                 ? m_Post.Process(fbo.ColorAttachment(), (uint32_t)size,
-                                                  (uint32_t)size)
-                                 : fbo.ColorAttachment();
-        std::string b64 = TextureToPngBase64(tex, size);
-        if (b64.empty()) {
-            restore();
-            return Err("View readback failed");
+        uint32_t tex = fbo.ColorAttachment();
+        if (beauty || clay) {
+            tex = m_Post.Process(fbo.ColorAttachment(), (uint32_t)size, (uint32_t)size);
+            guard.postResized = true; // m_DisplayTex now names a deleted texture
         }
+        std::string b64 = TextureToPngBase64(tex, size);
+        if (b64.empty())
+            return Err("View readback failed");
         result.content.push_back({{"type", "text"}, {"text", "view: " + spec.label}});
         result.content.push_back(
             {{"type", "image"}, {"data", std::move(b64)}, {"mimeType", "image/png"}});
         views.push_back(spec.label);
     }
-    restore();
 
     json info{{"preset", preset}, {"mode", mode}, {"views", views}};
     if (objectId)

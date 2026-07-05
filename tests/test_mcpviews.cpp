@@ -4,7 +4,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 
-#include <set>
+#include <vector>
 
 // Suites for the render_views camera kernel (#93): presets, projection,
 // id colors, and world-AABB transforms — all GL-free.
@@ -73,17 +73,48 @@ static void ProjectionCentersTarget()
     }
 }
 
+static void ElongatedTargetFullyFramed()
+{
+    // T-pose proportions: a 6x0.4x0.4 box. The old 2.4*R distance cropped the
+    // +/-x ends out of the front view — the exact extremities these views
+    // exist to inspect. Every corner of every view must land inside NDC.
+    const AABB box = UnitBoxAt({0.0f, 1.0f, 0.0f}, {3.0f, 0.2f, 0.2f});
+    for (const char* preset : {"turntable", "4up"}) {
+        for (const ViewSpec& s : BuildViewSpecs(preset, box)) {
+            const mat4 vp = ViewProjFor(s, 1.0f);
+            for (int i = 0; i < 8; ++i) {
+                const vec3 corner{i & 1 ? box.max.x : box.min.x,
+                                  i & 2 ? box.max.y : box.min.y,
+                                  i & 4 ? box.max.z : box.min.z};
+                const vec4 clip = vp * vec4(corner, 1.0f);
+                CHECK(clip.w > 0.0f);
+                CHECK(std::abs(clip.x / clip.w) <= 1.0f);
+                CHECK(std::abs(clip.y / clip.w) <= 1.0f);
+            }
+        }
+    }
+}
+
 static void IdColorsDistinct()
 {
-    std::set<std::tuple<int, int, int>> seen;
-    for (size_t i = 0; i < 16; ++i) {
+    // Perceptual distance, not byte inequality: a VLM reads antialiased
+    // pixels, so any pair closer than ~24/255 summed RGB is a legend
+    // misattribution waiting to happen. Tiered s/v keeps 48 entities apart.
+    std::vector<vec3> colors;
+    for (size_t i = 0; i < 48; ++i) {
         const vec3 c = IdColor(i);
         CHECK(c.r >= 0.0f && c.r <= 1.0f);
         CHECK(c.g >= 0.0f && c.g <= 1.0f);
         CHECK(c.b >= 0.0f && c.b <= 1.0f);
-        seen.insert({(int)(c.r * 255), (int)(c.g * 255), (int)(c.b * 255)});
+        colors.push_back(c);
     }
-    CHECK(seen.size() == 16); // no collisions across the first 16 entities
+    float minDist = 3.0f;
+    for (size_t a = 0; a < colors.size(); ++a)
+        for (size_t b = a + 1; b < colors.size(); ++b) {
+            const vec3 d = glm::abs(colors[a] - colors[b]);
+            minDist = std::min(minDist, d.r + d.g + d.b);
+        }
+    CHECK(minDist > 24.0f / 255.0f);
 }
 
 static void TransformAABBRotates()
@@ -101,12 +132,18 @@ static void TransformAABBRotates()
     const AABB moved = TransformAABB(box, t);
     CHECK(ApproxEq(moved.min.x, 4.0f, 1e-4f));
     CHECK(ApproxEq(moved.max.x, 6.0f, 1e-4f));
+
+    // An invalid box (empty mesh sentinel) must stay invalid — transforming
+    // its FLT_MAX corners would otherwise fabricate a universe-sized box that
+    // passes Valid() and blows up the framing math.
+    CHECK(!TransformAABB(AABB{}, rot).Valid());
 }
 
 void RunMcpViewsTests()
 {
     PresetShapes();
     ProjectionCentersTarget();
+    ElongatedTargetFullyFramed();
     IdColorsDistinct();
     TransformAABBRotates();
     std::printf("[ok] mcp views kernel tests\n");

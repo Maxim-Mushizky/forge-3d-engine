@@ -58,6 +58,7 @@ public:
     void SetShadowsEnabled(bool enabled) { m_ShadowsEnabled = enabled; }
     bool ShadowsEnabled() const { return m_ShadowsEnabled; }
     void SetGridEnabled(bool enabled) { m_GridEnabled = enabled; } // off for agent views (#93)
+    bool GridEnabled() const { return m_GridEnabled; }
     void SetEnvironment(const Environment* env) { m_Environment = env; } // null = procedural background
 
     void BeginScene(const mat4& viewProjection, const vec3& cameraPosition, const DirectionalLight& light);

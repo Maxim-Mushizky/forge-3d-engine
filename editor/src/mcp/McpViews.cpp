@@ -19,7 +19,11 @@ std::vector<ViewSpec> BuildViewSpecs(const std::string& preset, const AABB& targ
         return {};
     const vec3 center = (target.min + target.max) * 0.5f;
     const float radius = std::max(glm::length(target.max - target.min) * 0.5f, 0.05f);
-    const float dist = radius * 2.4f; // frames the sphere with margin at 40 deg fov
+    // Containing a sphere of radius R at fov f needs dist >= R / sin(f/2);
+    // anything closer crops off-axis extremities — the exact geometry these
+    // views exist to inspect. 5% margin on top.
+    const float kFovDeg = 40.0f;
+    const float dist = radius / std::sin(glm::radians(kFovDeg * 0.5f)) * 1.05f;
 
     auto orbit = [&](float azimuthDeg, float elevationDeg, std::string label) {
         ViewSpec s;
@@ -70,7 +74,16 @@ mat4 ViewProjFor(const ViewSpec& spec, float aspect)
 vec3 IdColor(size_t index)
 {
     const float h = std::fmod((float)index * 0.61803398875f, 1.0f) * 6.0f;
-    const float s = 0.72f, v = 0.95f;
+    // Hue alone runs out of perceptual distance past ~16 entities (golden-
+    // ratio near-misses like index 0 vs 21 differ by ~8 degrees), so every
+    // 16 indices step to a different saturation/value tier. Distinct through
+    // ~48 entities; beyond that the legend's exact hex still disambiguates.
+    // Every tier keeps chroma (s*v) >= ~0.5: pastel tiers compress hue
+    // distance and near-golden-ratio hue pairs fall below legibility.
+    static constexpr float kS[3] = {0.72f, 0.92f, 0.55f};
+    static constexpr float kV[3] = {0.95f, 0.62f, 0.90f};
+    const size_t tier = (index / 16) % 3;
+    const float s = kS[tier], v = kV[tier];
     const float c = v * s;
     const float x = c * (1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f));
     const float m = v - c;
@@ -86,6 +99,8 @@ vec3 IdColor(size_t index)
 AABB TransformAABB(const AABB& box, const mat4& transform)
 {
     AABB out;
+    if (!box.Valid())
+        return out; // never launder FLT_MAX sentinels into a "valid" universe box
     for (int i = 0; i < 8; ++i) {
         const vec3 corner{i & 1 ? box.max.x : box.min.x,
                           i & 2 ? box.max.y : box.min.y,
