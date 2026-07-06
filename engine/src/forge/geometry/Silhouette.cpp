@@ -260,7 +260,10 @@ static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, int width, in
             }
     }
     const int fg = n - bgCount;
-    if (fg < n / 100 || fg > n * 95 / 100)
+    // 64-bit compare: stbi admits images past ~22.6 MP, where n * 95 overflows
+    // int. The max(1, ...) floor keeps a fully-flooded tiny image degenerate
+    // (fg = 0 must fall back to Otsu, not report an empty success).
+    if (fg < std::max(1, n / 100) || (int64_t)fg * 100 > (int64_t)n * 95)
         return false; // flood leaked through the figure, or found no ground
 
     out = MakeMask(width, height);
@@ -285,7 +288,10 @@ SilhouetteMask BinarizeImage(const uint8_t* rgba, int width, int height)
     if (hasMatte) {
         for (size_t i = 0; i < n; ++i)
             m.pixels[i] = rgba[i * 4 + 3] >= 128 ? 255 : 0;
-        return m; // an authored matte needs no polarity guess or speck cleanup
+        // No polarity guess needed, but speck cleanup still is: web cutouts
+        // carry orphan alpha dust, and one pixel poisons the crop box.
+        DropSpecks(m);
+        return m;
     }
 
     std::vector<uint8_t> lum(n);

@@ -116,6 +116,47 @@ static void BinarizeAlphaMatte()
     CHECK(MaskArea(m) == 2);
     CHECK(m.pixels[1 * 4 + 1] != 0);
     CHECK(m.pixels[1 * 4 + 2] != 0);
+
+    // Speck cleanup applies to mattes too: web cutouts carry orphan alpha
+    // dust, and one stray pixel would poison the tight-crop bbox.
+    const int w = 24, h = 24;
+    std::vector<uint8_t> big((size_t)w * h * 4, 0);
+    auto setBig = [&](int x, int y, uint8_t a) {
+        uint8_t* p = &big[((size_t)y * w + x) * 4];
+        p[0] = p[1] = p[2] = 128;
+        p[3] = a;
+    };
+    for (int y = 8; y < 16; ++y)
+        for (int x = 8; x < 16; ++x)
+            setBig(x, y, 255); // 64-px object
+    setBig(1, 22, 255);        // orphan dust: 1 * 20 < 64 -> dropped
+    const SilhouetteMask bm = BinarizeImage(big.data(), w, h);
+    CHECK(MaskArea(bm) == 64);
+    CHECK(bm.pixels[22 * w + 1] == 0);
+}
+
+// Otsu fallback exercised for real (the flood path swallows most clean
+// cases): a bright fill inside a 1-px dark ring covers >95% of the frame, so
+// the flood reports degenerate and the histogram threshold does the split,
+// with border-majority polarity picking the fill as figure.
+static void BinarizeOtsuFallbackPath()
+{
+    const int w = 128, h = 128;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t lum) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = p[1] = p[2] = lum;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const bool ring = x == 0 || y == 0 || x == w - 1 || y == h - 1;
+            fill(x, y, ring ? 30 : 210);
+        }
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == (w - 2) * (h - 2)); // the bright fill, ring excluded
+    CHECK(m.pixels[(size_t)(h / 2) * w + w / 2] != 0);
+    CHECK(m.pixels[0] == 0);
 }
 
 // Opaque product shot: dark object on a light ground, plus a single dark
@@ -313,6 +354,7 @@ void RunSilhouetteTests()
     ViewProjFraming();
     BinarizeAlphaMatte();
     BinarizeOtsuPolarityAndSpecks();
+    BinarizeOtsuFallbackPath();
     BinarizeWhiteOnWhite();
     NormalizeInvariances();
     CompareAndDiffValues();

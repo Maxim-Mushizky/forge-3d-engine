@@ -1142,8 +1142,11 @@ ToolResult EditorApp::ToolCompareSilhouette(const json& args)
     if (!refPixels)
         return Err("Failed to load reference image \"" + refPath +
                    "\": " + stbi_failure_reason());
+    // RAII on the C buffer: BinarizeImage allocates image-sized transients,
+    // and a bad_alloc there unwinds to the protocol layer (which keeps the
+    // app running) — the decode buffer must not leak on that path.
+    const std::unique_ptr<stbi_uc, void (*)(void*)> refOwner(refPixels, stbi_image_free);
     SilhouetteMask reference = BinarizeImage(refPixels, refW, refH);
-    stbi_image_free(refPixels);
     if (MaskArea(reference) == 0)
         return Err("Reference image has no foreground after binarization");
 

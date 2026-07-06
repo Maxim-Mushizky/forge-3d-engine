@@ -63,8 +63,9 @@ public:
     // Cross-section diagnostics (#114): while enabled, geometry on the
     // plane's negative side is clipped and the PBR pass flat-shades visible
     // back faces as the cut surface — a raster-only "solid cut", no CSG.
-    // Only the PBR and shadow shaders write gl_ClipDistance, so callers must
-    // pair this with ShadingMode::PBR + DebugView::None (render_views does).
+    // Only the PBR and shadow shaders write gl_ClipDistance, so the clip
+    // activates only under ShadingMode::PBR + DebugView::None (see
+    // SectionActive) — armed under any other mode it stays inert.
     // A zero-length normal disables. Wants watertight, consistently wound
     // meshes; open meshes show background through the cut.
     void SetSectionPlane(const vec3& origin, const vec3& normal, bool enabled);
@@ -92,6 +93,14 @@ private:
     };
 
     AABB SceneBounds() const;
+    // True only when the section plane is armed AND every pass that will draw
+    // writes gl_ClipDistance (PBR main + shadow). Keeps a mispaired
+    // SetSectionPlane inert instead of undefined-clipping through the
+    // flat/blinnphong/debug shaders.
+    bool SectionActive() const
+    {
+        return m_SectionEnabled && m_Mode == ShadingMode::PBR && m_DebugView == DebugView::None;
+    }
     void ShadowPass();
     void SkyPass();
     void DrawItemMain(const DrawItem& item);

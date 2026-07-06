@@ -126,7 +126,7 @@ void Renderer::ShadowPass()
     // Section (#114): the shadow map clips to the same plane, or the removed
     // half would still cast onto the kept half.
     m_ShadowDepth->SetVec4("u_SectionPlane",
-                           m_SectionEnabled ? m_SectionPlane : vec4(0.0f, 0.0f, 0.0f, 1.0f));
+                           SectionActive() ? m_SectionPlane : vec4(0.0f, 0.0f, 0.0f, 1.0f));
     for (const DrawItem& item : m_Queue) {
         if (!item.castShadow)
             continue;
@@ -228,8 +228,8 @@ void Renderer::DrawItemMain(const DrawItem& item)
     }
     if (m_Mode == ShadingMode::PBR) {
         shader->SetVec4("u_SectionPlane",
-                        m_SectionEnabled ? m_SectionPlane : vec4(0.0f, 0.0f, 0.0f, 1.0f));
-        shader->SetInt("u_SectionEnabled", m_SectionEnabled ? 1 : 0);
+                        SectionActive() ? m_SectionPlane : vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        shader->SetInt("u_SectionEnabled", SectionActive() ? 1 : 0);
         shader->SetFloat("u_Metallic", material.metallic);
         shader->SetFloat("u_Roughness", material.roughness);
         shader->SetFloat("u_Transmission", material.transmission);
@@ -248,8 +248,11 @@ void Renderer::EndScene(const Framebuffer& target)
 {
     // Section (#114): the clip enable wraps only the passes whose shaders
     // write gl_ClipDistance (shadow + PBR items) — leaving it on for the
-    // outline/grid shaders would be undefined clipping.
-    if (m_SectionEnabled)
+    // outline/grid shaders would be undefined clipping. SectionActive() (not
+    // the raw flag) so a plane armed under Flat/BlinnPhong/debug shading
+    // stays inert instead of clipping through non-writing shaders.
+    const bool section = SectionActive();
+    if (section)
         glEnable(GL_CLIP_DISTANCE0);
 
     m_ShadowsThisFrame = m_ShadowsEnabled && !m_Queue.empty() && m_Mode != ShadingMode::Flat &&
@@ -269,8 +272,7 @@ void Renderer::EndScene(const Framebuffer& target)
     // Sky skipped in section mode: a diagnostic cut wants a void behind it,
     // and the sky shader doesn't write gl_ClipDistance (undefined under the
     // active clip enable).
-    if (m_Environment && m_Environment->Valid() && m_DebugView == DebugView::None &&
-        !m_SectionEnabled)
+    if (m_Environment && m_Environment->Valid() && m_DebugView == DebugView::None && !section)
         SkyPass(); // after opaques: fills only background pixels (depth = 1)
 
     // Transmissive pass: after the sky so the background shows through, blended
@@ -295,7 +297,7 @@ void Renderer::EndScene(const Framebuffer& target)
         glDisable(GL_BLEND);
     }
 
-    if (m_SectionEnabled)
+    if (section)
         glDisable(GL_CLIP_DISTANCE0); // before outlines/grid: their shaders don't write clip
 
     if (!m_Outlines.empty()) {
