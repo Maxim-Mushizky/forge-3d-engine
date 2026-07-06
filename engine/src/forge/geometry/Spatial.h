@@ -3,6 +3,9 @@
 #include "forge/core/Geometry.h"
 #include "forge/core/Math.h"
 
+#include <optional>
+#include <string>
+
 namespace forge {
 
 // GL-free spatial reasoning kernel (#94): world-AABB transforms, overlap tests,
@@ -33,5 +36,12 @@ float DistanceToAABB(const AABB& box, const vec3& p);
 
 // Distance between two boxes (closest points); 0 when touching/overlapping.
 float DistanceBetweenAABB(const AABB& a, const AABB& b);
+
+// Named landmark for forge.measure (#114): "top"/"bottom" are the y face
+// centers, "center" the box center. nullopt for unknown names/invalid boxes.
+std::optional<vec3> AabbLandmark(const AABB& box, const std::string& feature);
+
+// Extent along "x"/"y"/"z"; nullopt for an unknown axis or invalid box.
+std::optional<float> AabbAxisExtent(const AABB& box, const std::string& axis);
 
 } // namespace forge

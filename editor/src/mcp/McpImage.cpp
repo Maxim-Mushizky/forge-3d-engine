@@ -92,4 +92,20 @@ std::string TextureToPngBase64(uint32_t texture, int maxDim)
     return Base64(png);
 }
 
+std::string PixelsToPngBase64(const uint8_t* rgba, int width, int height)
+{
+    if (!rgba || width <= 0 || height <= 0)
+        return {};
+    std::vector<uint8_t> png;
+    stbi_write_png_to_func(
+        [](void* ctx, void* data, int size) {
+            auto* buf = (std::vector<uint8_t>*)ctx;
+            buf->insert(buf->end(), (uint8_t*)data, (uint8_t*)data + size);
+        },
+        &png, width, height, 4, rgba, width * 4);
+    if (png.empty())
+        return {};
+    return Base64(png);
+}
+
 } // namespace forge

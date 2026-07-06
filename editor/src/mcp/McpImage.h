@@ -11,4 +11,8 @@ namespace forge {
 // blocks: keep maxDim ~1024 so responses stay context-friendly (#76).
 std::string TextureToPngBase64(uint32_t texture, int maxDim);
 
+// CPU-buffer variant for software-rendered images (silhouette diffs, #114):
+// RGBA8, row 0 = top, no GL. "" on failure.
+std::string PixelsToPngBase64(const uint8_t* rgba, int width, int height);
+
 } // namespace forge

@@ -37,6 +37,8 @@ uniform int u_HasEnv;
 uniform float u_EnvIntensity;
 uniform float u_EnvRotation;
 
+uniform int u_SectionEnabled; // cross-section mode (#114)
+
 out vec4 FragColor;
 
 const float PI = 3.14159265359;
@@ -121,6 +123,16 @@ vec3 BRDF(vec3 N, vec3 V, vec3 L, vec3 albedo, float metallic, float roughness, 
 
 void main()
 {
+    // Section mode (#114): with the solid clipped open, the back faces seen
+    // through the cut ARE the cut surface. Flat amber, unlit — walls read as
+    // one solid region (thickness is the point), unmistakable against clay.
+    // Assumes watertight, outward-wound meshes (what the lathe/sweep builders
+    // and #118/#119 guarantee).
+    if (u_SectionEnabled == 1 && !gl_FrontFacing) {
+        FragColor = vec4(1.0, 0.35, 0.06, 1.0);
+        return;
+    }
+
     vec3 albedo = u_Albedo;
     if (u_HasAlbedoMap == 1)
         albedo *= texture(u_AlbedoMap, v_UV).rgb;

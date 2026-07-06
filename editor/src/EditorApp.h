@@ -164,6 +164,11 @@ private:
     ToolResult ToolManageScene(const nlohmann::json& args);
     ToolResult ToolExecuteScript(const nlohmann::json& args); // #78: Lua, one undo entry
     ToolResult ToolRenderViews(const nlohmann::json& args);   // #93: multi-view raster diagnostics
+    // --- measurement & critique (#114) ---------------------------------------
+    ToolResult ToolMeasure(const nlohmann::json& args);           // distances / landmarks / extents
+    ToolResult ToolCompareSilhouette(const nlohmann::json& args); // IoU vs reference image
+    // One measure endpoint: [x,y,z] literal, or {entity/id/name, feature}.
+    bool ResolveMeasurePoint(const nlohmann::json& endpoint, vec3& out, std::string& error);
     // --- Poly Haven asset library (#84) — bodies in mcp/McpPolyHaven.cpp ----
     void StartPolyHavenSearch(const nlohmann::json& args, ToolResponder respond);
     void StartPolyHavenDownload(const nlohmann::json& args, ToolResponder respond);
