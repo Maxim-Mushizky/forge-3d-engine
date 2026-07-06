@@ -1667,9 +1667,10 @@ ToolResult EditorApp::ToolEditElements(const json& args)
 
     if (action == "shade") {
         // COW discipline: undo history shares the mesh pointer, so shading
-        // recomputes normals on a clone and swaps — never in place.
+        // recomputes normals on a clone and swaps — never in place. Identity
+        // clone: submesh ranges carry over (same index buffer, #80).
         const bool smooth = args.value("smooth", true);
-        auto after = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        auto after = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
         if (smooth)
             RecomputeNormalsWelded(*after, MeshTopology::Build(*after));
         else
@@ -1846,9 +1847,10 @@ ToolResult EditorApp::ToolSculpt(const json& args)
 
     // Copy-on-write (same as SculptTool::Enter): primitives are shared between
     // sibling entities AND undo snapshots hold the same shared_ptr — editing
-    // in place would rewrite history.
+    // in place would rewrite history. Identity clone: submesh ranges carry
+    // over (same index buffer, #80).
     if (e->mesh.use_count() > 1)
-        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
 
     const std::vector<Vertex> before = e->mesh->Vertices();
     const MeshTopology topo = MeshTopology::Build(*e->mesh);

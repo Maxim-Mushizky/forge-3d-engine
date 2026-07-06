@@ -309,6 +309,32 @@ void RunSceneFormatTests()
 
         // exactly one submesh per triangle is legitimate
         CHECK(SanitizeSubmeshes({{0, 3, 0}, {3, 3, 1}, {6, 3, 2}}, 9).size() == 3);
+
+        // overlapping ranges (total coverage > buffer) fall back to single-material:
+        // per-range checks pass, but drawing/uploading each range would multiply work
+        CHECK(SanitizeSubmeshes({{0, 9, 0}, {0, 9, 1}}, 9).empty());
+        CHECK(SanitizeSubmeshes({{0, 6, 0}, {3, 6, 1}}, 9).empty());
+    }
+
+    // --- submesh triple > 2^32 must be dropped, not truncated into a valid range
+    {
+        std::string json =
+            R"({"version":2,"entities":[],"meshes":[{"vertexCount":3,"indexCount":9,"offset":0,)"
+            R"("submeshes":[[4294967299,3,0],[0,3,0]]}]})"; // 2^32+3 would truncate to firstIndex 3
+        std::vector<uint8_t> bytes;
+        const char magic[8] = {'F', 'O', 'R', 'G', 'E', 'S', 'C', 'N'};
+        bytes.insert(bytes.end(), magic, magic + 8);
+        uint32_t version = 2, len = (uint32_t)json.size();
+        bytes.insert(bytes.end(), (uint8_t*)&version, (uint8_t*)&version + 4);
+        bytes.insert(bytes.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
+        bytes.insert(bytes.end(), json.begin(), json.end());
+        bytes.resize(bytes.size() + 3 * sizeof(Vertex) + 9 * sizeof(uint32_t), 0);
+        auto back = DecodeScene(bytes.data(), bytes.size());
+        CHECK(back.has_value());
+        if (back) {
+            CHECK(back->meshes[0].submeshes.size() == 1);
+            CHECK(back->meshes[0].submeshes[0].firstIndex == 0);
+        }
     }
 
     // --- dangling mesh index rejected ------------------------------------------

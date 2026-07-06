@@ -191,7 +191,12 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                         if (!js.is_array() || js.size() != 3 || !js[0].is_number_unsigned() ||
                             !js[1].is_number_unsigned() || !js[2].is_number_unsigned())
                             continue; // lenient on content: skip malformed triples
-                        subs.push_back({js[0].get<uint32_t>(), js[1].get<uint32_t>(), js[2].get<uint32_t>()});
+                        // Read wide first: get<uint32_t> would silently truncate a
+                        // >2^32 value into a plausible-looking small range.
+                        uint64_t f = js[0].get<uint64_t>(), c = js[1].get<uint64_t>(), s = js[2].get<uint64_t>();
+                        if (f > UINT32_MAX || c > UINT32_MAX || s > UINT32_MAX)
+                            continue;
+                        subs.push_back({(uint32_t)f, (uint32_t)c, (uint32_t)s});
                     }
                     // Ranges that don't fit the index buffer are dropped here
                     // (and again in the Mesh constructor, defense in depth).

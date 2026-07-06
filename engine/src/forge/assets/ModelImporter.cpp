@@ -224,6 +224,13 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
                 slotMaterials.push_back(std::move(m));
             }
 
+            // The merged buffers use 32-bit offsets; a model that would overflow
+            // them is beyond anything drawable anyway — skip the primitive.
+            if (meshVertices.size() + vertices.size() > UINT32_MAX ||
+                meshIndices.size() + indices.size() > UINT32_MAX) {
+                FORGE_WARN("glTF: primitive skipped, merged mesh exceeds 32-bit vertex/index range");
+                continue;
+            }
             const uint32_t vertexBase = (uint32_t)meshVertices.size();
             const uint32_t firstIndex = (uint32_t)meshIndices.size();
             meshVertices.insert(meshVertices.end(), vertices.begin(), vertices.end());

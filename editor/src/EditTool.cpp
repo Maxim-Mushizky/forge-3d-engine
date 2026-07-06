@@ -68,8 +68,9 @@ void EditTool::Enter(Scene& scene, UUID entity)
         return;
     // Copy-on-write: primitives are shared between entities AND undo snapshots
     // hold the same shared_ptr — editing in place would corrupt siblings/history.
+    // Identity clone: submesh ranges carry over (same index buffer, #80).
     if (e->mesh.use_count() > 1)
-        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
 
     m_EditMesh = BuildEditMesh(*e->mesh);
     m_Topology = MeshTopology::Build(*e->mesh); // welded-normal recompute after edits
@@ -507,7 +508,8 @@ std::unique_ptr<Command> EditTool::EndExtrude(Scene& scene)
     }
 
     // Fresh mesh so bounds/normals match the committed geometry; one undo step.
-    auto finalMesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+    // Same index buffer as the WIP mesh, so its submesh table (if any) carries over.
+    auto finalMesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
     MeshTopology topo = MeshTopology::Build(*finalMesh);
     RecomputeNormalsWelded(*finalMesh, topo);
     finalMesh->RecomputeBounds();

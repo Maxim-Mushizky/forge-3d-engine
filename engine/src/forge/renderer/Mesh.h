@@ -32,10 +32,15 @@ inline std::vector<Submesh> SanitizeSubmeshes(std::vector<Submesh> submeshes, si
         return s.indexCount == 0 || s.firstIndex > indexCount ||
                s.indexCount > indexCount - s.firstIndex; // overflow-safe range check
     });
-    // More (valid) submeshes than triangles is nonsense — likely a hostile or
-    // corrupt file; fall back to single-material rather than looping millions
-    // of draws. Checked after the erase so garbage entries can't veto good ones.
-    if (submeshes.size() > indexCount / 3)
+    // Aggregate bounds, checked after the erase so garbage entries can't veto
+    // good ones. More (valid) submeshes than triangles, or ranges covering more
+    // indices than the buffer holds (overlaps — every legitimate producer emits
+    // a partition), is a hostile or corrupt file: fall back to single-material
+    // rather than multiplying draw calls and path-tracer triangle uploads.
+    uint64_t covered = 0;
+    for (const Submesh& s : submeshes)
+        covered += s.indexCount;
+    if (submeshes.size() > indexCount / 3 || covered > indexCount)
         submeshes.clear();
     return submeshes;
 }
