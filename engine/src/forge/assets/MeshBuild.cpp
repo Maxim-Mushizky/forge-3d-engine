@@ -12,6 +12,13 @@ namespace {
 constexpr float kWeldEps = 1e-6f; // consecutive input points closer than this collapse
 constexpr float kAxisEps = 1e-6f; // lathe radius at/below this sits on the axis (pole)
 
+// Point lists come straight from json/Lua, so a buggy caller loop can hand us
+// hundreds of thousands of points; the build runs serially on the GL main
+// thread, so oversized input must fail fast instead of allocating gigabytes.
+constexpr size_t kMaxProfilePoints = 4096;
+constexpr size_t kMaxPathPoints = 16384;
+constexpr size_t kMaxVertices = 2'000'000; // projected ring grid, pre-caps
+
 bool Finite(const vec2& v)
 {
     return std::isfinite(v.x) && std::isfinite(v.y);
@@ -61,8 +68,8 @@ bool BuildLathe(const std::vector<vec2>& profile, uint32_t sectors, bool closed,
         if (!Finite(p) || p.x < 0.0f)
             return false;
 
-    const std::vector<vec2> pts = DedupeConsecutive(profile);
-    if (pts.size() < 2)
+    std::vector<vec2> pts = DedupeConsecutive(profile);
+    if (pts.size() < 2 || pts.size() > kMaxProfilePoints)
         return false;
     float maxRadius = 0.0f;
     for (const vec2& p : pts)
@@ -70,6 +77,16 @@ bool BuildLathe(const std::vector<vec2>& profile, uint32_t sectors, bool closed,
     if (maxRadius <= kAxisEps)
         return false; // every point on the axis: revolving yields no surface
     sectors = std::clamp(sectors, 3u, 1024u);
+    if (pts.size() * (size_t)(sectors + 1) > kMaxVertices)
+        return false;
+
+    // A profile that returns to its start is a loop (revolved ring): the wall
+    // closes itself, so caps would stack coincident opposite-facing disks on
+    // the welded seam ring and break the manifold. Snap the closure bit-exact
+    // so the position weld actually sees one ring.
+    const bool loop = pts.size() >= 3 && glm::length(pts.front() - pts.back()) <= kWeldEps;
+    if (loop)
+        pts.back() = pts.front();
 
     std::vector<float> cs, sn;
     FillAngleTable(sectors, cs, sn);
@@ -84,12 +101,20 @@ bool BuildLathe(const std::vector<vec2>& profile, uint32_t sectors, bool closed,
 
     // Per-point profile normals from central differences: rotating the profile
     // tangent -90 degrees points +r on an ascending outer wall and toward the
-    // axis on a descending inner wall, so cup interiors light correctly.
-    std::vector<vec2> pn(pts.size());
-    for (size_t i = 0; i < pts.size(); ++i) {
-        const vec2 prev = pts[i > 0 ? i - 1 : i];
-        const vec2 next = pts[i + 1 < pts.size() ? i + 1 : i];
-        const vec2 t = glm::normalize(next - prev);
+    // axis on a descending inner wall, so cup interiors light correctly. Loops
+    // wrap around the closure so both seam rings shade identically.
+    const size_t nProf = pts.size();
+    std::vector<vec2> pn(nProf);
+    for (size_t i = 0; i < nProf; ++i) {
+        const vec2 prev = loop ? pts[i > 0 ? i - 1 : nProf - 2] : pts[i > 0 ? i - 1 : i];
+        const vec2 next = loop ? pts[i + 1 < nProf ? i + 1 : 1] : pts[i + 1 < nProf ? i + 1 : i];
+        vec2 d = next - prev;
+        // A switchback (prev == next around a turnaround point) collapses the
+        // central difference to zero; normalize would emit NaN normals. Fall
+        // back to a one-sided difference — dedupe guarantees it is nonzero.
+        if (glm::length(d) <= kWeldEps)
+            d = i + 1 < nProf ? pts[i + 1] - pts[i] : pts[i] - pts[i - 1];
+        const vec2 t = glm::normalize(d);
         pn[i] = vec2(t.y, -t.x);
     }
 
@@ -126,9 +151,10 @@ bool BuildLathe(const std::vector<vec2>& profile, uint32_t sectors, bool closed,
         }
     }
 
-    if (closed) {
+    if (closed && !loop) {
         // Fan caps over open ends; r = 0 ends are already sealed by the pole
-        // collapse. Ring positions repeat the wall expressions bit-exactly.
+        // collapse and loops close themselves. Ring positions repeat the wall
+        // expressions bit-exactly.
         for (int end = 0; end < 2; ++end) {
             const vec2 p = end == 0 ? pts.front() : pts.back();
             if (p.x <= kAxisEps)
@@ -164,29 +190,40 @@ bool BuildSweep(const std::vector<vec2>& profile, const std::vector<vec3>& path,
     std::vector<vec2> sec = DedupeConsecutive(profile);
     if (sec.size() >= 2 && glm::length(sec.front() - sec.back()) <= kWeldEps)
         sec.pop_back(); // tolerate an explicitly closed input polygon
-    if (sec.size() < 3)
+    if (sec.size() < 3 || sec.size() > kMaxProfilePoints)
         return false;
-    float area2 = 0.0f; // shoelace, twice the signed area
+    double area2 = 0.0; // shoelace, twice the signed area; double so huge-but-
+                        // finite floats can't overflow to inf/NaN and sneak a
+                        // backwards section past the checks below
     for (size_t j = 0; j < sec.size(); ++j) {
         const vec2& p0 = sec[j];
         const vec2& p1 = sec[(j + 1) % sec.size()];
-        area2 += p0.x * p1.y - p1.x * p0.y;
+        area2 += (double)p0.x * p1.y - (double)p1.x * p0.y;
     }
-    if (std::fabs(area2) < 1e-8f)
+    if (!std::isfinite(area2) || std::fabs(area2) < 1e-8)
         return false; // collinear section: no enclosed area to extrude
-    if (area2 < 0.0f)
+    if (area2 < 0.0)
         std::reverse(sec.begin(), sec.end()); // normalize to CCW so winding below holds
 
     const std::vector<vec3> pathPts = DedupeConsecutive(path);
-    if (pathPts.size() < 2)
+    if (pathPts.size() < 2 || pathPts.size() > kMaxPathPoints)
         return false;
     const size_t nPath = pathPts.size();
+    if (nPath * (sec.size() + 1) > kMaxVertices)
+        return false;
 
     std::vector<vec3> tan(nPath);
     for (size_t i = 0; i < nPath; ++i) {
         const vec3 prev = pathPts[i > 0 ? i - 1 : i];
         const vec3 next = pathPts[i + 1 < nPath ? i + 1 : i];
-        tan[i] = glm::normalize(next - prev);
+        vec3 d = next - prev;
+        // Switchback (out-and-back path): prev == next collapses the central
+        // difference and normalize would poison every frame — and therefore
+        // every ring position — with NaN. One-sided fallback is nonzero after
+        // dedupe.
+        if (glm::length(d) <= kWeldEps)
+            d = i + 1 < nPath ? pathPts[i + 1] - pathPts[i] : pathPts[i] - pathPts[i - 1];
+        tan[i] = glm::normalize(d);
     }
 
     // Parallel transport: rotate the previous frame by exactly the rotation

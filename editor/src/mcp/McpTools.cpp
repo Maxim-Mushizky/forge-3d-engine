@@ -2075,17 +2075,19 @@ ToolResult EditorApp::ToolManageEntity(const json& args)
                 mesh = MeshFactory::Lathe(profile, params.value("sectors", 48),
                                           params.value("closed", true));
                 if (!mesh)
-                    return Err("Degenerate lathe profile: need >= 2 distinct [r,y] points, "
-                               "r >= 0, not all on the axis");
+                    return Err("Degenerate or oversized lathe profile: need >= 2 distinct "
+                               "[r,y] points, r >= 0, not all on the axis, <= 4096 points "
+                               "and <= 2M projected vertices");
             } else {
                 std::vector<vec3> path;
                 if (!readVec3s(params.value("path", json()), path))
                     return Err("params.path must be [[x,y,z],...] number triples");
                 mesh = MeshFactory::Sweep(profile, path);
                 if (!mesh)
-                    return Err("Degenerate sweep input: need a closed profile with >= 3 "
-                               "distinct points and nonzero area, path with >= 2 distinct "
-                               "points");
+                    return Err("Degenerate or oversized sweep input: need a closed profile "
+                               "with >= 3 distinct points and nonzero area (<= 4096 points), "
+                               "a path with >= 2 distinct points (<= 16384), and <= 2M "
+                               "projected vertices");
             }
         } else if (primitive == "text") {
             const std::string text = params.value("text", "Forge");

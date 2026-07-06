@@ -43,6 +43,18 @@ bool SamePositionBits(const Vertex& a, const Vertex& b)
     return std::memcmp(&a.position, &b.position, sizeof(vec3)) == 0;
 }
 
+// One NaN anywhere in the output poisons AABBs, raycasts and exports — every
+// build that returns true must be finite throughout.
+bool AllFinite(const MeshData& m)
+{
+    for (const Vertex& v : m.vertices)
+        for (float f : {v.position.x, v.position.y, v.position.z, v.normal.x, v.normal.y,
+                        v.normal.z})
+            if (!std::isfinite(f))
+                return false;
+    return true;
+}
+
 // --- lathe -----------------------------------------------------------------
 
 void TestLatheCylinderProfile()
@@ -163,6 +175,45 @@ void TestLatheRejectsDegenerates()
     CHECK(m.vertices.empty() && m.indices.empty());
 }
 
+void TestLatheSwitchbackProfileStaysFinite()
+{
+    // A turnaround point (prev == next) collapses the central-difference
+    // tangent; the one-sided fallback must keep every normal finite.
+    const std::vector<vec2> profile = {{1.0f, 0.0f}, {2.0f, 1.0f}, {1.0f, 0.0f}};
+    MeshData m;
+    CHECK(BuildLathe(profile, 8, true, m));
+    CHECK(AllFinite(m));
+}
+
+void TestLatheLoopProfileIsWatertightWithClosed()
+{
+    // A profile that returns to its start (revolved ring) closes itself; caps
+    // must be skipped or they stack non-manifold disks on the seam ring.
+    const std::vector<vec2> profile = {
+        {1.0f, 0.0f}, {2.0f, 0.5f}, {1.0f, 1.0f}, {0.5f, 0.5f}, {1.0f, 0.0f}};
+    MeshData m;
+    CHECK(BuildLathe(profile, 8, /*closed=*/true, m));
+    MeshStats s = Stats(m);
+    CHECK(s.watertight);
+    CHECK(s.nonManifoldEdges == 0);
+    CHECK(SignedVolume(m) > 0.0f);
+    CHECK(AllFinite(m));
+}
+
+void TestLatheRejectsOversizedInput()
+{
+    // Point lists come straight from scripts; runaway loops must fail fast
+    // instead of allocating gigabytes on the GL main thread.
+    std::vector<vec2> big;
+    for (int i = 0; i < 5000; ++i)
+        big.push_back({0.5f, (float)i * 0.001f});
+    MeshData m;
+    CHECK(!BuildLathe(big, 8, true, m)); // > 4096 profile points
+    big.resize(2500);
+    CHECK(!BuildLathe(big, 1024, true, m)); // 2500 * 1025 > 2M projected verts
+    CHECK(BuildLathe(big, 48, true, m)); // same profile, sane grid: fine
+}
+
 void TestLatheSectorClamp()
 {
     const std::vector<vec2> profile = {{0.5f, 0.0f}, {0.5f, 1.0f}};
@@ -259,6 +310,32 @@ void TestSweepClosedInputPolygonTolerated()
     CHECK(ApproxEq(SignedVolume(m), 0.2f * 0.2f * 1.0f, 1e-5f));
 }
 
+void TestSweepSwitchbackPathStaysFinite()
+{
+    // Out-and-back path: interior tangents see prev == next. Without the
+    // one-sided fallback the NaN frame poisons every ring POSITION.
+    const std::vector<vec3> path = {{0, 0, 0}, {0, 1, 0}, {0, 0, 0}};
+    MeshData m;
+    CHECK(BuildSweep(SquareSection(0.1f), path, m));
+    CHECK(AllFinite(m));
+}
+
+void TestSweepRejectsOversizedInput()
+{
+    std::vector<vec3> longPath;
+    for (int i = 0; i < 20000; ++i)
+        longPath.push_back({0.0f, (float)i * 0.01f, 0.0f});
+    MeshData m;
+    CHECK(!BuildSweep(SquareSection(0.1f), longPath, m)); // > 16384 path points
+    longPath.resize(16000);
+    std::vector<vec2> bigSec;
+    for (int i = 0; i < 200; ++i) {
+        const float a = 2.0f * 3.14159265f * (float)i / 200.0f;
+        bigSec.push_back({0.1f * std::cos(a), 0.1f * std::sin(a)});
+    }
+    CHECK(!BuildSweep(bigSec, longPath, m)); // 16000 * 201 > 2M projected verts
+}
+
 void TestSweepRejectsDegenerates()
 {
     MeshData m;
@@ -284,12 +361,17 @@ void RunMeshBuildTests()
     TestLatheProfileFidelity();
     TestLatheSeamIsBitExact();
     TestLatheRejectsDegenerates();
+    TestLatheSwitchbackProfileStaysFinite();
+    TestLatheLoopProfileIsWatertightWithClosed();
+    TestLatheRejectsOversizedInput();
     TestLatheSectorClamp();
     TestSweepStraightPathIsPrism();
     TestSweepNormalizesSectionWinding();
     TestSweepBentPathKeepsSectionRigid();
     TestSweepSeamIsBitExact();
     TestSweepClosedInputPolygonTolerated();
+    TestSweepSwitchbackPathStaysFinite();
+    TestSweepRejectsOversizedInput();
     TestSweepRejectsDegenerates();
 }
 
