@@ -386,6 +386,9 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
     vec3 throughput = vec3(1.0);
     bool specularRay = true; // sun disc only visible to camera/mirror rays (NEE covers diffuse)
     bool diffuseBounced = false; // gates roughness regularization (see below)
+    bool walked = false; // path went through an SSS walk: its MIS-weighted
+                         // throughput can exceed 1, so every later NEE pickup
+                         // stays clamped until russian roulette renormalizes
     float envLod = 0.0;
     firstAlbedo = vec3(1.0); // sky default: uniform albedo lets sky pixels filter together
     firstNormal = vec3(0.0);
@@ -472,7 +475,6 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         float lobeR = bounce == 0 ? g_LdLobe : rand(seed);
         vec2 dirR = bounce == 0 ? g_LdDir : vec2(rand(seed), rand(seed));
         bool doDiffuse = false;
-        bool walked = false; // this bounce relocated through an SSS walk
         if (lobeR < metallic) {
             // Rough metal: GGX VNDF sample; weight = G2/G1, tint = albedo
             // (stand-in for conductor Fresnel in this factor-only model).
