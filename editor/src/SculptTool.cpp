@@ -25,8 +25,9 @@ void SculptTool::Enter(Scene& scene, UUID entity)
 
     // Copy-on-write: primitives are shared between entities AND undo snapshots
     // hold the same shared_ptr — sculpting in place would edit siblings/history.
+    // Identity clone: submesh ranges carry over (same index buffer, #80).
     if (e->mesh.use_count() > 1)
-        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
 
     m_Topology = MeshTopology::Build(*e->mesh);
     m_Target = entity;

@@ -62,7 +62,10 @@ public:
     void SetEnvironment(const Environment* env) { m_Environment = env; } // null = procedural background
 
     void BeginScene(const mat4& viewProjection, const vec3& cameraPosition, const DirectionalLight& light);
-    void Submit(const Mesh& mesh, const mat4& transform, const Material& material, bool castShadow = true);
+    // firstIndex/indexCount select a submesh range (#80); indexCount 0 = the
+    // whole mesh. Multi-material meshes submit one call per submesh.
+    void Submit(const Mesh& mesh, const mat4& transform, const Material& material, bool castShadow = true,
+                uint32_t firstIndex = 0, uint32_t indexCount = 0);
     void SubmitLight(const vec3& position, const vec3& color, float intensity, float range);
     // Selection wireframe; call once per highlighted entity (multi-select
     // outlines everything, the primary selection gets a brighter color).
@@ -75,6 +78,8 @@ private:
         mat4 transform;
         Material material;
         bool castShadow;
+        uint32_t firstIndex = 0; // submesh range (#80); indexCount 0 = whole mesh
+        uint32_t indexCount = 0;
     };
 
     AABB SceneBounds() const;

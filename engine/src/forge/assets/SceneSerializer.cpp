@@ -29,6 +29,17 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
         se.emissiveStrength = e.material.emissiveStrength;
         se.transmission = e.material.transmission;
         se.ior = e.material.ior;
+        for (const Material& m : e.extraMaterials) {
+            SavedMaterial sm;
+            sm.albedo = m.albedo;
+            sm.metallic = m.metallic;
+            sm.roughness = m.roughness;
+            sm.emissive = m.emissive;
+            sm.emissiveStrength = m.emissiveStrength;
+            sm.transmission = m.transmission;
+            sm.ior = m.ior;
+            se.extraMaterials.push_back(sm);
+        }
         se.lightEnabled = e.light.enabled;
         se.lightColor = e.light.color;
         se.lightIntensity = e.light.intensity;
@@ -42,6 +53,7 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
                 if (sm.recipe.empty()) {
                     sm.vertices = e.mesh->Vertices();
                     sm.indices = e.mesh->Indices();
+                    sm.submeshes = e.mesh->Submeshes();
                 }
                 out.meshes.push_back(std::move(sm));
             }
@@ -69,7 +81,7 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
                 FORGE_WARN("Scene load: unknown primitive recipe '%s'", sm.recipe.c_str());
             meshes.push_back(std::move(m));
         } else if (!sm.vertices.empty() && !sm.indices.empty()) {
-            meshes.push_back(std::make_shared<Mesh>(sm.vertices, sm.indices));
+            meshes.push_back(std::make_shared<Mesh>(sm.vertices, sm.indices, sm.submeshes));
         } else {
             meshes.push_back(nullptr);
         }
@@ -90,6 +102,17 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         e.material.emissiveStrength = se.emissiveStrength;
         e.material.transmission = se.transmission;
         e.material.ior = se.ior;
+        for (const SavedMaterial& sm : se.extraMaterials) {
+            Material m;
+            m.albedo = sm.albedo;
+            m.metallic = sm.metallic;
+            m.roughness = sm.roughness;
+            m.emissive = sm.emissive;
+            m.emissiveStrength = sm.emissiveStrength;
+            m.transmission = sm.transmission;
+            m.ior = sm.ior;
+            e.extraMaterials.push_back(m);
+        }
         e.light.enabled = se.lightEnabled;
         if (se.lightEnabled) {
             e.light.color = se.lightColor;

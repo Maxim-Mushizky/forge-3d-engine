@@ -14,7 +14,8 @@ namespace forge {
 // EncodeScene/DecodeScene are pure bytes <-> structs and run headless in unit
 // tests; SceneSerializer adapts live Scene/Mesh objects to and from this.
 //
-// File layout (version 1):
+// File layout (version 2 — v2 added submesh ranges + extra material slots, #80;
+// v1 files read unchanged, the new keys just default to empty):
 //   8 bytes  magic "FORGESCN"
 //   u32      version
 //   u32      json length
@@ -29,6 +30,18 @@ struct SavedMesh {
     std::string recipe;
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<Submesh> submeshes; // empty = single-material (whole buffer, slot 0)
+};
+
+// One material slot's factors. Texture maps are not persisted (no source path
+// for glTF-embedded images) — same limitation as the entity's base material.
+struct SavedMaterial {
+    vec3 albedo{0.8f};
+    float metallic = 0.0f, roughness = 0.5f;
+    vec3 emissive{0.0f};
+    float emissiveStrength = 0.0f;
+    float transmission = 0.0f;
+    float ior = 1.5f;
 };
 
 struct SavedEntity {
@@ -46,6 +59,7 @@ struct SavedEntity {
     float emissiveStrength = 0.0f;
     float transmission = 0.0f; // 0 = solid, 1 = clear (water/glass)
     float ior = 1.5f;
+    std::vector<SavedMaterial> extraMaterials; // material slots 1+ (#80); empty pre-v2
 
     bool lightEnabled = false;
     vec3 lightColor{1.0f};
@@ -66,6 +80,6 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene);
 // the current scene untouched.
 std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size);
 
-inline constexpr uint32_t kSceneFormatVersion = 1;
+inline constexpr uint32_t kSceneFormatVersion = 2; // v2: submeshes + material slots (#80)
 
 } // namespace forge

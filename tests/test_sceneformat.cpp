@@ -14,13 +14,14 @@ SavedScene MakeReferenceScene()
 {
     SavedScene s;
 
-    SavedMesh blobMesh; // unique geometry: a single triangle
+    SavedMesh blobMesh; // unique geometry: two triangles split into two material slots
     blobMesh.vertices = {
         {{0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
         {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
         {{0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},
     };
-    blobMesh.indices = {0, 1, 2};
+    blobMesh.indices = {0, 1, 2, 2, 1, 0};
+    blobMesh.submeshes = {{0, 3, 0}, {3, 3, 1}}; // v2 (#80)
     s.meshes.push_back(blobMesh);
 
     SavedMesh recipeMesh;
@@ -47,6 +48,15 @@ SavedScene MakeReferenceScene()
     child.emissiveStrength = 3.5f;
     child.transmission = 0.8f;
     child.ior = 1.33f;
+    SavedMaterial slot1; // material slot 1 for the second submesh (#80)
+    slot1.albedo = {0.9f, 0.1f, 0.2f};
+    slot1.metallic = 1.0f;
+    slot1.roughness = 0.05f;
+    slot1.emissive = {0.0f, 1.0f, 0.0f};
+    slot1.emissiveStrength = 2.0f;
+    slot1.transmission = 0.3f;
+    slot1.ior = 1.9f;
+    child.extraMaterials.push_back(slot1);
     s.entities.push_back(child);
 
     SavedEntity lamp;
@@ -111,6 +121,19 @@ void RunSceneFormatTests()
             CHECK(ApproxEq(child.ior, 1.33f));
             CHECK(!child.lightEnabled);
 
+            // material slot 1 round-trips every factor (#80)
+            CHECK(child.extraMaterials.size() == 1);
+            if (child.extraMaterials.size() == 1) {
+                const SavedMaterial& m1 = child.extraMaterials[0];
+                CHECK(SameVec3(m1.albedo, {0.9f, 0.1f, 0.2f}));
+                CHECK(ApproxEq(m1.metallic, 1.0f));
+                CHECK(ApproxEq(m1.roughness, 0.05f));
+                CHECK(SameVec3(m1.emissive, {0.0f, 1.0f, 0.0f}));
+                CHECK(ApproxEq(m1.emissiveStrength, 2.0f));
+                CHECK(ApproxEq(m1.transmission, 0.3f));
+                CHECK(ApproxEq(m1.ior, 1.9f));
+            }
+
             const SavedEntity& lamp = back->entities[2];
             CHECK(lamp.lightEnabled);
             CHECK(ApproxEq(lamp.lightIntensity, 25.0f));
@@ -121,10 +144,19 @@ void RunSceneFormatTests()
             const SavedMesh& tri = back->meshes[0];
             CHECK(tri.recipe.empty());
             CHECK(tri.vertices.size() == 3);
-            CHECK(tri.indices.size() == 3);
+            CHECK(tri.indices.size() == 6);
             CHECK(std::memcmp(tri.vertices.data(), ref.meshes[0].vertices.data(),
                               3 * sizeof(Vertex)) == 0);
             CHECK(tri.indices == ref.meshes[0].indices);
+
+            // submesh ranges round-trip (#80)
+            CHECK(tri.submeshes.size() == 2);
+            if (tri.submeshes.size() == 2) {
+                CHECK(tri.submeshes[0].firstIndex == 0 && tri.submeshes[0].indexCount == 3 &&
+                      tri.submeshes[0].materialSlot == 0);
+                CHECK(tri.submeshes[1].firstIndex == 3 && tri.submeshes[1].indexCount == 3 &&
+                      tri.submeshes[1].materialSlot == 1);
+            }
 
             // recipe mesh: id preserved, no blob
             CHECK(back->meshes[1].recipe == "cube");
@@ -212,6 +244,96 @@ void RunSceneFormatTests()
             CHECK(back->entities[0].name == "N");
             CHECK(back->entities[0].meshIndex == -1);
             CHECK(SameVec3(back->entities[0].scale, {1.0f, 1.0f, 1.0f})); // default
+            CHECK(back->entities[0].extraMaterials.empty()); // v1 files: single material
+        }
+    }
+
+    // --- v1 binary accepted: pre-#80 files carry no submeshes/slots ------------
+    {
+        SavedScene v1;
+        SavedEntity e;
+        e.id = 3;
+        e.name = "Old";
+        v1.entities.push_back(e);
+        std::vector<uint8_t> bytes = EncodeScene(v1);
+        bytes[8] = 1; // rewrite the binary version field to 1 (json keys unchanged)
+        auto back = DecodeScene(bytes.data(), bytes.size());
+        CHECK(back.has_value());
+        if (back) {
+            CHECK(back->entities.size() == 1);
+            CHECK(back->entities[0].extraMaterials.empty());
+        }
+    }
+
+    // --- hostile/malformed submeshes: bad ranges dropped, file still loads -----
+    {
+        // 3 triangles (9 indices). Valid range kept; out-of-range firstIndex,
+        // zero count, and a non-numeric triple all dropped silently.
+        std::string json =
+            R"({"version":2,"entities":[],"meshes":[{"vertexCount":3,"indexCount":9,"offset":0,)"
+            R"("submeshes":[[0,3,0],[100,3,1],[3,0,2],["x",3,0],[3,6,1]]}]})";
+        std::vector<uint8_t> bytes;
+        const char magic[8] = {'F', 'O', 'R', 'G', 'E', 'S', 'C', 'N'};
+        bytes.insert(bytes.end(), magic, magic + 8);
+        uint32_t version = 2, len = (uint32_t)json.size();
+        bytes.insert(bytes.end(), (uint8_t*)&version, (uint8_t*)&version + 4);
+        bytes.insert(bytes.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
+        bytes.insert(bytes.end(), json.begin(), json.end());
+        bytes.resize(bytes.size() + 3 * sizeof(Vertex) + 9 * sizeof(uint32_t), 0);
+        auto back = DecodeScene(bytes.data(), bytes.size());
+        CHECK(back.has_value());
+        if (back) {
+            CHECK(back->meshes.size() == 1);
+            CHECK(back->meshes[0].submeshes.size() == 2); // [0,3,0] and [3,6,1] survive
+        }
+    }
+
+    // --- SanitizeSubmeshes: the shared validation kernel (#80) -----------------
+    {
+        // valid ranges pass through untouched
+        auto ok = SanitizeSubmeshes({{0, 3, 0}, {3, 6, 1}}, 9);
+        CHECK(ok.size() == 2);
+
+        // zero count, past-the-end start, and range overflowing the buffer drop
+        auto bad = SanitizeSubmeshes({{0, 0, 0}, {10, 3, 0}, {6, 6, 0}, {0, 9, 1}}, 9);
+        CHECK(bad.size() == 1);
+        CHECK(bad[0].firstIndex == 0 && bad[0].indexCount == 9);
+
+        // firstIndex + indexCount wrapping uint32 must not sneak past the check
+        auto wrap = SanitizeSubmeshes({{0xFFFFFFF0u, 0x20u, 0}}, 9);
+        CHECK(wrap.empty());
+
+        // hostile count (more submeshes than triangles) falls back to single-material
+        std::vector<Submesh> many(4, Submesh{0, 3, 0});
+        CHECK(SanitizeSubmeshes(many, 9).empty());
+
+        // exactly one submesh per triangle is legitimate
+        CHECK(SanitizeSubmeshes({{0, 3, 0}, {3, 3, 1}, {6, 3, 2}}, 9).size() == 3);
+
+        // overlapping ranges (total coverage > buffer) fall back to single-material:
+        // per-range checks pass, but drawing/uploading each range would multiply work
+        CHECK(SanitizeSubmeshes({{0, 9, 0}, {0, 9, 1}}, 9).empty());
+        CHECK(SanitizeSubmeshes({{0, 6, 0}, {3, 6, 1}}, 9).empty());
+    }
+
+    // --- submesh triple > 2^32 must be dropped, not truncated into a valid range
+    {
+        std::string json =
+            R"({"version":2,"entities":[],"meshes":[{"vertexCount":3,"indexCount":9,"offset":0,)"
+            R"("submeshes":[[4294967299,3,0],[0,3,0]]}]})"; // 2^32+3 would truncate to firstIndex 3
+        std::vector<uint8_t> bytes;
+        const char magic[8] = {'F', 'O', 'R', 'G', 'E', 'S', 'C', 'N'};
+        bytes.insert(bytes.end(), magic, magic + 8);
+        uint32_t version = 2, len = (uint32_t)json.size();
+        bytes.insert(bytes.end(), (uint8_t*)&version, (uint8_t*)&version + 4);
+        bytes.insert(bytes.end(), (uint8_t*)&len, (uint8_t*)&len + 4);
+        bytes.insert(bytes.end(), json.begin(), json.end());
+        bytes.resize(bytes.size() + 3 * sizeof(Vertex) + 9 * sizeof(uint32_t), 0);
+        auto back = DecodeScene(bytes.data(), bytes.size());
+        CHECK(back.has_value());
+        if (back) {
+            CHECK(back->meshes[0].submeshes.size() == 1);
+            CHECK(back->meshes[0].submeshes[0].firstIndex == 0);
         }
     }
 

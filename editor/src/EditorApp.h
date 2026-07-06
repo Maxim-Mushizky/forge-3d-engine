@@ -205,6 +205,7 @@ private:
     float m_EditExtrudeWorldPerLocal = 1.0f;
     float m_EditSmoothStrength = 0.5f; // edit-mode Laplacian smooth strength (#65)
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
+    int m_InspectorSlot = 0; // material slot shown in the inspector (#80), clamped per entity
     bool m_FirstDockLayout = false;
 
     DirectionalLight m_Sun;

@@ -111,6 +111,8 @@ static json EntityJson(const Scene& scene, const Entity& e)
     if (e.mesh) {
         j["mesh"] = {{"vertices", e.mesh->Vertices().size()},
                      {"triangles", e.mesh->Indices().size() / 3}};
+        if (!e.mesh->Submeshes().empty())
+            j["mesh"]["submeshes"] = e.mesh->Submeshes().size();
         const AABB wb = WorldBoundsOf(scene, e);
         if (wb.Valid())
             j["worldBounds"] = {{"min", Vec3Json(wb.min)},
@@ -119,6 +121,13 @@ static json EntityJson(const Scene& scene, const Entity& e)
                                 {"extents", Vec3Json(wb.max - wb.min)}};
     }
     j["material"] = MaterialJson(e.material);
+    if (!e.extraMaterials.empty()) {
+        j["materialSlots"] = MaterialSlotCount(e);
+        json mats = json::array();
+        for (uint32_t s = 0; s < MaterialSlotCount(e); ++s)
+            mats.push_back(MaterialJson(MaterialForSlot(e, s)));
+        j["materials"] = std::move(mats); // per-slot materials (#80); "material" stays slot 0
+    }
     if (e.light.enabled)
         j["light"] = {{"color", Vec3Json(e.light.color)},
                       {"intensity", e.light.intensity},
@@ -502,11 +511,14 @@ void EditorApp::RegisterMcpTools()
         "manage_material",
         "Set material properties on an entity (any subset): albedo [r,g,b] 0-1, metallic, "
         "roughness, emissive [r,g,b], emissiveStrength, transmission (0=solid 1=glass), ior, "
-        "albedoTexture (image file path; empty string clears). Undoable.",
+        "albedoTexture (image file path; empty string clears). slot selects a material slot "
+        "on multi-material meshes (default 0 = base; imported glTF meshes may have more — "
+        "see materialSlots in get_entity). Undoable.",
         {{"type", "object"},
          {"properties",
           {{"id", {{"type", "string"}}},
            {"name", {{"type", "string"}}},
+           {"slot", {{"type", "integer"}}},
            {"albedo", {{"type", "array"}, {"items", {{"type", "number"}}}}},
            {"metallic", {{"type", "number"}}},
            {"roughness", {{"type", "number"}}},
@@ -639,7 +651,8 @@ void EditorApp::RegisterMcpTools()
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
         "vases/legs/handles instead of sphere-pushing), delete{}, "
-        "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{}, "
+        "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{slot for "
+        "multi-material meshes}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
@@ -1654,9 +1667,10 @@ ToolResult EditorApp::ToolEditElements(const json& args)
 
     if (action == "shade") {
         // COW discipline: undo history shares the mesh pointer, so shading
-        // recomputes normals on a clone and swaps — never in place.
+        // recomputes normals on a clone and swaps — never in place. Identity
+        // clone: submesh ranges carry over (same index buffer, #80).
         const bool smooth = args.value("smooth", true);
-        auto after = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        auto after = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
         if (smooth)
             RecomputeNormalsWelded(*after, MeshTopology::Build(*after));
         else
@@ -1833,9 +1847,10 @@ ToolResult EditorApp::ToolSculpt(const json& args)
 
     // Copy-on-write (same as SculptTool::Enter): primitives are shared between
     // sibling entities AND undo snapshots hold the same shared_ptr — editing
-    // in place would rewrite history.
+    // in place would rewrite history. Identity clone: submesh ranges carry
+    // over (same index buffer, #80).
     if (e->mesh.use_count() > 1)
-        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices());
+        e->mesh = std::make_shared<Mesh>(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes());
 
     const std::vector<Vertex> before = e->mesh->Vertices();
     const MeshTopology topo = MeshTopology::Build(*e->mesh);
@@ -2199,8 +2214,18 @@ ToolResult EditorApp::ToolManageMaterial(const json& args)
     if (!e)
         return Err(error);
 
+    int slot = 0;
+    if (args.contains("slot")) {
+        if (!args["slot"].is_number_integer())
+            return Err("slot must be an integer");
+        slot = args["slot"].get<int>();
+        if (slot < 0 || slot >= (int)MaterialSlotCount(*e))
+            return Err("Slot " + std::to_string(slot) + " out of range: entity has " +
+                       std::to_string(MaterialSlotCount(*e)) + " material slot(s)");
+    }
+
     Entity before = *e;
-    Material& m = e->material;
+    Material& m = MaterialForSlot(*e, (uint32_t)slot);
     bool any = GetVec3(args, "albedo", m.albedo) | GetVec3(args, "emissive", m.emissive);
     auto num = [&](const char* key, float& out) {
         if (args.contains(key) && args[key].is_number()) {
@@ -2614,19 +2639,31 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
                 continue; // targeted call: render the subtree only
             if (!beauty && e.light.enabled)
                 continue; // gizmo spheres read as floating-part false positives
-            Material mat = e.material;
-            if (clay)
-                mat = clayMat;
-            else if (wire)
-                mat.albedo = {0.75f, 0.85f, 1.0f};
-            else if (objectId)
-                mat.albedo = idColors[e.id];
-            if (!beauty) { // diagnostics want opaque geometry, no texture noise
-                mat.transmission = 0.0f;
-                mat.albedoMap = nullptr;
-                mat.metallicRoughnessMap = nullptr;
+            auto styled = [&](const Material& base) {
+                Material mat = base;
+                if (clay)
+                    mat = clayMat;
+                else if (wire)
+                    mat.albedo = {0.75f, 0.85f, 1.0f};
+                else if (objectId)
+                    mat.albedo = idColors[e.id];
+                if (!beauty) { // diagnostics want opaque geometry, no texture noise
+                    mat.transmission = 0.0f;
+                    mat.albedoMap = nullptr;
+                    mat.metallicRoughnessMap = nullptr;
+                }
+                return mat;
+            };
+            // Diagnostic styles are uniform across the mesh, so only beauty needs
+            // per-submesh materials (#80).
+            const auto& subs = e.mesh->Submeshes();
+            if (!beauty || subs.empty()) {
+                m_Renderer.Submit(*e.mesh, world, styled(e.material), !e.light.enabled);
+            } else {
+                for (const Submesh& sm : subs)
+                    m_Renderer.Submit(*e.mesh, world, styled(MaterialForSlot(e, sm.materialSlot)),
+                                      !e.light.enabled, sm.firstIndex, sm.indexCount);
             }
-            m_Renderer.Submit(*e.mesh, world, mat, !e.light.enabled);
         }
         m_Renderer.EndScene(fbo);
         fbo.Unbind();

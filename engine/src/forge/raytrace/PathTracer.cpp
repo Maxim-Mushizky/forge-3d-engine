@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 namespace forge {
 
@@ -96,44 +97,63 @@ void PathTracer::Upload(const Scene& scene)
         if (e.light.enabled)
             continue;
 
-        int matIndex = (int)materials.size();
-        GPUMaterial gm;
-        gm.albedoMetallic = vec4(e.material.albedo, e.material.metallic);
-        gm.roughness = vec4(e.material.roughness, e.material.transmission, e.material.ior, 0);
-        gm.emissive = vec4(e.material.emissive * e.material.emissiveStrength, 0);
-        materials.push_back(gm);
+        // One GPUMaterial per material slot the mesh actually uses (#80):
+        // submesh ranges map to slot materials, whole-buffer meshes to slot 0.
+        std::unordered_map<uint32_t, int> slotToIndex;
+        auto materialIndexForSlot = [&](uint32_t slot) {
+            auto [it, inserted] = slotToIndex.try_emplace(slot, (int)materials.size());
+            if (inserted) {
+                const Material& m = MaterialForSlot(e, slot);
+                GPUMaterial gm;
+                gm.albedoMetallic = vec4(m.albedo, m.metallic);
+                gm.roughness = vec4(m.roughness, m.transmission, m.ior, 0);
+                gm.emissive = vec4(m.emissive * m.emissiveStrength, 0);
+                materials.push_back(gm);
+            }
+            return it->second;
+        };
 
         mat4 world = scene.WorldTransform(e.id);
         mat3 normalMat = mat3(glm::transpose(glm::inverse(world)));
 
         const auto& verts = e.mesh->Vertices();
         const auto& idx = e.mesh->Indices();
-        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
-            BVHTriangle t;
-            t.v0 = vec3(world * vec4(verts[idx[i]].position, 1.0f));
-            t.v1 = vec3(world * vec4(verts[idx[i + 1]].position, 1.0f));
-            t.v2 = vec3(world * vec4(verts[idx[i + 2]].position, 1.0f));
-            // Skip degenerate (zero-area) triangles — a mesh edit can collapse one,
-            // and the shader's normalize(cross(e1,e2)) would yield NaN and render
-            // black (#61). A zero-area tri carries no surface, so drop it.
-            vec3 faceN = glm::cross(t.v1 - t.v0, t.v2 - t.v0);
-            float faceLen = glm::length(faceN);
-            if (faceLen < 1e-12f)
-                continue;
-            faceN /= faceLen; // geometric normal, used as a fallback below
-            // A welded vertex whose adjacent faces cancelled has a ~zero normal;
-            // normalize would give NaN, so fall back to the geometric normal.
-            auto safeNormal = [&](const vec3& n) {
-                vec3 m = normalMat * n;
-                float l = glm::length(m);
-                return l > 1e-8f ? m / l : faceN;
-            };
-            t.n0 = safeNormal(verts[idx[i]].normal);
-            t.n1 = safeNormal(verts[idx[i + 1]].normal);
-            t.n2 = safeNormal(verts[idx[i + 2]].normal);
-            t.material = matIndex;
-            t.centroid = (t.v0 + t.v1 + t.v2) / 3.0f;
-            tris.push_back(t);
+        auto emitRange = [&](size_t first, size_t count, int matIndex) {
+            size_t end = std::min(first + count, idx.size());
+            for (size_t i = first; i + 2 < end; i += 3) {
+                BVHTriangle t;
+                t.v0 = vec3(world * vec4(verts[idx[i]].position, 1.0f));
+                t.v1 = vec3(world * vec4(verts[idx[i + 1]].position, 1.0f));
+                t.v2 = vec3(world * vec4(verts[idx[i + 2]].position, 1.0f));
+                // Skip degenerate (zero-area) triangles — a mesh edit can collapse one,
+                // and the shader's normalize(cross(e1,e2)) would yield NaN and render
+                // black (#61). A zero-area tri carries no surface, so drop it.
+                vec3 faceN = glm::cross(t.v1 - t.v0, t.v2 - t.v0);
+                float faceLen = glm::length(faceN);
+                if (faceLen < 1e-12f)
+                    continue;
+                faceN /= faceLen; // geometric normal, used as a fallback below
+                // A welded vertex whose adjacent faces cancelled has a ~zero normal;
+                // normalize would give NaN, so fall back to the geometric normal.
+                auto safeNormal = [&](const vec3& n) {
+                    vec3 m = normalMat * n;
+                    float l = glm::length(m);
+                    return l > 1e-8f ? m / l : faceN;
+                };
+                t.n0 = safeNormal(verts[idx[i]].normal);
+                t.n1 = safeNormal(verts[idx[i + 1]].normal);
+                t.n2 = safeNormal(verts[idx[i + 2]].normal);
+                t.material = matIndex;
+                t.centroid = (t.v0 + t.v1 + t.v2) / 3.0f;
+                tris.push_back(t);
+            }
+        };
+        const auto& subs = e.mesh->Submeshes();
+        if (subs.empty()) {
+            emitRange(0, idx.size(), materialIndexForSlot(0));
+        } else {
+            for (const Submesh& sm : subs)
+                emitRange(sm.firstIndex, sm.indexCount, materialIndexForSlot(sm.materialSlot));
         }
     }
 

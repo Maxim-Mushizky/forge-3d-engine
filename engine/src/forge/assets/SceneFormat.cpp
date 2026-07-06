@@ -63,6 +63,12 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
             jm["offset"] = (uint64_t)blob.size();
             Append(blob, m.vertices.data(), m.vertices.size() * sizeof(Vertex));
             Append(blob, m.indices.data(), m.indices.size() * sizeof(uint32_t));
+            if (!m.submeshes.empty()) {
+                json subs = json::array();
+                for (const Submesh& s : m.submeshes)
+                    subs.push_back(json::array({s.firstIndex, s.indexCount, s.materialSlot}));
+                jm["submeshes"] = std::move(subs); // [first, count, slot] triples (v2, #80)
+            }
         }
         meshes.push_back(std::move(jm));
     }
@@ -86,6 +92,19 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
         je["emissiveStrength"] = e.emissiveStrength;
         je["transmission"] = e.transmission;
         je["ior"] = e.ior;
+        if (!e.extraMaterials.empty()) {
+            json mats = json::array();
+            for (const SavedMaterial& m : e.extraMaterials) {
+                mats.push_back({{"albedo", Vec3ToJson(m.albedo)},
+                                {"metallic", m.metallic},
+                                {"roughness", m.roughness},
+                                {"emissive", Vec3ToJson(m.emissive)},
+                                {"emissiveStrength", m.emissiveStrength},
+                                {"transmission", m.transmission},
+                                {"ior", m.ior}});
+            }
+            je["extraMaterials"] = std::move(mats); // material slots 1+ (v2, #80)
+        }
         if (e.lightEnabled) {
             je["light"] = {{"color", Vec3ToJson(e.lightColor)},
                            {"intensity", e.lightIntensity},
@@ -166,6 +185,23 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                 if (iCount)
                     std::memcpy(m.indices.data(), blob + offset + vCount * sizeof(Vertex),
                                 iCount * sizeof(uint32_t));
+                if (auto st = jm.find("submeshes"); st != jm.end() && st->is_array()) {
+                    std::vector<Submesh> subs;
+                    for (const json& js : *st) {
+                        if (!js.is_array() || js.size() != 3 || !js[0].is_number_unsigned() ||
+                            !js[1].is_number_unsigned() || !js[2].is_number_unsigned())
+                            continue; // lenient on content: skip malformed triples
+                        // Read wide first: get<uint32_t> would silently truncate a
+                        // >2^32 value into a plausible-looking small range.
+                        uint64_t f = js[0].get<uint64_t>(), c = js[1].get<uint64_t>(), s = js[2].get<uint64_t>();
+                        if (f > UINT32_MAX || c > UINT32_MAX || s > UINT32_MAX)
+                            continue;
+                        subs.push_back({(uint32_t)f, (uint32_t)c, (uint32_t)s});
+                    }
+                    // Ranges that don't fit the index buffer are dropped here
+                    // (and again in the Mesh constructor, defense in depth).
+                    m.submeshes = SanitizeSubmeshes(std::move(subs), m.indices.size());
+                }
             }
             scene.meshes.push_back(std::move(m));
         }
@@ -192,6 +228,21 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
             e.emissiveStrength = GetOr<float>(je, "emissiveStrength", 0.0f);
             e.transmission = GetOr<float>(je, "transmission", 0.0f); // pre-transmission files stay solid
             e.ior = GetOr<float>(je, "ior", 1.5f);
+            if (auto mt = je.find("extraMaterials"); mt != je.end() && mt->is_array()) {
+                for (const json& jm : *mt) {
+                    if (!jm.is_object())
+                        continue; // lenient on content
+                    SavedMaterial m;
+                    m.albedo = JsonToVec3(jm.value("albedo", json()), vec3(0.8f));
+                    m.metallic = GetOr<float>(jm, "metallic", 0.0f);
+                    m.roughness = GetOr<float>(jm, "roughness", 0.5f);
+                    m.emissive = JsonToVec3(jm.value("emissive", json()), vec3(0.0f));
+                    m.emissiveStrength = GetOr<float>(jm, "emissiveStrength", 0.0f);
+                    m.transmission = GetOr<float>(jm, "transmission", 0.0f);
+                    m.ior = GetOr<float>(jm, "ior", 1.5f);
+                    e.extraMaterials.push_back(m);
+                }
+            }
             if (auto lt = je.find("light"); lt != je.end() && lt->is_object()) {
                 e.lightEnabled = true;
                 e.lightColor = JsonToVec3(lt->value("color", json()), vec3(1.0f));
