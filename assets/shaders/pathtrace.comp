@@ -22,9 +22,10 @@ layout(std430, binding = 2) readonly buffer Triangles { vec4 b_Tris[]; };
 layout(std430, binding = 3) readonly buffer Nodes { vec4 b_Nodes[]; };
 // kMatStride vec4 per material: albedo+metallic, (roughness, transmission, ior, -),
 // emissive, (albedo layer, MR layer, -, -) with -1 = untextured,
-// (SSS single-scatter albedo, subsurface mix), (SSS extinction 1/mfp, -).
+// (SSS single-scatter albedo, subsurface mix), (SSS extinction 1/mfp, -),
+// (raw SSS color for the denoiser guide, -).
 // Mirror of GPUMaterial in PathTracer.cpp — the two must change together.
-const int kMatStride = 6;
+const int kMatStride = 7;
 layout(std430, binding = 4) readonly buffer Materials { vec4 b_Mats[]; };
 // 2 vec4 per triangle: (uv0.xy, uv1.xy), (uv2.xy, -, -). Separate from b_Tris
 // so BVH traversal's hot fetches never drag UV bytes through the cache; only
@@ -449,10 +450,11 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         vec3 pos = ro + rd * h.t + gn * 2e-3;
 
         if (bounce == 0) { // denoiser guides: exact first-hit data
-            // SSS pixels blend toward the scatter albedo so the guide still
-            // separates material regions; a black/mismatched guide would make
-            // the à-trous filter smear the soft translucency gradients (#112).
-            firstAlbedo = mix(albedo, mSss.rgb, subsurface);
+            // SSS pixels blend toward the raw subsurface color (not the
+            // remapped albedo, which compresses every bright color to ~1 and
+            // would defeat the edge cut) so the guide still separates material
+            // regions instead of smearing the translucency gradients (#112).
+            firstAlbedo = mix(albedo, b_Mats[h.mat * kMatStride + 6].rgb, subsurface);
             firstNormal = n;
             firstT = h.t;
         }
@@ -470,6 +472,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         float lobeR = bounce == 0 ? g_LdLobe : rand(seed);
         vec2 dirR = bounce == 0 ? g_LdDir : vec2(rand(seed), rand(seed));
         bool doDiffuse = false;
+        bool walked = false; // this bounce relocated through an SSS walk
         if (lobeR < metallic) {
             // Rough metal: GGX VNDF sample; weight = G2/G1, tint = albedo
             // (stand-in for conductor Fresnel in this factor-only model).
@@ -593,7 +596,14 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
                 vec3 tr = exp(-wSigmaT * wt);
                 // Wall hit: pdf = P(flying past the wall); scatter: pdf(t).
                 vec3 pdf = wall ? tr : wSigmaT * tr;
-                throughput *= (wall ? tr : wAlpha * wSigmaT * tr) / max(dot(chPdf, pdf), 1e-12);
+                // The per-step cap bounds the MIS ratio for channels the
+                // selection (throughput*albedo) never draws: a near-black
+                // channel crossing a wall otherwise inflates without bound
+                // (e.g. pure-blue color + red-deepest radius). Same mildly
+                // biased variance-control trade as the firefly clamp.
+                throughput *= min((wall ? tr : wAlpha * wSigmaT * tr) /
+                                      max(dot(chPdf, pdf), 1e-12),
+                                  vec3(1e3));
                 wp += wd * wt;
                 if (wall) {
                     resolveHit(wh);
@@ -604,6 +614,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
                     albedo = vec3(1.0); // the walk already carries the color
                     dirR = vec2(rand(seed), rand(seed)); // entry consumed the LD pair
                     exited = true;
+                    walked = true;
                     break;
                 }
                 if (max(throughput.r, max(throughput.g, throughput.b)) < 1e-6)
@@ -618,8 +629,14 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             vec3 sunL = normalize(-u_SunDir +
                                   (vec3(rand(seed), rand(seed), rand(seed)) - 0.5) * 0.06);
             float ndl = max(dot(n, sunL), 0.0);
-            if (ndl > 0.0 && !occluded(pos, sunL))
-                radiance += throughput * (albedo / PI) * ndl * u_SunColor * u_SunIntensity;
+            if (ndl > 0.0 && !occluded(pos, sunL)) {
+                vec3 c = throughput * (albedo / PI) * ndl * u_SunColor * u_SunIntensity;
+                // Post-walk NEE is the one spot where a divided (MIS-weighted)
+                // throughput meets a light directly — the "never divided"
+                // invariant that keeps plain-diffuse NEE clamp-free doesn't
+                // hold there, so clamp like any indirect pickup.
+                radiance += walked ? clampFirefly(c, 10.0) : c;
+            }
 
             for (int i = 0; i < u_NumPointLights; ++i) {
                 vec3 toLight = u_LightPos[i] - pos;
@@ -628,8 +645,10 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
                 float ndlp = max(dot(n, L), 0.0);
                 float window = clamp(1.0 - pow(dist / max(u_LightRange[i], 0.01), 4.0), 0.0, 1.0);
                 float atten = window * window / (dist * dist + 0.01);
-                if (ndlp > 0.0 && atten > 0.0 && !occludedRange(pos, L, dist - 0.01))
-                    radiance += throughput * (albedo / PI) * ndlp * u_LightColor[i] * atten;
+                if (ndlp > 0.0 && atten > 0.0 && !occludedRange(pos, L, dist - 0.01)) {
+                    vec3 c = throughput * (albedo / PI) * ndlp * u_LightColor[i] * atten;
+                    radiance += walked ? clampFirefly(c, 10.0) : c;
+                }
             }
 
             rd = cosineSampleRn(n, dirR.x, dirR.y);
