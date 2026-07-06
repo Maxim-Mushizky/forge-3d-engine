@@ -13,6 +13,7 @@
 #include <forge/geometry/MeshRemesh.h>
 #include <forge/geometry/MeshStats.h>
 #include <forge/geometry/Placement.h>
+#include <forge/geometry/Silhouette.h>
 #include <forge/geometry/Spatial.h>
 #include <forge/geometry/UvUnwrap.h>
 #include <forge/renderer/Texture2D.h>
@@ -21,6 +22,7 @@
 #include <forge/scene/DropToGround.h>
 
 #include <json.hpp>
+#include <stb_image.h> // reference decode for compare_silhouette (#114)
 
 #include <algorithm>
 #include <cfloat>
@@ -49,12 +51,9 @@ using nlohmann::json;
 
 static json Vec3Json(const vec3& v) { return {v.x, v.y, v.z}; }
 
-// Reads [x,y,z] into out; true when the key is present and well-formed.
-static bool GetVec3(const json& args, const char* key, vec3& out)
+// Reads an [x,y,z] json value into out; true when well-formed.
+static bool Vec3FromJson(const json& a, vec3& out)
 {
-    if (!args.contains(key))
-        return false;
-    const json& a = args[key];
     if (!a.is_array() || a.size() != 3 || !a[0].is_number() || !a[1].is_number() ||
         !a[2].is_number())
         return false;
@@ -71,6 +70,12 @@ static bool GetVec3(const json& args, const char* key, vec3& out)
         return false;
     out = {(float)x, (float)y, (float)z};
     return true;
+}
+
+// Reads [x,y,z] into out; true when the key is present and well-formed.
+static bool GetVec3(const json& args, const char* key, vec3& out)
+{
+    return args.contains(key) && Vec3FromJson(args[key], out);
 }
 
 static json MaterialJson(const Material& m)
@@ -183,6 +188,38 @@ static Entity* FindToolTarget(Scene& scene, const json& args, std::string& error
     return FindToolTargetKeyed(scene, args, "id", "name", error);
 }
 
+// forge.measure's `entity` accepts an id (number or numeric string) or a name.
+// Digit-only strings try the id first, then fall back to a name scan — an
+// entity literally named "42" still resolves.
+static Entity* FindEntityFlexible(Scene& scene, const json& v, std::string& error)
+{
+    std::string text;
+    if (v.is_number_unsigned())
+        text = std::to_string(v.get<uint64_t>());
+    else if (v.is_number_integer())
+        text = std::to_string(v.get<int64_t>());
+    else if (v.is_string())
+        text = v.get<std::string>();
+    else {
+        error = "entity must be an id or a name";
+        return nullptr;
+    }
+    if (!text.empty() &&
+        std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        try {
+            if (Entity* e = scene.Find(std::stoull(text)))
+                return e;
+        } catch (const std::exception&) {
+            // out-of-range digits: fall through to the name scan
+        }
+    }
+    for (Entity& e : scene.Entities())
+        if (e.name == text)
+            return &e;
+    error = "no entity matching \"" + text + "\"";
+    return nullptr;
+}
+
 // Whole-scene framing bounds (#93). A ground plane dominates the raw union
 // and shrinks everything else to dots, so essentially-flat meshes are ignored
 // when anything with volume exists.
@@ -250,6 +287,55 @@ void EditorApp::RegisterMcpTools()
          {"properties", {{"id", {{"type", "string"}}}, {"name", {{"type", "string"}}}}},
          {"additionalProperties", false}},
         [this](const json& args) { return ToolGetMeshStats(args); });
+
+    m_McpProtocol.RegisterTool(
+        "measure",
+        "World-space measurement (#114) — proportions as numbers, not eyeballs. Two "
+        "forms: distance between endpoints a/b (each an [x,y,z] literal or {entity, "
+        "feature} with feature top|bottom|center, landmarks on the subtree's world "
+        "AABB), or extents of one entity (entity/id/name, optional axis x|y|z). Use "
+        "after every build: a cup whose height/diameter ratio is off reads wrong "
+        "long before a render shows it.",
+        {{"type", "object"},
+         {"properties",
+          {{"a", {{"description", "[x,y,z] or {entity, feature: top|bottom|center}"}}},
+           {"b", {{"description", "[x,y,z] or {entity, feature: top|bottom|center}"}}},
+           {"entity", {{"description", "extents form: entity id or name"}}},
+           {"id", {{"type", "string"}}},
+           {"name", {{"type", "string"}}},
+           {"axis",
+            {{"type", "string"},
+             {"enum", {"x", "y", "z"}},
+             {"description", "extents form: report one axis instead of all three"}}}}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolMeasure(args); });
+
+    m_McpProtocol.RegisterTool(
+        "compare_silhouette",
+        "Shape verification against a reference image (#114): software-rasterizes "
+        "the entity subtree (or whole scene) into a binary orthographic silhouette, "
+        "binarizes the reference (alpha matte when present, else Otsu), tight-crops "
+        "and uniformly rescales both, and returns IoU/Dice plus pass vs threshold, "
+        "the silhouette PNG, and a diff PNG (gray = match, green = render only, "
+        "magenta = reference only). IoU >= ~0.9 = matching shape; proportion errors "
+        "show as one-sided green/magenta bands.",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}}},
+           {"name", {{"type", "string"}}},
+           {"view",
+            {{"type", "string"},
+             {"enum", {"front", "back", "left", "right", "top"}},
+             {"description", "orthographic view axis, default front"}}},
+           {"reference",
+            {{"type", "string"}, {"description", "path to the reference image (png/jpg)"}}},
+           {"threshold",
+            {{"type", "number"}, {"description", "pass when IoU >= this, default 0.8"}}},
+           {"size",
+            {{"type", "integer"}, {"description", "mask resolution, 64-1024, default 256"}}}}},
+         {"required", {"reference"}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolCompareSilhouette(args); });
 
     m_McpProtocol.RegisterTool(
         "raycast",
@@ -710,9 +796,11 @@ void EditorApp::RegisterMcpTools()
         "quarter), top_ortho (plan view). Modes: beauty (lit raster), clay (uniform "
         "gray, geometry-only), wireframe, normals (RGB-encoded world normals — "
         "spot inverted faces), object_id (flat unique color per entity + legend — "
-        "name what you see). Frames one entity (id/name, with children) or the "
-        "whole scene. Returns one PNG per view with labels. Use after every build "
-        "step: single-view checks miss floating/interpenetrating parts.",
+        "name what you see), section (#114: clay cut open at a world plane, cut "
+        "faces amber — wall thickness and interior profiles at a glance). Frames "
+        "one entity (id/name, with children) or the whole scene. Returns one PNG "
+        "per view with labels. Use after every build step: single-view checks miss "
+        "floating/interpenetrating parts.",
         {{"type", "object"},
          {"properties",
           {{"preset",
@@ -720,8 +808,14 @@ void EditorApp::RegisterMcpTools()
              {"description", "default 4up"}}},
            {"mode",
             {{"type", "string"},
-             {"enum", {"beauty", "clay", "wireframe", "normals", "object_id"}},
+             {"enum", {"beauty", "clay", "wireframe", "normals", "object_id", "section"}},
              {"description", "default clay"}}},
+           {"plane",
+            {{"type", "object"},
+             {"description",
+              "section mode: cut plane {origin:[x,y,z], normal:[x,y,z]}; geometry on "
+              "the normal's negative side is removed. Default: z=target-center plane, "
+              "normal -z — the cut face points at the presets' front camera"}}},
            {"id", {{"type", "string"}}},
            {"name", {{"type", "string"}}},
            {"size", {{"type", "integer"}, {"description", "px per view, 128-768, default 448"}}}}},
@@ -736,7 +830,9 @@ void EditorApp::RegisterMcpTools()
         "variables for parametric builds that would take dozens of tool calls. "
         "The forge.* functions mirror the other tools and take one table of the "
         "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
-        "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}. "
+        "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}, "
+        "measure{a/b or entity+axis — #114 distances/extents}, compare_silhouette{"
+        "reference, view — returns IoU numbers; the diff images are MCP-only}. "
         "Writes: spawn{} (incl. primitive='lathe' params={profile={{r,y},... bottom->top "
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
@@ -905,6 +1001,195 @@ ToolResult EditorApp::ToolCheckOverlap(const json& args)
         j["distance"] = r.distance;
     }
     return JsonResult(j);
+}
+
+// --- measurement & critique (#114) ------------------------------------------------
+
+bool EditorApp::ResolveMeasurePoint(const json& endpoint, vec3& out, std::string& error)
+{
+    if (Vec3FromJson(endpoint, out))
+        return true;
+    if (!endpoint.is_object()) {
+        error = "expected [x,y,z] or {entity/id/name, feature}";
+        return false;
+    }
+    Entity* e = endpoint.contains("entity")
+                    ? FindEntityFlexible(m_Scene, endpoint["entity"], error)
+                    : FindToolTarget(m_Scene, endpoint, error);
+    if (!e)
+        return false;
+    // Landmarks live on the subtree's world AABB: a group measures as the
+    // whole assembly, a leaf mesh as itself.
+    const AABB wb = SubtreeWorldBounds(e->id, nullptr);
+    if (!wb.Valid()) {
+        error = "entity \"" + e->name + "\" has no mesh in its subtree";
+        return false;
+    }
+    const std::string feature = endpoint.value("feature", "center");
+    const std::optional<vec3> p = AabbLandmark(wb, feature);
+    if (!p) {
+        error = "unknown feature \"" + feature + "\" (top, bottom, or center)";
+        return false;
+    }
+    out = *p;
+    return true;
+}
+
+ToolResult EditorApp::ToolMeasure(const json& args)
+{
+    const bool hasA = args.contains("a"), hasB = args.contains("b");
+    if (hasA != hasB)
+        return Err("Provide both \"a\" and \"b\" for a distance, or entity/id/name for extents");
+
+    if (hasA) {
+        vec3 pa, pb;
+        std::string error;
+        if (!ResolveMeasurePoint(args["a"], pa, error))
+            return Err("a: " + error);
+        if (!ResolveMeasurePoint(args["b"], pb, error))
+            return Err("b: " + error);
+        const vec3 d = pb - pa;
+        return JsonResult(json{{"distance", glm::length(d)},
+                               {"delta", Vec3Json(d)},
+                               {"a", Vec3Json(pa)},
+                               {"b", Vec3Json(pb)}});
+    }
+
+    std::string error;
+    Entity* e = args.contains("entity") ? FindEntityFlexible(m_Scene, args["entity"], error)
+                                        : FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    const AABB wb = SubtreeWorldBounds(e->id, nullptr);
+    if (!wb.Valid())
+        return Err("Entity \"" + e->name + "\" has no mesh in its subtree (no bounds)");
+
+    json j{{"id", std::to_string(e->id)}, {"name", e->name}};
+    if (args.contains("axis")) {
+        const std::string axis = args.value("axis", "");
+        const std::optional<float> extent = AabbAxisExtent(wb, axis);
+        if (!extent)
+            return Err("Unknown axis \"" + axis + "\" (x, y, or z)");
+        const int i = axis == "x" ? 0 : axis == "y" ? 1 : 2;
+        j["axis"] = axis;
+        j["extent"] = *extent;
+        j["min"] = wb.min[i];
+        j["max"] = wb.max[i];
+    } else {
+        j["extents"] = Vec3Json(wb.max - wb.min);
+        j["min"] = Vec3Json(wb.min);
+        j["max"] = Vec3Json(wb.max);
+        j["center"] = Vec3Json((wb.min + wb.max) * 0.5f);
+    }
+    return JsonResult(j);
+}
+
+ToolResult EditorApp::ToolCompareSilhouette(const json& args)
+{
+    const std::string view = args.value("view", "front");
+    if (!args.contains("reference") || !args["reference"].is_string())
+        return Err("Provide \"reference\" (path to the reference image)");
+    const std::string refPath = args["reference"];
+    const double thresholdRaw = args.value("threshold", 0.8);
+    if (!(thresholdRaw >= 0.0 && thresholdRaw <= 1.0))
+        return Err("threshold must be in [0, 1]");
+    const float threshold = (float)thresholdRaw;
+    const int size = std::clamp(args.value("size", 256), 64, 1024);
+
+    // Draw set: the target subtree, or every mesh in the scene. Light-gizmo
+    // spheres are skipped like in render_views — they'd bleed into the outline.
+    std::unordered_set<UUID> subtree;
+    if (args.contains("id") || args.contains("name")) {
+        std::string error;
+        Entity* e = FindToolTarget(m_Scene, args, error);
+        if (!e)
+            return Err(error);
+        for (UUID node : SubtreeOf(e->id))
+            subtree.insert(node);
+    }
+    AABB bounds;
+    std::vector<const Entity*> targets;
+    for (const Entity& e : m_Scene.Entities()) {
+        if (!e.mesh || e.light.enabled)
+            continue;
+        if (!subtree.empty() && !subtree.count(e.id))
+            continue;
+        const AABB b = WorldBoundsOf(m_Scene, e);
+        if (!b.Valid())
+            continue;
+        bounds.Expand(b.min);
+        bounds.Expand(b.max);
+        targets.push_back(&e);
+    }
+    if (!bounds.Valid())
+        return Err("Nothing to compare (no meshes)");
+
+    const std::optional<mat4> viewProj = SilhouetteViewProj(view, bounds);
+    if (!viewProj)
+        return Err("Unknown view \"" + view + "\" (front, back, left, right, or top)");
+
+    // Software rasterizer, not the GL renderer: exact mesh coverage, no
+    // shading/AA noise in a binary mask, and the whole path is unit-tested.
+    SilhouetteMask rendered = MakeMask(size, size);
+    for (const Entity* e : targets)
+        RasterizeSilhouette(e->mesh->Vertices(), e->mesh->Indices(),
+                            *viewProj * m_Scene.WorldTransform(e->id), rendered);
+    if (MaskArea(rendered) == 0)
+        return Err("Rendered silhouette is empty (degenerate geometry?)");
+
+    int refW = 0, refH = 0, refC = 0;
+    stbi_uc* refPixels = stbi_load(refPath.c_str(), &refW, &refH, &refC, 4);
+    if (!refPixels)
+        return Err("Failed to load reference image \"" + refPath +
+                   "\": " + stbi_failure_reason());
+    SilhouetteMask reference = BinarizeImage(refPixels, refW, refH);
+    stbi_image_free(refPixels);
+    if (MaskArea(reference) == 0)
+        return Err("Reference image has no foreground after binarization");
+
+    const SilhouetteMask a = NormalizeMask(rendered, size);
+    const SilhouetteMask b = NormalizeMask(reference, size);
+    const SilhouetteDiff diff = CompareMasks(a, b);
+
+    json j{{"iou", diff.iou},
+           {"dice", diff.dice},
+           {"pass", diff.iou >= threshold},
+           {"threshold", threshold},
+           {"view", view},
+           {"pixels",
+            {{"match", diff.intersection},
+             {"renderOnly", diff.onlyA},
+             {"referenceOnly", diff.onlyB}}}};
+
+    ToolResult result;
+    // Metrics text first: the Lua binding surfaces content[0] only, so
+    // forge.compare_silhouette returns the numbers (images are MCP-only).
+    result.content.push_back({{"type", "text"}, {"text", j.dump(2)}});
+
+    std::vector<uint8_t> silhouetteImg((size_t)size * size * 4);
+    for (size_t i = 0; i < a.pixels.size(); ++i) {
+        const uint8_t v = a.pixels[i] ? 255 : 0;
+        silhouetteImg[i * 4 + 0] = silhouetteImg[i * 4 + 1] = silhouetteImg[i * 4 + 2] = v;
+        silhouetteImg[i * 4 + 3] = 255;
+    }
+    const std::string silB64 = PixelsToPngBase64(silhouetteImg.data(), size, size);
+    if (!silB64.empty()) {
+        result.content.push_back(
+            {{"type", "text"}, {"text", "silhouette (normalized render mask)"}});
+        result.content.push_back(
+            {{"type", "image"}, {"data", silB64}, {"mimeType", "image/png"}});
+    }
+    const std::vector<uint8_t> diffImg = DiffImageRGBA(a, b);
+    const std::string diffB64 =
+        diffImg.empty() ? std::string() : PixelsToPngBase64(diffImg.data(), size, size);
+    if (!diffB64.empty()) {
+        result.content.push_back(
+            {{"type", "text"},
+             {"text", "diff (gray = match, green = render only, magenta = reference only)"}});
+        result.content.push_back(
+            {{"type", "image"}, {"data", diffB64}, {"mimeType", "image/png"}});
+    }
+    return result;
 }
 
 ToolResult EditorApp::ToolQuerySpatial(const json& args)
@@ -2728,8 +3013,9 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
     const std::string mode = args.value("mode", "clay");
     const int size = std::clamp(args.value("size", 448), 128, 768);
     const bool beauty = mode == "beauty", clay = mode == "clay", wire = mode == "wireframe",
-               normals = mode == "normals", objectId = mode == "object_id";
-    if (!(beauty || clay || wire || normals || objectId))
+               normals = mode == "normals", objectId = mode == "object_id",
+               section = mode == "section"; // #114: clay cut open at a plane
+    if (!(beauty || clay || wire || normals || objectId || section))
         return Err("Unknown mode: \"" + mode + "\"");
 
     // A targeted call frames AND renders only that subtree — mixing in the
@@ -2755,6 +3041,23 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
     }
     if (!box.Valid())
         return Err("Nothing to frame (no meshes)");
+
+    // Section cut plane (#114). Default: the z = center plane with normal -z,
+    // which keeps the back half — the cut face points straight at the presets'
+    // front camera, so the default call IS the wall-thickness shot.
+    vec3 planeOrigin = (box.min + box.max) * 0.5f;
+    vec3 planeNormal{0.0f, 0.0f, -1.0f};
+    if (section && args.contains("plane")) {
+        const json& plane = args["plane"];
+        if (!plane.is_object())
+            return Err("plane must be an object {origin:[x,y,z], normal:[x,y,z]}");
+        if (plane.contains("origin") && !GetVec3(plane, "origin", planeOrigin))
+            return Err("plane.origin must be [x,y,z]");
+        if (plane.contains("normal") && !GetVec3(plane, "normal", planeNormal))
+            return Err("plane.normal must be [x,y,z]");
+        if (glm::length(planeNormal) < 1e-6f)
+            return Err("plane.normal must be non-zero");
+    }
 
     const std::vector<ViewSpec> specs = BuildViewSpecs(preset, box);
     if (specs.empty())
@@ -2794,6 +3097,7 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
             app.m_Renderer.SetShadingMode(shading);
             app.m_Renderer.SetEnvironment(app.m_Env.get());
             app.m_Renderer.SetGridEnabled(grid);
+            app.m_Renderer.SetSectionPlane({}, {}, false); // never leak the cut into the viewport
             if (postResized)
                 app.m_DisplayTex = 0;
         }
@@ -2805,9 +3109,11 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
                             : normals ? DebugView::Normals
                             : objectId ? DebugView::Unlit
                                        : DebugView::None);
-    if (beauty || clay)
-        m_Renderer.SetShadingMode(ShadingMode::PBR);
+    if (beauty || clay || section)
+        m_Renderer.SetShadingMode(ShadingMode::PBR); // section needs the PBR path (clip + cap shader)
     m_Renderer.SetEnvironment(beauty ? m_Env.get() : nullptr); // sky only in beauty
+    if (section)
+        m_Renderer.SetSectionPlane(planeOrigin, planeNormal, true);
 
     Material clayMat;
     clayMat.albedo = {0.72f, 0.72f, 0.70f};
@@ -2821,7 +3127,7 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
         m_Renderer.BeginScene(ViewProjFor(spec, 1.0f), spec.eye, m_Sun);
         for (const Entity& e : m_Scene.Entities()) {
             const mat4 world = m_Scene.WorldTransform(e.id);
-            if ((beauty || clay) && e.light.enabled)
+            if ((beauty || clay || section) && e.light.enabled)
                 m_Renderer.SubmitLight(vec3(world[3]), e.light.color, e.light.intensity,
                                        e.light.range);
             if (!e.mesh)
@@ -2832,7 +3138,7 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
                 continue; // gizmo spheres read as floating-part false positives
             auto styled = [&](const Material& base) {
                 Material mat = base;
-                if (clay)
+                if (clay || section)
                     mat = clayMat;
                 else if (wire)
                     mat.albedo = {0.75f, 0.85f, 1.0f};
@@ -2861,7 +3167,7 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
         // Lit modes go through the post stack (tonemap); diagnostic modes are
         // already display-encoded and read straight from the HDR attachment.
         uint32_t tex = fbo.ColorAttachment();
-        if (beauty || clay) {
+        if (beauty || clay || section) {
             tex = m_Post.Process(fbo.ColorAttachment(), (uint32_t)size, (uint32_t)size);
             guard.postResized = true; // m_DisplayTex now names a deleted texture
         }
@@ -2877,6 +3183,10 @@ ToolResult EditorApp::ToolRenderViews(const json& args)
     json info{{"preset", preset}, {"mode", mode}, {"views", views}};
     if (objectId)
         info["legend"] = legend;
+    if (section)
+        info["plane"] = {{"origin", Vec3Json(planeOrigin)},
+                         {"normal", Vec3Json(planeNormal)},
+                         {"note", "amber = cut surface; negative side removed"}};
     result.content.push_back({{"type", "text"}, {"text", info.dump(2)}});
     return result;
 }
@@ -2929,6 +3239,8 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("raycast", call(&EditorApp::ToolRaycast, nullptr));
         add("check_overlap", call(&EditorApp::ToolCheckOverlap, nullptr));
         add("query_spatial", call(&EditorApp::ToolQuerySpatial, nullptr));
+        add("measure", call(&EditorApp::ToolMeasure, nullptr)); // #114
+        add("compare_silhouette", call(&EditorApp::ToolCompareSilhouette, nullptr)); // #114: numbers only
 
         add("spawn", call(&EditorApp::ToolManageEntity, "spawn"));
         add("delete", call(&EditorApp::ToolManageEntity, "delete"));

@@ -26,6 +26,7 @@ add_library(forge STATIC
     src/forge/geometry/MeshStats.cpp
     src/forge/geometry/UvUnwrap.cpp
     src/forge/geometry/Spatial.cpp
+    src/forge/geometry/Silhouette.cpp
     src/forge/geometry/Placement.cpp
     src/forge/raytrace/BVH.cpp
     src/forge/raytrace/PathTracer.cpp)

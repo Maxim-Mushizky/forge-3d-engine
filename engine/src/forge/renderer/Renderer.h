@@ -60,6 +60,15 @@ public:
     void SetGridEnabled(bool enabled) { m_GridEnabled = enabled; } // off for agent views (#93)
     bool GridEnabled() const { return m_GridEnabled; }
     void SetEnvironment(const Environment* env) { m_Environment = env; } // null = procedural background
+    // Cross-section diagnostics (#114): while enabled, geometry on the
+    // plane's negative side is clipped and the PBR pass flat-shades visible
+    // back faces as the cut surface — a raster-only "solid cut", no CSG.
+    // Only the PBR and shadow shaders write gl_ClipDistance, so callers must
+    // pair this with ShadingMode::PBR + DebugView::None (render_views does).
+    // A zero-length normal disables. Wants watertight, consistently wound
+    // meshes; open meshes show background through the cut.
+    void SetSectionPlane(const vec3& origin, const vec3& normal, bool enabled);
+    bool SectionEnabled() const { return m_SectionEnabled; }
 
     void BeginScene(const mat4& viewProjection, const vec3& cameraPosition, const DirectionalLight& light);
     // firstIndex/indexCount select a submesh range (#80); indexCount 0 = the
@@ -106,6 +115,8 @@ private:
 
     ShadingMode m_Mode = ShadingMode::PBR;
     DebugView m_DebugView = DebugView::None;
+    vec4 m_SectionPlane{0.0f, 1.0f, 0.0f, 0.0f}; // world plane: xyz = normal, w = d
+    bool m_SectionEnabled = false;
     mat4 m_ViewProjection{1.0f};
     vec3 m_CameraPosition{0.0f};
     DirectionalLight m_Light;

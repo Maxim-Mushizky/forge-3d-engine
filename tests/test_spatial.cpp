@@ -209,6 +209,29 @@ static void RadiusQuerySemantics()
     CHECK(ApproxEq(DistanceToAABB(boxes[3], vec3(0.0f)), 5.5f)); // first excluded
 }
 
+static void LandmarksAndExtents()
+{
+    // forge.measure's kernel (#114): named AABB landmarks and axis extents.
+    const AABB box = BoxAt({1.0f, 2.0f, 3.0f}, {0.5f, 1.0f, 2.0f});
+
+    const std::optional<vec3> top = AabbLandmark(box, "top");
+    CHECK(top && ApproxEq(top->x, 1.0f) && ApproxEq(top->y, 3.0f) && ApproxEq(top->z, 3.0f));
+    const std::optional<vec3> bottom = AabbLandmark(box, "bottom");
+    CHECK(bottom && ApproxEq(bottom->y, 1.0f));
+    const std::optional<vec3> center = AabbLandmark(box, "center");
+    CHECK(center && ApproxEq(center->x, 1.0f) && ApproxEq(center->y, 2.0f) &&
+          ApproxEq(center->z, 3.0f));
+    CHECK(!AabbLandmark(box, "left").has_value());   // not a landmark
+    CHECK(!AabbLandmark(AABB{}, "center").has_value());
+
+    const std::optional<float> ey = AabbAxisExtent(box, "y");
+    CHECK(ey && ApproxEq(*ey, 2.0f));
+    const std::optional<float> ez = AabbAxisExtent(box, "z");
+    CHECK(ez && ApproxEq(*ez, 4.0f));
+    CHECK(!AabbAxisExtent(box, "w").has_value());
+    CHECK(!AabbAxisExtent(AABB{}, "x").has_value());
+}
+
 void RunSpatialTests()
 {
     TransformRotation();
@@ -218,6 +241,7 @@ void RunSpatialTests()
     OverlapFlatBoxes();
     PointAndBoxDistance();
     RadiusQuerySemantics();
+    LandmarksAndExtents();
     std::printf("[ok] spatial kernel tests done\n");
 }
 

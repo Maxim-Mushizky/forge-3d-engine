@@ -93,4 +93,31 @@ float DistanceBetweenAABB(const AABB& a, const AABB& b)
     return glm::length(gap);
 }
 
+std::optional<vec3> AabbLandmark(const AABB& box, const std::string& feature)
+{
+    if (!box.Valid())
+        return std::nullopt;
+    const vec3 c = (box.min + box.max) * 0.5f;
+    if (feature == "center")
+        return c;
+    if (feature == "top")
+        return vec3(c.x, box.max.y, c.z);
+    if (feature == "bottom")
+        return vec3(c.x, box.min.y, c.z);
+    return std::nullopt;
+}
+
+std::optional<float> AabbAxisExtent(const AABB& box, const std::string& axis)
+{
+    if (!box.Valid())
+        return std::nullopt;
+    if (axis == "x")
+        return box.max.x - box.min.x;
+    if (axis == "y")
+        return box.max.y - box.min.y;
+    if (axis == "z")
+        return box.max.z - box.min.z;
+    return std::nullopt;
+}
+
 } // namespace forge
