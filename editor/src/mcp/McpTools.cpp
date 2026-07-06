@@ -92,6 +92,11 @@ static json MaterialJson(const Material& m)
         j["transmission"] = m.transmission;
         j["ior"] = m.ior;
     }
+    if (m.subsurface > 0.0f) {
+        j["subsurface"] = m.subsurface;
+        j["subsurfaceColor"] = Vec3Json(m.subsurfaceColor);
+        j["subsurfaceRadius"] = Vec3Json(m.subsurfaceRadius);
+    }
     if (m.albedoMap)
         j["hasAlbedoMap"] = true;
     if (m.metallicRoughnessMap)
@@ -609,9 +614,11 @@ void EditorApp::RegisterMcpTools()
         "manage_material",
         "Set material properties on an entity (any subset): albedo [r,g,b] 0-1, metallic, "
         "roughness, emissive [r,g,b], emissiveStrength, transmission (0=solid 1=glass), ior, "
-        "albedoTexture (image file path; empty string clears). slot selects a material slot "
-        "on multi-material meshes (default 0 = base; imported glTF meshes may have more — "
-        "see materialSlots in get_entity). Undoable.",
+        "subsurface (0=opaque 1=full SSS; ray traced only), subsurfaceColor [r,g,b], "
+        "subsurfaceRadius [r,g,b] (scatter depth per channel, world units — red deepest for "
+        "skin/wax), albedoTexture (image file path; empty string clears). slot selects a "
+        "material slot on multi-material meshes (default 0 = base; imported glTF meshes may "
+        "have more — see materialSlots in get_entity). Undoable.",
         {{"type", "object"},
          {"properties",
           {{"id", {{"type", "string"}}},
@@ -624,6 +631,9 @@ void EditorApp::RegisterMcpTools()
            {"emissiveStrength", {{"type", "number"}}},
            {"transmission", {{"type", "number"}}},
            {"ior", {{"type", "number"}}},
+           {"subsurface", {{"type", "number"}}},
+           {"subsurfaceColor", {{"type", "array"}, {"items", {{"type", "number"}}}}},
+           {"subsurfaceRadius", {{"type", "array"}, {"items", {{"type", "number"}}}}},
            {"albedoTexture", {{"type", "string"}}}}}},
         [this](const json& args) { return ToolManageMaterial(args); });
 
@@ -838,7 +848,8 @@ void EditorApp::RegisterMcpTools()
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
         "vases/legs/handles instead of sphere-pushing), delete{}, "
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{slot for "
-        "multi-material meshes}, set_texture{slot='albedo'|'roughness', source=file path "
+        "multi-material meshes; subsurface/subsurfaceColor/subsurfaceRadius = SSS, #112}, "
+        "set_texture{slot='albedo'|'roughness', source=file path "
         "or procedural recipe {kind='checker'|'stripes'|'gradient'|'noise'|'wood', colorA, "
         "colorB, scale, ...} — wood grain, glaze bands; needs UVs (unwrap_uv first)}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
@@ -2622,6 +2633,9 @@ ToolResult EditorApp::ToolManageMaterial(const json& args)
     num("emissiveStrength", m.emissiveStrength);
     num("transmission", m.transmission);
     num("ior", m.ior);
+    num("subsurface", m.subsurface);
+    any = GetVec3(args, "subsurfaceColor", m.subsurfaceColor) | any;
+    any = GetVec3(args, "subsurfaceRadius", m.subsurfaceRadius) | any;
     if (args.contains("albedoTexture") && args["albedoTexture"].is_string()) {
         const std::string path = args["albedoTexture"];
         if (path.empty()) {

@@ -29,7 +29,8 @@ add_library(forge STATIC
     src/forge/geometry/Silhouette.cpp
     src/forge/geometry/Placement.cpp
     src/forge/raytrace/BVH.cpp
-    src/forge/raytrace/PathTracer.cpp)
+    src/forge/raytrace/PathTracer.cpp
+    src/forge/raytrace/Sss.cpp)
 
 target_include_directories(forge PUBLIC src)
 target_include_directories(forge PRIVATE ${tinygltf_SOURCE_DIR} ${tinyobjloader_SOURCE_DIR} vendor)

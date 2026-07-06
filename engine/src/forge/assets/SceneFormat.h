@@ -43,6 +43,9 @@ struct SavedMaterial {
     float emissiveStrength = 0.0f;
     float transmission = 0.0f;
     float ior = 1.5f;
+    float subsurface = 0.0f; // optional keys, still v2 (#112)
+    vec3 subsurfaceColor{0.9f, 0.8f, 0.7f};
+    vec3 subsurfaceRadius{0.1f, 0.05f, 0.03f};
     std::string albedoSource;
     std::string mrSource;
 };
@@ -63,6 +66,9 @@ struct SavedEntity {
     float emissiveStrength = 0.0f;
     float transmission = 0.0f; // 0 = solid, 1 = clear (water/glass)
     float ior = 1.5f;
+    float subsurface = 0.0f; // optional keys, still v2 (#112)
+    vec3 subsurfaceColor{0.9f, 0.8f, 0.7f};
+    vec3 subsurfaceRadius{0.1f, 0.05f, 0.03f};
     std::string albedoSource; // "file:<path>" / "proc:<json>"; empty = none (#113)
     std::string mrSource;
     std::vector<SavedMaterial> extraMaterials; // material slots 1+ (#80); empty pre-v2

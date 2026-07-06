@@ -30,6 +30,9 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
         se.emissiveStrength = e.material.emissiveStrength;
         se.transmission = e.material.transmission;
         se.ior = e.material.ior;
+        se.subsurface = e.material.subsurface;
+        se.subsurfaceColor = e.material.subsurfaceColor;
+        se.subsurfaceRadius = e.material.subsurfaceRadius;
         se.albedoSource = e.material.albedoSource;
         se.mrSource = e.material.mrSource;
         for (const Material& m : e.extraMaterials) {
@@ -41,6 +44,9 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
             sm.emissiveStrength = m.emissiveStrength;
             sm.transmission = m.transmission;
             sm.ior = m.ior;
+            sm.subsurface = m.subsurface;
+            sm.subsurfaceColor = m.subsurfaceColor;
+            sm.subsurfaceRadius = m.subsurfaceRadius;
             sm.albedoSource = m.albedoSource;
             sm.mrSource = m.mrSource;
             se.extraMaterials.push_back(sm);
@@ -124,6 +130,9 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         e.material.emissiveStrength = se.emissiveStrength;
         e.material.transmission = se.transmission;
         e.material.ior = se.ior;
+        e.material.subsurface = se.subsurface;
+        e.material.subsurfaceColor = se.subsurfaceColor;
+        e.material.subsurfaceRadius = se.subsurfaceRadius;
         e.material.albedoSource = se.albedoSource;
         e.material.mrSource = se.mrSource;
         rebuildTextures(e.material);
@@ -136,6 +145,9 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
             m.emissiveStrength = sm.emissiveStrength;
             m.transmission = sm.transmission;
             m.ior = sm.ior;
+            m.subsurface = sm.subsurface;
+            m.subsurfaceColor = sm.subsurfaceColor;
+            m.subsurfaceRadius = sm.subsurfaceRadius;
             m.albedoSource = sm.albedoSource;
             m.mrSource = sm.mrSource;
             rebuildTextures(m);

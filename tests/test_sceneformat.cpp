@@ -48,6 +48,9 @@ SavedScene MakeReferenceScene()
     child.emissiveStrength = 3.5f;
     child.transmission = 0.8f;
     child.ior = 1.33f;
+    child.subsurface = 0.6f; // SSS factors (#112)
+    child.subsurfaceColor = {0.9f, 0.4f, 0.3f};
+    child.subsurfaceRadius = {0.2f, 0.08f, 0.04f};
     child.albedoSource = "proc:{\"kind\":\"wood\",\"seed\":7}"; // texture sources (#113)
     child.mrSource = "file:assets/rough.png";
     SavedMaterial slot1; // material slot 1 for the second submesh (#80)
@@ -58,6 +61,9 @@ SavedScene MakeReferenceScene()
     slot1.emissiveStrength = 2.0f;
     slot1.transmission = 0.3f;
     slot1.ior = 1.9f;
+    slot1.subsurface = 0.25f;
+    slot1.subsurfaceColor = {0.7f, 0.75f, 0.9f};
+    slot1.subsurfaceRadius = {0.05f, 0.05f, 0.15f};
     slot1.albedoSource = "file:assets/checker.bmp";
     child.extraMaterials.push_back(slot1);
     s.entities.push_back(child);
@@ -122,6 +128,9 @@ void RunSceneFormatTests()
             CHECK(ApproxEq(child.emissiveStrength, 3.5f));
             CHECK(ApproxEq(child.transmission, 0.8f));
             CHECK(ApproxEq(child.ior, 1.33f));
+            CHECK(ApproxEq(child.subsurface, 0.6f)); // #112
+            CHECK(SameVec3(child.subsurfaceColor, {0.9f, 0.4f, 0.3f}));
+            CHECK(SameVec3(child.subsurfaceRadius, {0.2f, 0.08f, 0.04f}));
             CHECK(child.albedoSource == "proc:{\"kind\":\"wood\",\"seed\":7}"); // #113
             CHECK(child.mrSource == "file:assets/rough.png");
             CHECK(!child.lightEnabled);
@@ -137,6 +146,9 @@ void RunSceneFormatTests()
                 CHECK(ApproxEq(m1.emissiveStrength, 2.0f));
                 CHECK(ApproxEq(m1.transmission, 0.3f));
                 CHECK(ApproxEq(m1.ior, 1.9f));
+                CHECK(ApproxEq(m1.subsurface, 0.25f)); // #112
+                CHECK(SameVec3(m1.subsurfaceColor, {0.7f, 0.75f, 0.9f}));
+                CHECK(SameVec3(m1.subsurfaceRadius, {0.05f, 0.05f, 0.15f}));
                 CHECK(m1.albedoSource == "file:assets/checker.bmp"); // #113
                 CHECK(m1.mrSource.empty()); // absent key defaults empty (pre-#113 files)
             }
@@ -252,6 +264,7 @@ void RunSceneFormatTests()
             CHECK(back->entities[0].meshIndex == -1);
             CHECK(SameVec3(back->entities[0].scale, {1.0f, 1.0f, 1.0f})); // default
             CHECK(back->entities[0].extraMaterials.empty()); // v1 files: single material
+            CHECK(ApproxEq(back->entities[0].subsurface, 0.0f)); // pre-SSS files stay opaque (#112)
         }
     }
 

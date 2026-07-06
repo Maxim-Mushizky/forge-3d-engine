@@ -28,6 +28,7 @@ add_executable(forge_tests
     test_mcpsculpt.cpp
     test_polyhaven.cpp
     test_silhouette.cpp
+    test_sss.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/polyhaven/PolyHaven.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/Settings.cpp
@@ -42,6 +43,7 @@ add_executable(forge_tests
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/Spatial.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/Silhouette.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/Placement.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/raytrace/Sss.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/renderer/TextureGen.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/MeshBuild.cpp
