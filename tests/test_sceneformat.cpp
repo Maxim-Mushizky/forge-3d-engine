@@ -48,6 +48,8 @@ SavedScene MakeReferenceScene()
     child.emissiveStrength = 3.5f;
     child.transmission = 0.8f;
     child.ior = 1.33f;
+    child.albedoSource = "proc:{\"kind\":\"wood\",\"seed\":7}"; // texture sources (#113)
+    child.mrSource = "file:assets/rough.png";
     SavedMaterial slot1; // material slot 1 for the second submesh (#80)
     slot1.albedo = {0.9f, 0.1f, 0.2f};
     slot1.metallic = 1.0f;
@@ -56,6 +58,7 @@ SavedScene MakeReferenceScene()
     slot1.emissiveStrength = 2.0f;
     slot1.transmission = 0.3f;
     slot1.ior = 1.9f;
+    slot1.albedoSource = "file:assets/checker.bmp";
     child.extraMaterials.push_back(slot1);
     s.entities.push_back(child);
 
@@ -119,6 +122,8 @@ void RunSceneFormatTests()
             CHECK(ApproxEq(child.emissiveStrength, 3.5f));
             CHECK(ApproxEq(child.transmission, 0.8f));
             CHECK(ApproxEq(child.ior, 1.33f));
+            CHECK(child.albedoSource == "proc:{\"kind\":\"wood\",\"seed\":7}"); // #113
+            CHECK(child.mrSource == "file:assets/rough.png");
             CHECK(!child.lightEnabled);
 
             // material slot 1 round-trips every factor (#80)
@@ -132,6 +137,8 @@ void RunSceneFormatTests()
                 CHECK(ApproxEq(m1.emissiveStrength, 2.0f));
                 CHECK(ApproxEq(m1.transmission, 0.3f));
                 CHECK(ApproxEq(m1.ior, 1.9f));
+                CHECK(m1.albedoSource == "file:assets/checker.bmp"); // #113
+                CHECK(m1.mrSource.empty()); // absent key defaults empty (pre-#113 files)
             }
 
             const SavedEntity& lamp = back->entities[2];

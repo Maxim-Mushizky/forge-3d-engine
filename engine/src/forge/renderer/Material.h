@@ -4,6 +4,7 @@
 #include "forge/renderer/Texture2D.h"
 
 #include <memory>
+#include <string>
 
 namespace forge {
 
@@ -17,6 +18,14 @@ struct Material {
     float ior = 1.5f;              // index of refraction; water 1.33, glass 1.5, diamond 2.4
     std::shared_ptr<Texture2D> albedoMap;            // sRGB
     std::shared_ptr<Texture2D> metallicRoughnessMap; // linear; glTF packing: G=roughness, B=metallic
+
+    // Rebuildable descriptors ("file:<path>" / "proc:<recipe json>", #113) for
+    // the maps above. Empty = no source: either no map, or one that can't be
+    // re-derived (glTF-embedded image) — only sourced maps survive a .forge
+    // round-trip. Kept next to the pointers so whole-entity undo snapshots
+    // carry both together.
+    std::string albedoSource;
+    std::string mrSource;
 };
 
 } // namespace forge

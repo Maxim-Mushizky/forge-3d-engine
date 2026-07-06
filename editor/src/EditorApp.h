@@ -156,6 +156,7 @@ private:
     AABB SubtreeWorldBounds(UUID root, std::unordered_set<UUID>* members);
     ToolResult ToolManageEntity(const nlohmann::json& args);
     ToolResult ToolManageMaterial(const nlohmann::json& args);
+    ToolResult ToolSetTexture(const nlohmann::json& args); // #113: procedural/file textures
     ToolResult ToolManageLight(const nlohmann::json& args);
     ToolResult ToolEditMesh(const nlohmann::json& args);
     ToolResult ToolManageScene(const nlohmann::json& args);

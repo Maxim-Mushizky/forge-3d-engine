@@ -9,6 +9,7 @@ namespace forge {
 struct BVHTriangle {
     vec3 v0, v1, v2;
     vec3 n0, n1, n2;
+    vec2 uv0{0.0f}, uv1{0.0f}, uv2{0.0f}; // ride here so Build's reorder keeps them paired (#113)
     int material = 0;
     vec3 centroid;
 };

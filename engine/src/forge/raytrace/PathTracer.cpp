@@ -2,6 +2,7 @@
 
 #include "forge/core/Log.h"
 #include "forge/raytrace/BVH.h"
+#include "forge/renderer/TextureGen.h"
 
 #include <GL/glew.h>
 
@@ -30,6 +31,7 @@ struct GPUMaterial {
     vec4 albedoMetallic; // rgb = albedo, w = metallic
     vec4 roughness;      // x = roughness, y = transmission, z = ior
     vec4 emissive;       // rgb premultiplied by strength
+    vec4 tex;            // x = albedo array layer, y = MR array layer; -1 = none (#113)
 };
 
 static float IntBits(int v)
@@ -40,6 +42,52 @@ static float IntBits(int v)
     return f;
 }
 
+// All layers of a texture array share one size, so every material texture is
+// resampled (from its retained CPU pixels) to this. 1024 covers prop-scale
+// close-ups; bump alongside a mip strategy if 4K file textures start losing
+// visible detail in renders.
+static constexpr uint32_t kTexLayerSize = 1024;
+// Layer cap per array — beyond it materials fall back to factors with a
+// warning rather than failing the upload (GL guarantees >= 256 layers; 64
+// keeps the resample cost bounded).
+static constexpr int kMaxTexLayers = 64;
+
+// Builds an immutable single-mip array from the textures' retained CPU pixels.
+// Empty list -> 1x1 white placeholder so the samplers are always complete.
+// textureLod(..., 0) sampling makes mips useless weight here; AA jitter
+// converges edge aliasing instead.
+static uint32_t BuildTextureArray(const std::vector<const Texture2D*>& textures, bool srgb)
+{
+    const bool dummy = textures.empty();
+    const uint32_t size = dummy ? 1 : kTexLayerSize;
+    const int layers = dummy ? 1 : (int)textures.size();
+
+    uint32_t tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8, (GLsizei)size,
+                   (GLsizei)size, layers);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (dummy) {
+        const uint8_t white[4] = {255, 255, 255, 255};
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, white);
+    } else {
+        for (int i = 0; i < layers; ++i) {
+            const Texture2D* t = textures[i];
+            std::vector<uint8_t> pixels =
+                ResampleRGBA(t->Pixels().data(), t->Width(), t->Height(), size, size);
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, (GLsizei)size, (GLsizei)size, 1,
+                            GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        }
+    }
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+    return tex;
+}
+
 void PathTracer::Init()
 {
     m_Compute = std::make_unique<Shader>(std::string(FORGE_ASSET_DIR) + "/shaders/pathtrace.comp");
@@ -48,6 +96,10 @@ void PathTracer::Init()
     glGenBuffers(1, &m_TriSSBO);
     glGenBuffers(1, &m_NodeSSBO);
     glGenBuffers(1, &m_MatSSBO);
+    glGenBuffers(1, &m_UVSSBO);
+    // Placeholder arrays so Dispatch before the first Upload binds complete textures.
+    m_AlbedoArray = BuildTextureArray({}, /*srgb=*/true);
+    m_MrArray = BuildTextureArray({}, /*srgb=*/false);
 }
 
 void PathTracer::Resize(uint32_t width, uint32_t height)
@@ -88,6 +140,28 @@ void PathTracer::Upload(const Scene& scene)
     std::vector<BVHTriangle> tris;
     std::vector<GPUMaterial> materials;
 
+    // Texture -> array-layer assignment, deduped across the whole scene (#113).
+    // Raw keys are safe: the shared_ptrs on the entities outlive this call.
+    std::unordered_map<const Texture2D*, int> albedoLayers, mrLayers;
+    std::vector<const Texture2D*> albedoList, mrList;
+    bool layerOverflow = false;
+    auto layerFor = [&](const std::shared_ptr<Texture2D>& t,
+                        std::unordered_map<const Texture2D*, int>& map,
+                        std::vector<const Texture2D*>& list) {
+        if (!t || t->Pixels().empty())
+            return -1;
+        auto [it, inserted] = map.try_emplace(t.get(), (int)list.size());
+        if (inserted) {
+            if ((int)list.size() >= kMaxTexLayers) {
+                map.erase(it);
+                layerOverflow = true;
+                return -1; // factor-only fallback, warned once below
+            }
+            list.push_back(t.get());
+        }
+        return it->second;
+    };
+
     for (const Entity& e : scene.Entities()) {
         if (!e.mesh)
             continue;
@@ -108,6 +182,8 @@ void PathTracer::Upload(const Scene& scene)
                 gm.albedoMetallic = vec4(m.albedo, m.metallic);
                 gm.roughness = vec4(m.roughness, m.transmission, m.ior, 0);
                 gm.emissive = vec4(m.emissive * m.emissiveStrength, 0);
+                gm.tex = vec4((float)layerFor(m.albedoMap, albedoLayers, albedoList),
+                              (float)layerFor(m.metallicRoughnessMap, mrLayers, mrList), 0, 0);
                 materials.push_back(gm);
             }
             return it->second;
@@ -143,6 +219,9 @@ void PathTracer::Upload(const Scene& scene)
                 t.n0 = safeNormal(verts[idx[i]].normal);
                 t.n1 = safeNormal(verts[idx[i + 1]].normal);
                 t.n2 = safeNormal(verts[idx[i + 2]].normal);
+                t.uv0 = verts[idx[i]].uv;
+                t.uv1 = verts[idx[i + 1]].uv;
+                t.uv2 = verts[idx[i + 2]].uv;
                 t.material = matIndex;
                 t.centroid = (t.v0 + t.v1 + t.v2) / 3.0f;
                 tris.push_back(t);
@@ -165,6 +244,7 @@ void PathTracer::Upload(const Scene& scene)
         floorMat.albedoMetallic = vec4(0.42f, 0.43f, 0.45f, 0.0f);
         floorMat.roughness = vec4(1.0f, 0.0f, 1.5f, 0); // opaque; ior unread when transmission = 0
         floorMat.emissive = vec4(0.0f);
+        floorMat.tex = vec4(-1.0f, -1.0f, 0, 0); // untextured (0 would alias layer 0)
         materials.push_back(floorMat);
 
         const float kExtent = 300.0f;
@@ -188,10 +268,15 @@ void PathTracer::Upload(const Scene& scene)
     m_NodeCount = bvh.Nodes().size();
 
     std::vector<GPUTriangle> gpuTris(tris.size());
+    // UVs live in their own buffer (2 vec4 per tri), fetched only on accepted
+    // hits — growing GPUTriangle would drag them through BVH traversal fetches.
+    std::vector<vec4> gpuUVs(tris.size() * 2);
     for (size_t i = 0; i < tris.size(); ++i) {
         const BVHTriangle& t = tris[i];
         gpuTris[i] = {vec4(t.v0, IntBits(t.material)), vec4(t.v1, 0), vec4(t.v2, 0),
                       vec4(t.n0, 0), vec4(t.n1, 0), vec4(t.n2, 0)};
+        gpuUVs[i * 2 + 0] = vec4(t.uv0.x, t.uv0.y, t.uv1.x, t.uv1.y);
+        gpuUVs[i * 2 + 1] = vec4(t.uv2.x, t.uv2.y, 0, 0);
     }
     std::vector<GPUNode> gpuNodes(bvh.Nodes().size());
     for (size_t i = 0; i < bvh.Nodes().size(); ++i) {
@@ -207,9 +292,19 @@ void PathTracer::Upload(const Scene& scene)
     upload(m_TriSSBO, gpuTris.data(), gpuTris.size() * sizeof(GPUTriangle));
     upload(m_NodeSSBO, gpuNodes.data(), gpuNodes.size() * sizeof(GPUNode));
     upload(m_MatSSBO, materials.data(), materials.size() * sizeof(GPUMaterial));
+    upload(m_UVSSBO, gpuUVs.data(), gpuUVs.size() * sizeof(vec4));
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-    FORGE_INFO("PathTracer: uploaded %zu triangles, %zu BVH nodes", m_TriCount, m_NodeCount);
+    if (layerOverflow)
+        FORGE_WARN("PathTracer: more than %d unique textures in a channel — extras render "
+                   "factor-only", kMaxTexLayers);
+    glDeleteTextures(1, &m_AlbedoArray);
+    glDeleteTextures(1, &m_MrArray);
+    m_AlbedoArray = BuildTextureArray(albedoList, /*srgb=*/true);
+    m_MrArray = BuildTextureArray(mrList, /*srgb=*/false);
+
+    FORGE_INFO("PathTracer: uploaded %zu triangles, %zu BVH nodes, %zu+%zu texture layers",
+               m_TriCount, m_NodeCount, albedoList.size(), mrList.size());
 }
 
 void PathTracer::Dispatch(const mat4& viewProjection, const vec3& cameraPos, const DirectionalLight& sun, int maxBounces,
@@ -254,12 +349,21 @@ void PathTracer::Dispatch(const mat4& viewProjection, const vec3& cameraPos, con
         glBindTexture(GL_TEXTURE_2D, env->Source());
     }
 
+    m_Compute->SetInt("u_AlbedoTexArr", 1);
+    m_Compute->SetInt("u_MrTexArr", 2);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_AlbedoArray);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, m_MrArray);
+    glActiveTexture(GL_TEXTURE0);
+
     glBindImageTexture(0, m_AccumTex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
     glBindImageTexture(2, m_AlbedoTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glBindImageTexture(3, m_NormalDepthTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_TriSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_NodeSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_MatSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, m_UVSSBO);
 
     GLuint groupsX = (m_Width + 7) / 8, groupsY = (m_Height + 7) / 8;
     glDispatchCompute(groupsX, groupsY, 1);

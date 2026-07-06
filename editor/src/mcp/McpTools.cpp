@@ -16,6 +16,8 @@
 #include <forge/geometry/Spatial.h>
 #include <forge/geometry/UvUnwrap.h>
 #include <forge/renderer/Texture2D.h>
+#include <forge/renderer/TextureGen.h>
+#include <forge/renderer/TextureSource.h>
 #include <forge/scene/DropToGround.h>
 
 #include <json.hpp>
@@ -87,6 +89,14 @@ static json MaterialJson(const Material& m)
     }
     if (m.albedoMap)
         j["hasAlbedoMap"] = true;
+    if (m.metallicRoughnessMap)
+        j["hasMRMap"] = true;
+    // Rebuildable descriptors ("file:..."/"proc:...", #113) so an agent can
+    // read back what it assigned; absent for sourceless (glTF-embedded) maps.
+    if (!m.albedoSource.empty())
+        j["albedoSource"] = m.albedoSource;
+    if (!m.mrSource.empty())
+        j["mrSource"] = m.mrSource;
     return j;
 }
 
@@ -532,6 +542,33 @@ void EditorApp::RegisterMcpTools()
         [this](const json& args) { return ToolManageMaterial(args); });
 
     m_McpProtocol.RegisterTool(
+        "set_texture",
+        "Set or clear a texture on an entity's material (#113). slot: 'albedo' (sRGB color, "
+        "multiplies the albedo factor) or 'roughness' (grayscale baked into the metallic-"
+        "roughness map's G channel; roughness factor multiplies it, metallic passes through). "
+        "source: an image file path string, or a procedural recipe object {kind: 'checker'|"
+        "'stripes'|'gradient'|'noise'|'wood', resolution 16-4096 (default 512), seed, "
+        "colorA/colorB [r,g,b] linear 0-1, scale (checker cells / stripe pairs / noise cells / "
+        "wood rings; wood also accepts ringScale), octaves 1-8 (noise detail), distort (wood "
+        "grain distortion; alias grainNoise), ratio (stripes colorA fraction), axis 'u'|'v' "
+        "(stripes/gradient direction)}. Checker/stripes/noise tile; recipes bake CPU-side, "
+        "persist in .forge saves, and are sampled by BOTH the raster viewport and the path "
+        "tracer. Meaningful results need UVs — run edit_mesh unwrap_uv first on meshes "
+        "without them. clear:true removes the map. materialSlot selects the material slot on "
+        "multi-material meshes (default 0). Undoable.",
+        {{"type", "object"},
+         {"properties",
+          {{"id", {{"type", "string"}}},
+           {"name", {{"type", "string"}}},
+           {"slot", {{"type", "string"}, {"enum", {"albedo", "roughness"}}}},
+           {"materialSlot", {{"type", "integer"}}},
+           {"source",
+            {{"description", "file path string or procedural recipe object"},
+             {"type", {"string", "object"}}}},
+           {"clear", {{"type", "boolean"}}}}}},
+        [this](const json& args) { return ToolSetTexture(args); });
+
+    m_McpProtocol.RegisterTool(
         "manage_light",
         "Lighting. Actions: spawn_point (position/color/intensity/range), set_point (entity "
         "target + enabled/color/intensity/range), set_sun (azimuthDeg/elevationDeg/intensity/"
@@ -661,7 +698,9 @@ void EditorApp::RegisterMcpTools()
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
         "vases/legs/handles instead of sphere-pushing), delete{}, "
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{slot for "
-        "multi-material meshes}, "
+        "multi-material meshes}, set_texture{slot='albedo'|'roughness', source=file path "
+        "or procedural recipe {kind='checker'|'stripes'|'gradient'|'noise'|'wood', colorA, "
+        "colorB, scale, ...} — wood grain, glaze bands; needs UVs (unwrap_uv first)}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
@@ -2255,13 +2294,16 @@ ToolResult EditorApp::ToolManageMaterial(const json& args)
         const std::string path = args["albedoTexture"];
         if (path.empty()) {
             m.albedoMap = nullptr;
+            m.albedoSource.clear();
         } else {
-            auto tex = Texture2D::FromFile(path, /*srgb=*/true, /*flipV=*/false);
+            const std::string source = "file:" + path;
+            auto tex = TextureFromSource(source, TextureChannel::Albedo);
             if (!tex) {
                 *e = before; // no partial edit: earlier fields already changed
                 return Err("Couldn't load texture: " + path);
             }
             m.albedoMap = tex;
+            m.albedoSource = source; // survives .forge round-trips (#113)
         }
         any = true;
     }
@@ -2269,6 +2311,76 @@ ToolResult EditorApp::ToolManageMaterial(const json& args)
         return Err("Provide at least one material property");
     m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
     return JsonResult(EntityJson(m_Scene, *e));
+}
+
+ToolResult EditorApp::ToolSetTexture(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+
+    int slot = 0;
+    if (args.contains("materialSlot")) {
+        if (!args["materialSlot"].is_number_integer())
+            return Err("materialSlot must be an integer");
+        slot = args["materialSlot"].get<int>();
+        if (slot < 0 || slot >= (int)MaterialSlotCount(*e))
+            return Err("materialSlot " + std::to_string(slot) + " out of range: entity has " +
+                       std::to_string(MaterialSlotCount(*e)) + " material slot(s)");
+    }
+
+    const std::string channelName = args.value("slot", "albedo");
+    if (channelName == "normal")
+        return Err("Normal maps aren't supported yet (the mesh format has no tangents) — "
+                   "use albedo or roughness; normal maps are a tracked follow-up");
+    if (channelName != "albedo" && channelName != "roughness")
+        return Err("slot must be \"albedo\" or \"roughness\"");
+    const TextureChannel channel =
+        channelName == "albedo" ? TextureChannel::Albedo : TextureChannel::Roughness;
+
+    // Build the texture BEFORE touching the entity (validate-then-mutate):
+    // every error path must precede the first scene mutation.
+    const bool clear = args.value("clear", false);
+    std::string source;
+    std::shared_ptr<Texture2D> tex;
+    if (!clear) {
+        auto it = args.find("source");
+        if (it == args.end())
+            return Err("Provide source (image file path string, or a procedural recipe object "
+                       "{kind:'checker'|'stripes'|'gradient'|'noise'|'wood', ...}) or clear:true");
+        if (it->is_string()) {
+            source = "file:" + it->get<std::string>();
+        } else if (it->is_object()) {
+            auto recipe = RecipeFromJsonText(it->dump());
+            if (!recipe)
+                return Err("Invalid procedural recipe: kind must be checker/stripes/gradient/"
+                           "noise/wood (other fields clamp to their ranges)");
+            // Canonical form: aliases resolved, values clamped — what persists.
+            source = "proc:" + RecipeToJsonText(*recipe);
+        } else {
+            return Err("source must be a file path string or a recipe object");
+        }
+        tex = TextureFromSource(source, channel);
+        if (!tex)
+            return Err("Couldn't build texture from source: " + source);
+    }
+
+    Entity before = *e;
+    Material& m = MaterialForSlot(*e, (uint32_t)slot);
+    if (channel == TextureChannel::Albedo) {
+        m.albedoMap = tex;
+        m.albedoSource = source;
+    } else {
+        m.metallicRoughnessMap = tex;
+        m.mrSource = source;
+    }
+    m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+
+    json j = EntityJson(m_Scene, *e);
+    if (tex)
+        j["texture"] = {{"width", tex->Width()}, {"height", tex->Height()}, {"slot", channelName}};
+    return JsonResult(std::move(j));
 }
 
 ToolResult EditorApp::ToolManageLight(const json& args)
@@ -2782,6 +2894,7 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("set_parent", call(&EditorApp::ToolManageEntity, "set_parent"));
 
         add("set_material", call(&EditorApp::ToolManageMaterial, nullptr));
+        add("set_texture", call(&EditorApp::ToolSetTexture, nullptr));
         add("spawn_point_light", call(&EditorApp::ToolManageLight, "spawn_point"));
         add("set_point_light", call(&EditorApp::ToolManageLight, "set_point"));
         add("set_sun", call(&EditorApp::ToolManageLight, "set_sun"));
