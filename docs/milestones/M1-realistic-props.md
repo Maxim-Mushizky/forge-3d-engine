@@ -18,7 +18,10 @@ through the MCP surface. Scene: [`assets/scenes/milestone1-props.forge`](../../a
   the vase (#113); glossy porcelain glaze with subsurface scattering on cup
   and vase (#112: random-walk SSS, radius ≈ 0.012 world units at this scale).
 - **Lighting** — `studio_small_09` HDRI environment (#84) + warm sun key.
-- **Camera** — 3/4 product shot, thin-lens DoF, 4096 spp.
+- **Camera** — 3/4 product shot (focal {-0.03, 1.27, 0.02}, distance 1.5,
+  pitch 7°, yaw 31°), thin-lens DoF at aperture 0.0065 / focus 1.5, rendered
+  960×720 at 4096 spp / 8 bounces via `render_image` overrides (the saved
+  scene's rt block keeps editor pinhole defaults).
 
 ## Agent verification (the #114 thesis: numbers over eyeballs)
 
@@ -38,6 +41,16 @@ through the MCP surface. Scene: [`assets/scenes/milestone1-props.forge`](../../a
 | Section view through vase | uniform thin wall, hollow interior, solid base |
 
 ![clay](m1-clay-front.png) ![section](m1-section-vase.png)
+
+## Reproducing on another machine
+
+The scene's texture and HDRI sources are machine-local paths into the Poly
+Haven cache (`%LOCALAPPDATA%/Forge/assets/polyhaven`); a fresh checkout loads
+the geometry/materials but warns and renders untextured under no sky. Re-fetch
+`fine_grained_wood` (2k, diffuse+rough → apply to the five table entities via
+`set_texture`) and `studio_small_09` (2k HDRI, auto-applies) with the
+`download_polyhaven_asset` tool, then re-render with the camera/DoF settings
+above.
 
 ## Honest limits (feed into the next lane)
 
