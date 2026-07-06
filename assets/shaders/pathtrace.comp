@@ -1,7 +1,8 @@
 #version 460 core
 
 // Progressive path tracer: u_SamplesPerPass samples per pixel per dispatch.
-// Materials: lambertian diffuse + rough-metal reflection (factor-only, no textures).
+// Materials: lambertian diffuse + rough-metal reflection; albedo and
+// metallic-roughness maps sample from texture arrays (#113), other factors only.
 // Lights: directional sun (NEE, soft cone), point lights (NEE), emissive surfaces,
 // equirect HDRI environment or procedural gradient sky.
 // Variance control: blurred env mip for non-specular rays, firefly clamp on
@@ -19,8 +20,16 @@ layout(binding = 3, rgba16f) uniform writeonly image2D u_GuideNormalDepth; // xy
 layout(std430, binding = 2) readonly buffer Triangles { vec4 b_Tris[]; };
 // 2 vec4 per node: min(w=leftFirst), max(w=count)
 layout(std430, binding = 3) readonly buffer Nodes { vec4 b_Nodes[]; };
-// 3 vec4 per material: albedo+metallic, (roughness, transmission, ior, -), emissive
+// 4 vec4 per material: albedo+metallic, (roughness, transmission, ior, -), emissive,
+// (albedo layer, MR layer, -, -) with -1 = untextured
 layout(std430, binding = 4) readonly buffer Materials { vec4 b_Mats[]; };
+// 2 vec4 per triangle: (uv0.xy, uv1.xy), (uv2.xy, -, -). Separate from b_Tris
+// so BVH traversal's hot fetches never drag UV bytes through the cache; only
+// accepted hits read this buffer.
+layout(std430, binding = 5) readonly buffer TriUVs { vec4 b_TriUVs[]; };
+
+uniform sampler2DArray u_AlbedoTexArr; // sRGB layers — sampling returns linear
+uniform sampler2DArray u_MrTexArr;     // linear; glTF packing: G = roughness, B = metallic
 
 uniform mat4 u_InvViewProj;
 uniform vec3 u_CamPos;
@@ -380,14 +389,32 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         }
         resolveHit(h);
 
-        vec4 m0 = b_Mats[h.mat * 3 + 0];
-        vec4 m1 = b_Mats[h.mat * 3 + 1];
-        vec3 emissive = b_Mats[h.mat * 3 + 2].rgb;
+        vec4 m0 = b_Mats[h.mat * 4 + 0];
+        vec4 m1 = b_Mats[h.mat * 4 + 1];
+        vec3 emissive = b_Mats[h.mat * 4 + 2].rgb;
         vec3 albedo = m0.rgb;
         float metallic = m0.w;
         float roughness = m1.x;
         float transmission = m1.y;
         float ior = max(m1.z, 1.0);
+
+        // Texture modulation before any lobe logic so metallic/roughness maps
+        // steer lobe selection exactly like their factor counterparts (#113).
+        // textureLod 0: compute shaders have no derivatives for implicit lod,
+        // and the AA jitter converges edge aliasing over accumulation.
+        vec4 mTex = b_Mats[h.mat * 4 + 3];
+        if (mTex.x >= 0.0 || mTex.y >= 0.0) {
+            vec4 uv01 = b_TriUVs[h.tri * 2 + 0];
+            vec2 uv = uv01.xy * (1.0 - h.u - h.v) + uv01.zw * h.u +
+                      b_TriUVs[h.tri * 2 + 1].xy * h.v;
+            if (mTex.x >= 0.0)
+                albedo *= textureLod(u_AlbedoTexArr, vec3(uv, mTex.x), 0.0).rgb;
+            if (mTex.y >= 0.0) {
+                vec4 mr = textureLod(u_MrTexArr, vec3(uv, mTex.y), 0.0);
+                roughness = clamp(roughness * mr.g, 0.0, 1.0);
+                metallic = clamp(metallic * mr.b, 0.0, 1.0);
+            }
+        }
 
         // Path-space regularization (Kaplanyan/Dachsbacher): once the path has
         // gone diffuse, clamp roughness up so glossy chains converge instead of

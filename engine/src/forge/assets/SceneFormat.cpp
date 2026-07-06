@@ -92,16 +92,25 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
         je["emissiveStrength"] = e.emissiveStrength;
         je["transmission"] = e.transmission;
         je["ior"] = e.ior;
+        if (!e.albedoSource.empty())
+            je["albedoSource"] = e.albedoSource; // texture sources (#113, optional keys)
+        if (!e.mrSource.empty())
+            je["mrSource"] = e.mrSource;
         if (!e.extraMaterials.empty()) {
             json mats = json::array();
             for (const SavedMaterial& m : e.extraMaterials) {
-                mats.push_back({{"albedo", Vec3ToJson(m.albedo)},
-                                {"metallic", m.metallic},
-                                {"roughness", m.roughness},
-                                {"emissive", Vec3ToJson(m.emissive)},
-                                {"emissiveStrength", m.emissiveStrength},
-                                {"transmission", m.transmission},
-                                {"ior", m.ior}});
+                json jm = {{"albedo", Vec3ToJson(m.albedo)},
+                           {"metallic", m.metallic},
+                           {"roughness", m.roughness},
+                           {"emissive", Vec3ToJson(m.emissive)},
+                           {"emissiveStrength", m.emissiveStrength},
+                           {"transmission", m.transmission},
+                           {"ior", m.ior}};
+                if (!m.albedoSource.empty())
+                    jm["albedoSource"] = m.albedoSource;
+                if (!m.mrSource.empty())
+                    jm["mrSource"] = m.mrSource;
+                mats.push_back(std::move(jm));
             }
             je["extraMaterials"] = std::move(mats); // material slots 1+ (v2, #80)
         }
@@ -228,6 +237,8 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
             e.emissiveStrength = GetOr<float>(je, "emissiveStrength", 0.0f);
             e.transmission = GetOr<float>(je, "transmission", 0.0f); // pre-transmission files stay solid
             e.ior = GetOr<float>(je, "ior", 1.5f);
+            e.albedoSource = GetOr<std::string>(je, "albedoSource", "");
+            e.mrSource = GetOr<std::string>(je, "mrSource", "");
             if (auto mt = je.find("extraMaterials"); mt != je.end() && mt->is_array()) {
                 for (const json& jm : *mt) {
                     if (!jm.is_object())
@@ -240,6 +251,8 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                     m.emissiveStrength = GetOr<float>(jm, "emissiveStrength", 0.0f);
                     m.transmission = GetOr<float>(jm, "transmission", 0.0f);
                     m.ior = GetOr<float>(jm, "ior", 1.5f);
+                    m.albedoSource = GetOr<std::string>(jm, "albedoSource", "");
+                    m.mrSource = GetOr<std::string>(jm, "mrSource", "");
                     e.extraMaterials.push_back(m);
                 }
             }

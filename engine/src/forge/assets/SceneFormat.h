@@ -33,8 +33,9 @@ struct SavedMesh {
     std::vector<Submesh> submeshes; // empty = single-material (whole buffer, slot 0)
 };
 
-// One material slot's factors. Texture maps are not persisted (no source path
-// for glTF-embedded images) — same limitation as the entity's base material.
+// One material slot's factors plus rebuildable texture sources (#113,
+// "file:<path>" / "proc:<recipe json>"; empty = none). Maps without a source
+// (glTF-embedded images) still don't persist — nothing to re-derive them from.
 struct SavedMaterial {
     vec3 albedo{0.8f};
     float metallic = 0.0f, roughness = 0.5f;
@@ -42,6 +43,8 @@ struct SavedMaterial {
     float emissiveStrength = 0.0f;
     float transmission = 0.0f;
     float ior = 1.5f;
+    std::string albedoSource;
+    std::string mrSource;
 };
 
 struct SavedEntity {
@@ -51,14 +54,17 @@ struct SavedEntity {
     vec3 translation{0.0f}, rotation{0.0f}, scale{1.0f};
     int meshIndex = -1; // into SavedScene::meshes; -1 = meshless node (group)
 
-    // Material factors. Texture maps are not persisted in v1 (no source path
-    // for glTF-embedded images); the loader warns when they were present.
+    // Material factors. Texture sources persist since #113 (optional keys —
+    // still format version 2, older readers just ignore them); sourceless
+    // glTF-embedded maps remain unpersistable.
     vec3 albedo{0.8f};
     float metallic = 0.0f, roughness = 0.5f;
     vec3 emissive{0.0f};
     float emissiveStrength = 0.0f;
     float transmission = 0.0f; // 0 = solid, 1 = clear (water/glass)
     float ior = 1.5f;
+    std::string albedoSource; // "file:<path>" / "proc:<json>"; empty = none (#113)
+    std::string mrSource;
     std::vector<SavedMaterial> extraMaterials; // material slots 1+ (#80); empty pre-v2
 
     bool lightEnabled = false;

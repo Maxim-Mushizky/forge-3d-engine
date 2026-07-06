@@ -1,6 +1,7 @@
 #include "SceneSerializer.h"
 
 #include "forge/core/Log.h"
+#include "forge/renderer/TextureSource.h"
 
 #include <fstream>
 #include <unordered_map>
@@ -29,6 +30,8 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
         se.emissiveStrength = e.material.emissiveStrength;
         se.transmission = e.material.transmission;
         se.ior = e.material.ior;
+        se.albedoSource = e.material.albedoSource;
+        se.mrSource = e.material.mrSource;
         for (const Material& m : e.extraMaterials) {
             SavedMaterial sm;
             sm.albedo = m.albedo;
@@ -38,6 +41,8 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
             sm.emissiveStrength = m.emissiveStrength;
             sm.transmission = m.transmission;
             sm.ior = m.ior;
+            sm.albedoSource = m.albedoSource;
+            sm.mrSource = m.mrSource;
             se.extraMaterials.push_back(sm);
         }
         se.lightEnabled = e.light.enabled;
@@ -87,6 +92,23 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         }
     }
 
+    // Rebuild textures from their persisted sources (#113). A failed rebuild
+    // (moved file, bad recipe) degrades to factors-only with a warning — same
+    // leniency as missing mesh recipes; the source string is kept so a later
+    // re-save doesn't destroy the reference.
+    auto rebuildTextures = [](Material& m) {
+        if (!m.albedoSource.empty()) {
+            m.albedoMap = TextureFromSource(m.albedoSource, TextureChannel::Albedo);
+            if (!m.albedoMap)
+                FORGE_WARN("Scene load: albedo texture source failed: %s", m.albedoSource.c_str());
+        }
+        if (!m.mrSource.empty()) {
+            m.metallicRoughnessMap = TextureFromSource(m.mrSource, TextureChannel::Roughness);
+            if (!m.metallicRoughnessMap)
+                FORGE_WARN("Scene load: roughness texture source failed: %s", m.mrSource.c_str());
+        }
+    };
+
     for (const SavedEntity& se : saved.entities) {
         Entity e;
         e.id = se.id ? se.id : GenerateUUID(); // tolerate hand-edited files without ids
@@ -102,6 +124,9 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         e.material.emissiveStrength = se.emissiveStrength;
         e.material.transmission = se.transmission;
         e.material.ior = se.ior;
+        e.material.albedoSource = se.albedoSource;
+        e.material.mrSource = se.mrSource;
+        rebuildTextures(e.material);
         for (const SavedMaterial& sm : se.extraMaterials) {
             Material m;
             m.albedo = sm.albedo;
@@ -111,6 +136,9 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
             m.emissiveStrength = sm.emissiveStrength;
             m.transmission = sm.transmission;
             m.ior = sm.ior;
+            m.albedoSource = sm.albedoSource;
+            m.mrSource = sm.mrSource;
+            rebuildTextures(m);
             e.extraMaterials.push_back(m);
         }
         e.light.enabled = se.lightEnabled;

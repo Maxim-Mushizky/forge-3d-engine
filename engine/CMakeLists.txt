@@ -3,6 +3,8 @@ add_library(forge STATIC
     src/forge/renderer/Shader.cpp
     src/forge/renderer/Mesh.cpp
     src/forge/renderer/Texture2D.cpp
+    src/forge/renderer/TextureGen.cpp
+    src/forge/renderer/TextureSource.cpp
     src/forge/renderer/Environment.cpp
     src/forge/renderer/Framebuffer.cpp
     src/forge/renderer/PostProcess.cpp

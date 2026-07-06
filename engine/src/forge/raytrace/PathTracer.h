@@ -12,7 +12,9 @@ namespace forge {
 // Progressive GPU path tracer (OpenGL compute). Each Dispatch adds one sample
 // per pixel into an RGBA32F accumulation image and writes a tonemapped RGBA8
 // display image the viewport shows directly.
-// Limitation (v1): material textures are not sampled — factors only.
+// Albedo and metallic-roughness maps are sampled (#113) via two fixed-size
+// texture arrays rebuilt from the textures' retained CPU pixels on Upload;
+// normal maps are not (no tangents yet — follow-up issue).
 class PathTracer {
 public:
     void Init();
@@ -62,6 +64,8 @@ private:
     uint32_t m_AlbedoTex = 0, m_NormalDepthTex = 0; // denoiser guides (first hit)
     uint32_t m_PingTex = 0, m_PongTex = 0;          // à-trous ping-pong
     uint32_t m_TriSSBO = 0, m_NodeSSBO = 0, m_MatSSBO = 0;
+    uint32_t m_UVSSBO = 0;                          // per-triangle UVs, fetched only on hits
+    uint32_t m_AlbedoArray = 0, m_MrArray = 0;      // GL_TEXTURE_2D_ARRAY (sRGB / linear)
     uint32_t m_Width = 0, m_Height = 0;
     int m_SampleCount = 0;
     int m_FrameIndex = 0; // never resets: decorrelates noise across accumulation restarts

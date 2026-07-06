@@ -256,30 +256,33 @@ uint64_t EditorApp::SceneHash() const
             h *= 1099511628211ull;
         }
     };
+    // The path tracer's texture arrays are keyed by map identity (#113); every
+    // set_texture creates a fresh Texture2D and undo/redo swaps the old pointer
+    // back, so mixing the pointers is a sufficient change signal.
+    auto mixMaterial = [&](const Material& m) {
+        mix(&m.albedo, sizeof(m.albedo));
+        mix(&m.metallic, sizeof(m.metallic));
+        mix(&m.roughness, sizeof(m.roughness));
+        mix(&m.emissive, sizeof(m.emissive));
+        mix(&m.emissiveStrength, sizeof(m.emissiveStrength));
+        mix(&m.transmission, sizeof(m.transmission));
+        mix(&m.ior, sizeof(m.ior));
+        const Texture2D* albedoMap = m.albedoMap.get();
+        const Texture2D* mrMap = m.metallicRoughnessMap.get();
+        mix(&albedoMap, sizeof(albedoMap));
+        mix(&mrMap, sizeof(mrMap));
+    };
     for (const Entity& e : m_Scene.Entities()) {
         mix(&e.id, sizeof(e.id));
         mix(&e.parent, sizeof(e.parent)); // group moves must refresh the path tracer
         mix(&e.transform, sizeof(e.transform));
         if (!e.mesh && !e.light.enabled)
             continue;
-        mix(&e.material.albedo, sizeof(e.material.albedo));
-        mix(&e.material.metallic, sizeof(e.material.metallic));
-        mix(&e.material.roughness, sizeof(e.material.roughness));
-        mix(&e.material.emissive, sizeof(e.material.emissive));
-        mix(&e.material.emissiveStrength, sizeof(e.material.emissiveStrength));
-        mix(&e.material.transmission, sizeof(e.material.transmission));
-        mix(&e.material.ior, sizeof(e.material.ior));
+        mixMaterial(e.material);
         // Extra material slots (#80): an edit to any slot must re-upload.
         // (Submesh ranges are immutable per mesh, so the mesh pointer covers them.)
-        for (const Material& m : e.extraMaterials) {
-            mix(&m.albedo, sizeof(m.albedo));
-            mix(&m.metallic, sizeof(m.metallic));
-            mix(&m.roughness, sizeof(m.roughness));
-            mix(&m.emissive, sizeof(m.emissive));
-            mix(&m.emissiveStrength, sizeof(m.emissiveStrength));
-            mix(&m.transmission, sizeof(m.transmission));
-            mix(&m.ior, sizeof(m.ior));
-        }
+        for (const Material& m : e.extraMaterials)
+            mixMaterial(m);
         mix(&e.light, sizeof(e.light));
         const Mesh* mesh = e.mesh.get();
         mix(&mesh, sizeof(mesh));
