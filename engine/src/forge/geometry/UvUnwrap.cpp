@@ -8,12 +8,15 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <memory>
 
 namespace forge {
 
 // xatlas logs through a global printf-style hook; route it into our leveled
 // logging once so chart warnings (degenerate faces, failed parameterizations)
-// land in the editor console instead of raw stdout.
+// land in the editor console instead of raw stdout. May be called from xatlas
+// worker threads — keep the sink thread-safe (stdio locks internally today;
+// the M6 console ring buffer must synchronize).
 static int XatlasPrint(const char* format, ...)
 {
     char buffer[1024];
@@ -38,6 +41,10 @@ std::optional<UnwrapResult> UnwrapUVData(const std::vector<Vertex>& vertices,
 {
     if (vertices.empty() || indices.size() < 3 || indices.size() % 3 != 0)
         return std::nullopt;
+    // Same defense the Mesh constructor applies: hostile or stale ranges
+    // degrade to single-material instead of indexing faceMaterials out of
+    // bounds below.
+    const std::vector<Submesh> sane = SanitizeSubmeshes(submeshes, indices.size());
 
     xatlas::SetPrint(XatlasPrint, /*verbose=*/false);
 
@@ -54,19 +61,21 @@ std::optional<UnwrapResult> UnwrapUVData(const std::vector<Vertex>& vertices,
     // Keep charts from spanning material slots: a chart mixing two slots would
     // force both materials onto one texture region when texturing lands (#113).
     std::vector<uint32_t> faceMaterials;
-    if (!submeshes.empty()) {
+    if (!sane.empty()) {
         faceMaterials.assign(indices.size() / 3, 0);
-        for (const Submesh& s : submeshes)
+        for (const Submesh& s : sane)
             for (uint32_t i = 0; i < s.indexCount; i += 3)
                 faceMaterials[(s.firstIndex + i) / 3] = s.materialSlot;
         decl.faceMaterialData = faceMaterials.data();
     }
 
-    xatlas::Atlas* atlas = xatlas::Create();
-    xatlas::AddMeshError error = xatlas::AddMesh(atlas, decl, 1);
+    // Scope guard: the vector operations below can throw bad_alloc, and the
+    // MCP boundary catches it — a raw pointer would leak the whole atlas.
+    std::unique_ptr<xatlas::Atlas, decltype(&xatlas::Destroy)> atlas(xatlas::Create(),
+                                                                     &xatlas::Destroy);
+    xatlas::AddMeshError error = xatlas::AddMesh(atlas.get(), decl, 1);
     if (error != xatlas::AddMeshError::Success) {
         FORGE_ERROR("UnwrapUV: xatlas AddMesh failed: %s", xatlas::StringForEnum(error));
-        xatlas::Destroy(atlas);
         return std::nullopt;
     }
 
@@ -75,11 +84,10 @@ std::optional<UnwrapResult> UnwrapUVData(const std::vector<Vertex>& vertices,
     packOptions.resolution = options.resolution; // texelsPerUnit 0 -> estimated to fit one page
     packOptions.padding = options.padding;
     packOptions.bruteForce = options.bruteForce;
-    xatlas::Generate(atlas, chartOptions, packOptions);
+    xatlas::Generate(atlas.get(), chartOptions, packOptions);
 
     if (atlas->meshCount != 1 || atlas->width == 0 || atlas->height == 0) {
         FORGE_ERROR("UnwrapUV: no chartable geometry (all faces degenerate?)");
-        xatlas::Destroy(atlas);
         return std::nullopt;
     }
 
@@ -98,12 +106,11 @@ std::optional<UnwrapResult> UnwrapUVData(const std::vector<Vertex>& vertices,
     result.indices.assign(out.indexArray, out.indexArray + out.indexCount);
     // xatlas keeps triangle order, so the input ranges still partition the
     // output index buffer; only the vertex indices inside them changed.
-    result.submeshes = submeshes;
+    result.submeshes = sane;
     result.chartCount = out.chartCount;
     result.atlasWidth = atlas->width;
     result.atlasHeight = atlas->height;
     result.utilization = atlas->atlasCount > 0 ? atlas->utilization[0] : 0.0f;
-    xatlas::Destroy(atlas);
 
     FORGE_INFO("UnwrapUV: %u charts on a %ux%u atlas, %.0f%% utilization", result.chartCount,
                result.atlasWidth, result.atlasHeight, result.utilization * 100.0f);

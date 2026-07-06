@@ -115,6 +115,57 @@ void TestSubmeshRangesSurvive()
         CHECK(idx < result->vertices.size());
 }
 
+void TestMaterialSlotsSplitCharts()
+{
+    // One flat two-quad strip: without material ids xatlas charts the whole
+    // plane as a single region, so a >= 2 chart count with two slots proves
+    // faceMaterialData actually keeps charts inside their material slot.
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    auto quad = [&](float x0, float x1) {
+        uint32_t base = (uint32_t)vertices.size();
+        vertices.push_back({{x0, 0, 0}, {0, 0, 1}, {0, 0}});
+        vertices.push_back({{x1, 0, 0}, {0, 0, 1}, {0, 0}});
+        vertices.push_back({{x1, 1, 0}, {0, 0, 1}, {0, 0}});
+        vertices.push_back({{x0, 1, 0}, {0, 0, 1}, {0, 0}});
+        indices.insert(indices.end(),
+                       {base, base + 1, base + 2, base, base + 2, base + 3});
+    };
+    quad(0.0f, 1.0f);
+    quad(1.0f, 2.0f); // shares the x=1 edge positions -> colocal weld
+
+    auto plain = UnwrapUVData(vertices, indices, {});
+    CHECK(plain.has_value() && plain->chartCount == 1);
+
+    std::vector<Submesh> submeshes = {{0, 6, 0}, {6, 6, 1}};
+    auto split = UnwrapUVData(vertices, indices, submeshes);
+    CHECK(split.has_value());
+    if (!split)
+        return;
+    CHECK(split->chartCount >= 2);
+    // Triangle order must hold with faceMaterialData active too.
+    for (size_t i = 0; i < indices.size(); ++i) {
+        const Vertex& in = vertices[indices[i]];
+        const Vertex& out = split->vertices[split->indices[i]];
+        CHECK(ApproxEq(in.position.x, out.position.x) && ApproxEq(in.position.y, out.position.y) &&
+              ApproxEq(in.position.z, out.position.z));
+    }
+}
+
+void TestHostileSubmeshesDegradeSafely()
+{
+    // Ranges that don't fit the index buffer must sanitize away (single-
+    // material fallback), not index faceMaterials out of bounds.
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    BuildCube(vertices, indices);
+    std::vector<Submesh> hostile = {{100, 30, 0}, {0, 0, 1}};
+    auto result = UnwrapUVData(vertices, indices, hostile);
+    CHECK(result.has_value());
+    if (result)
+        CHECK(result->submeshes.empty());
+}
+
 void TestUnwrapIsRepeatable()
 {
     // Acceptance: unwrapping an already-unwrapped mesh replaces the atlas
@@ -172,6 +223,8 @@ void RunUvUnwrapTests()
     TestCubeUnwrap();
     TestInputCoverageReportsOverlap();
     TestSubmeshRangesSurvive();
+    TestMaterialSlotsSplitCharts();
+    TestHostileSubmeshesDegradeSafely();
     TestUnwrapIsRepeatable();
     TestEmptyAndInvalidInput();
     TestFullyDegenerateMeshFails();

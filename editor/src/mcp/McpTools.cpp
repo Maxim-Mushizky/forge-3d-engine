@@ -563,8 +563,10 @@ void EditorApp::RegisterMcpTools()
         "union|subtract|intersect with otherId/otherName; replaces both operands), remesh "
         "(detail 32-160), mirror (bake X-mirror), extrude_face (pick a face via u/v or "
         "origin/direction ray on the target, push it out by distance), unwrap_uv (generate "
-        "a non-overlapping UV atlas with xatlas; optional resolution 256-4096, default "
-        "1024 — run before assigning image textures). All undoable.",
+        "a non-overlapping UV atlas with xatlas; optional target resolution 256-4096, "
+        "default 1024 — the packed page can differ slightly, actual size/charts/"
+        "utilization returned in result.atlas; run before assigning image textures). "
+        "All undoable.",
         {{"type", "object"},
          {"properties",
           {{"action",
@@ -2376,7 +2378,24 @@ ToolResult EditorApp::ToolEditMesh(const json& args)
     if (action == "unwrap_uv") {
         UnwrapOptions opts;
         opts.resolution = (uint32_t)std::clamp(args.value("resolution", 1024), 256, 4096);
-        return swapMesh(UnwrapUV(*e->mesh, opts), "Unwrap UV (empty or degenerate input?)");
+        // Call the kernel directly (not the UnwrapUV wrapper) so the atlas
+        // stats reach the agent — the packed page can differ from the request.
+        auto unwrapped =
+            UnwrapUVData(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes(), opts);
+        if (!unwrapped)
+            return Err("Unwrap UV failed (empty or degenerate input?)");
+        auto after = std::make_shared<Mesh>(std::move(unwrapped->vertices),
+                                            std::move(unwrapped->indices),
+                                            std::move(unwrapped->submeshes));
+        std::shared_ptr<Mesh> beforeMesh = e->mesh;
+        e->mesh = after;
+        m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, beforeMesh, after));
+        json j = EntityJson(m_Scene, *e);
+        j["atlas"] = {{"width", unwrapped->atlasWidth},
+                      {"height", unwrapped->atlasHeight},
+                      {"charts", unwrapped->chartCount},
+                      {"utilization", unwrapped->utilization}};
+        return JsonResult(j);
     }
 
     if (action == "boolean") {
