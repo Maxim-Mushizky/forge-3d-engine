@@ -24,6 +24,7 @@ void RunSpatialTests();
 void RunPlacementTests();
 void RunMcpElementsTests();
 void RunMcpSculptTests();
+void RunPolyHavenTests();
 } // namespace forge::test
 
 int main()
@@ -51,6 +52,7 @@ int main()
     RunPlacementTests();
     RunMcpElementsTests();
     RunMcpSculptTests();
+    RunPolyHavenTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");
