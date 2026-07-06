@@ -8,6 +8,7 @@ add_library(forge STATIC
     src/forge/renderer/PostProcess.cpp
     src/forge/renderer/Renderer.cpp
     src/forge/scene/Scene.cpp
+    src/forge/assets/MeshBuild.cpp
     src/forge/assets/MeshFactory.cpp
     src/forge/assets/ModelImporter.cpp
     src/forge/assets/StlExporter.cpp
