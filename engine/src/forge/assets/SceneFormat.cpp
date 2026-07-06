@@ -92,6 +92,9 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
         je["emissiveStrength"] = e.emissiveStrength;
         je["transmission"] = e.transmission;
         je["ior"] = e.ior;
+        je["subsurface"] = e.subsurface; // SSS (#112, optional keys)
+        je["subsurfaceColor"] = Vec3ToJson(e.subsurfaceColor);
+        je["subsurfaceRadius"] = Vec3ToJson(e.subsurfaceRadius);
         if (!e.albedoSource.empty())
             je["albedoSource"] = e.albedoSource; // texture sources (#113, optional keys)
         if (!e.mrSource.empty())
@@ -105,7 +108,10 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
                            {"emissive", Vec3ToJson(m.emissive)},
                            {"emissiveStrength", m.emissiveStrength},
                            {"transmission", m.transmission},
-                           {"ior", m.ior}};
+                           {"ior", m.ior},
+                           {"subsurface", m.subsurface},
+                           {"subsurfaceColor", Vec3ToJson(m.subsurfaceColor)},
+                           {"subsurfaceRadius", Vec3ToJson(m.subsurfaceRadius)}};
                 if (!m.albedoSource.empty())
                     jm["albedoSource"] = m.albedoSource;
                 if (!m.mrSource.empty())
@@ -237,6 +243,9 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
             e.emissiveStrength = GetOr<float>(je, "emissiveStrength", 0.0f);
             e.transmission = GetOr<float>(je, "transmission", 0.0f); // pre-transmission files stay solid
             e.ior = GetOr<float>(je, "ior", 1.5f);
+            e.subsurface = GetOr<float>(je, "subsurface", 0.0f); // pre-SSS files stay opaque
+            e.subsurfaceColor = JsonToVec3(je.value("subsurfaceColor", json()), vec3(0.9f, 0.8f, 0.7f));
+            e.subsurfaceRadius = JsonToVec3(je.value("subsurfaceRadius", json()), vec3(0.1f, 0.05f, 0.03f));
             e.albedoSource = GetOr<std::string>(je, "albedoSource", "");
             e.mrSource = GetOr<std::string>(je, "mrSource", "");
             if (auto mt = je.find("extraMaterials"); mt != je.end() && mt->is_array()) {
@@ -251,6 +260,9 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                     m.emissiveStrength = GetOr<float>(jm, "emissiveStrength", 0.0f);
                     m.transmission = GetOr<float>(jm, "transmission", 0.0f);
                     m.ior = GetOr<float>(jm, "ior", 1.5f);
+                    m.subsurface = GetOr<float>(jm, "subsurface", 0.0f);
+                    m.subsurfaceColor = JsonToVec3(jm.value("subsurfaceColor", json()), vec3(0.9f, 0.8f, 0.7f));
+                    m.subsurfaceRadius = JsonToVec3(jm.value("subsurfaceRadius", json()), vec3(0.1f, 0.05f, 0.03f));
                     m.albedoSource = GetOr<std::string>(jm, "albedoSource", "");
                     m.mrSource = GetOr<std::string>(jm, "mrSource", "");
                     e.extraMaterials.push_back(m);

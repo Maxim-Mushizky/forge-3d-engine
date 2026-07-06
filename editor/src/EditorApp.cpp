@@ -269,6 +269,9 @@ uint64_t EditorApp::SceneHash() const
         mix(&m.emissiveStrength, sizeof(m.emissiveStrength));
         mix(&m.transmission, sizeof(m.transmission));
         mix(&m.ior, sizeof(m.ior));
+        mix(&m.subsurface, sizeof(m.subsurface));
+        mix(&m.subsurfaceColor, sizeof(m.subsurfaceColor));
+        mix(&m.subsurfaceRadius, sizeof(m.subsurfaceRadius));
         const Texture2D* albedoMap = m.albedoMap.get();
         const Texture2D* mrMap = m.metallicRoughnessMap.get();
         mix(&albedoMap, sizeof(albedoMap));
@@ -2608,6 +2611,17 @@ void EditorApp::DrawInspector()
         Tip("How much light bends: water 1.33, glass 1.5, diamond 2.4");
         track();
     }
+    ImGui::SliderFloat("Subsurface", &mat.subsurface, 0.0f, 1.0f);
+    Tip("Light scattering under the surface: wax, skin, ceramic (ray traced only)");
+    track();
+    if (mat.subsurface > 0.0f) {
+        ImGui::ColorEdit3("SSS Color", &mat.subsurfaceColor.x);
+        Tip("The color light takes on as it scatters inside");
+        track();
+        ImGui::DragFloat3("SSS Radius", &mat.subsurfaceRadius.x, 0.005f, 0.0f, 2.0f, "%.3f");
+        Tip("Scatter depth per channel (world units); deepest red reads as skin/wax");
+        track();
+    }
 
     // Preset buttons write fields programmatically, so they push their own undo
     // entry instead of relying on track()'s widget edit-state.
@@ -2632,6 +2646,26 @@ void EditorApp::DrawInspector()
     preset("Glass", {1.0f, 1.0f, 1.0f}, 0.0f, 0.0f, 1.0f, 1.5f);
     ImGui::SameLine();
     preset("Frosted", {1.0f, 1.0f, 1.0f}, 0.0f, 0.4f, 1.0f, 1.5f);
+    auto sssPreset = [&](const char* label, vec3 albedo, float roughness, float subsurface,
+                         vec3 sssColor, vec3 sssRadius) {
+        if (ImGui::SmallButton(label)) {
+            Entity before = *e;
+            mat.albedo = albedo;
+            mat.metallic = 0.0f;
+            mat.roughness = roughness;
+            mat.transmission = 0.0f;
+            mat.subsurface = subsurface;
+            mat.subsurfaceColor = sssColor;
+            mat.subsurfaceRadius = sssRadius;
+            m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+        }
+    };
+    ImGui::SameLine();
+    sssPreset("Wax", {0.93f, 0.90f, 0.85f}, 0.35f, 1.0f, {0.93f, 0.87f, 0.75f},
+              {0.15f, 0.12f, 0.08f});
+    ImGui::SameLine();
+    sssPreset("Skin", {0.85f, 0.65f, 0.55f}, 0.45f, 0.85f, {0.88f, 0.60f, 0.45f},
+              {0.12f, 0.045f, 0.02f});
 
     if (e->light.enabled) {
         sepText("Point Light");

@@ -16,6 +16,10 @@ struct Material {
     float emissiveStrength = 0.0f; // radiance multiplier; >0 glows (and emits light in RT)
     float transmission = 0.0f;     // 0 = solid, 1 = clear (water/glass); dielectric only
     float ior = 1.5f;              // index of refraction; water 1.33, glass 1.5, diamond 2.4
+    float subsurface = 0.0f;       // diffuse->SSS mix; ray traced only (#112)
+    vec3 subsurfaceColor{0.9f, 0.8f, 0.7f};    // multi-scatter surface color (warm wax)
+    vec3 subsurfaceRadius{0.1f, 0.05f, 0.03f}; // mean free path per channel, world units;
+                                               // red deepest = skin/wax-like falloff
     std::shared_ptr<Texture2D> albedoMap;            // sRGB
     std::shared_ptr<Texture2D> metallicRoughnessMap; // linear; glTF packing: G=roughness, B=metallic
 

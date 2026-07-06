@@ -20,8 +20,11 @@ layout(binding = 3, rgba16f) uniform writeonly image2D u_GuideNormalDepth; // xy
 layout(std430, binding = 2) readonly buffer Triangles { vec4 b_Tris[]; };
 // 2 vec4 per node: min(w=leftFirst), max(w=count)
 layout(std430, binding = 3) readonly buffer Nodes { vec4 b_Nodes[]; };
-// 4 vec4 per material: albedo+metallic, (roughness, transmission, ior, -), emissive,
-// (albedo layer, MR layer, -, -) with -1 = untextured
+// kMatStride vec4 per material: albedo+metallic, (roughness, transmission, ior, -),
+// emissive, (albedo layer, MR layer, -, -) with -1 = untextured,
+// (SSS single-scatter albedo, subsurface mix), (SSS extinction 1/mfp, -).
+// Mirror of GPUMaterial in PathTracer.cpp — the two must change together.
+const int kMatStride = 6;
 layout(std430, binding = 4) readonly buffer Materials { vec4 b_Mats[]; };
 // 2 vec4 per triangle: (uv0.xy, uv1.xy), (uv2.xy, -, -). Separate from b_Tris
 // so BVH traversal's hot fetches never drag UV bytes through the cache; only
@@ -107,6 +110,14 @@ vec3 cosineSample(vec3 n, inout uint seed)
 {
     float r1 = rand(seed), r2v = rand(seed);
     return cosineSampleRn(n, r1, r2v);
+}
+
+vec3 uniformSphereSample(inout uint seed)
+{
+    float z = 1.0 - 2.0 * rand(seed);
+    float phi = 6.28318530718 * rand(seed);
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    return vec3(r * cos(phi), r * sin(phi), z);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,20 +400,22 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         }
         resolveHit(h);
 
-        vec4 m0 = b_Mats[h.mat * 4 + 0];
-        vec4 m1 = b_Mats[h.mat * 4 + 1];
-        vec3 emissive = b_Mats[h.mat * 4 + 2].rgb;
+        vec4 m0 = b_Mats[h.mat * kMatStride + 0];
+        vec4 m1 = b_Mats[h.mat * kMatStride + 1];
+        vec3 emissive = b_Mats[h.mat * kMatStride + 2].rgb;
+        vec4 mSss = b_Mats[h.mat * kMatStride + 4]; // rgb = single-scatter albedo, w = mix
         vec3 albedo = m0.rgb;
         float metallic = m0.w;
         float roughness = m1.x;
         float transmission = m1.y;
         float ior = max(m1.z, 1.0);
+        float subsurface = mSss.w;
 
         // Texture modulation before any lobe logic so metallic/roughness maps
         // steer lobe selection exactly like their factor counterparts (#113).
         // textureLod 0: compute shaders have no derivatives for implicit lod,
         // and the AA jitter converges edge aliasing over accumulation.
-        vec4 mTex = b_Mats[h.mat * 4 + 3];
+        vec4 mTex = b_Mats[h.mat * kMatStride + 3];
         if (mTex.x >= 0.0 || mTex.y >= 0.0) {
             vec4 uv01 = b_TriUVs[h.tri * 2 + 0];
             vec2 uv = uv01.xy * (1.0 - h.u - h.v) + uv01.zw * h.u +
@@ -436,7 +449,10 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
         vec3 pos = ro + rd * h.t + gn * 2e-3;
 
         if (bounce == 0) { // denoiser guides: exact first-hit data
-            firstAlbedo = albedo;
+            // SSS pixels blend toward the scatter albedo so the guide still
+            // separates material regions; a black/mismatched guide would make
+            // the à-trous filter smear the soft translucency gradients (#112).
+            firstAlbedo = mix(albedo, mSss.rgb, subsurface);
             firstNormal = n;
             firstT = h.t;
         }
@@ -531,6 +547,72 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed,
             doDiffuse = true;
         }
 
+        if (doDiffuse && subsurface > 0.0 && rand(seed) < subsurface) {
+            // Subsurface random walk (#112; Chiang et al. 2016, Cycles-style):
+            // enter through the surface, take exponentially-distributed steps
+            // through a homogeneous medium (extinction = 1/mfp, single-scatter
+            // albedo from the van de Hulst inversion, both packed CPU-side in
+            // Sss.cpp), exit as a white Lambertian at the first wall the walk
+            // reaches — the accumulated step weights ARE the subsurface color.
+            // Picked with probability `subsurface` inside the diffuse budget,
+            // so pick probability and mix weight cancel like the other lobes.
+            // Any surface bounds the walk (no object id in the hit payload):
+            // interpenetrating meshes exit slightly early — accepted for props.
+            vec3 wAlpha = mSss.rgb;
+            vec3 wSigmaT = b_Mats[h.mat * kMatStride + 5].rgb;
+            // Diffuse-transmission entry: cosine sample around the inward
+            // normal, rejected if it fails to enter the geometric surface.
+            // Origin nudged to the far side like the refraction branch.
+            vec3 wd = cosineSampleRn(-n, dirR.x, dirR.y);
+            if (dot(wd, gn) >= 0.0)
+                break;
+            vec3 wp = pos - gn * 4e-3;
+            bool exited = false;
+            for (int wstep = 0; wstep < 64; ++wstep) { // cap biases only deep
+                                                       // high-albedo walks dark
+                // One-sample RGB MIS: pick the flight channel by the current
+                // throughput*albedo share, divide by the balance-heuristic
+                // mixture pdf below. Extinct channels stop drawing samples
+                // (red keeps walking through skin after blue died).
+                vec3 cw = abs(throughput * wAlpha);
+                float cwSum = cw.r + cw.g + cw.b;
+                vec3 chPdf = cwSum > 0.0 ? cw / cwSum : vec3(1.0 / 3.0);
+                float cr = rand(seed);
+                float sigma = cr < chPdf.r
+                                  ? wSigmaT.r
+                                  : (cr < chPdf.r + chPdf.g ? wSigmaT.g : wSigmaT.b);
+                float wt = -log(max(1.0 - rand(seed), 1e-7)) / sigma;
+
+                Hit wh;
+                wh.t = 1e30;
+                if (!traverse(wp, wd, wh))
+                    break; // open mesh: the walk escaped through a hole
+                bool wall = wh.t < wt;
+                if (wall)
+                    wt = wh.t;
+                vec3 tr = exp(-wSigmaT * wt);
+                // Wall hit: pdf = P(flying past the wall); scatter: pdf(t).
+                vec3 pdf = wall ? tr : wSigmaT * tr;
+                throughput *= (wall ? tr : wAlpha * wSigmaT * tr) / max(dot(chPdf, pdf), 1e-12);
+                wp += wd * wt;
+                if (wall) {
+                    resolveHit(wh);
+                    // The exit normal faces along the walk: outward through the wall.
+                    gn = dot(wh.gn, wd) > 0.0 ? wh.gn : -wh.gn;
+                    n = dot(wh.n, gn) < 0.0 ? -wh.n : wh.n;
+                    pos = wp + gn * 2e-3;
+                    albedo = vec3(1.0); // the walk already carries the color
+                    dirR = vec2(rand(seed), rand(seed)); // entry consumed the LD pair
+                    exited = true;
+                    break;
+                }
+                if (max(throughput.r, max(throughput.g, throughput.b)) < 1e-6)
+                    break; // extinct
+                wd = uniformSphereSample(seed); // isotropic phase
+            }
+            if (!exited)
+                break; // lost walks terminate the path (matches Cycles)
+        }
         if (doDiffuse) {
             // Diffuse: next-event estimation toward the sun (soft cone) and point lights.
             vec3 sunL = normalize(-u_SunDir +

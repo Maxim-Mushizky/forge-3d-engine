@@ -2,6 +2,7 @@
 
 #include "forge/core/Log.h"
 #include "forge/raytrace/BVH.h"
+#include "forge/raytrace/Sss.h"
 #include "forge/renderer/TextureGen.h"
 
 #include <GL/glew.h>
@@ -32,7 +33,12 @@ struct GPUMaterial {
     vec4 roughness;      // x = roughness, y = transmission, z = ior
     vec4 emissive;       // rgb premultiplied by strength
     vec4 tex;            // x = albedo array layer, y = MR array layer; -1 = none (#113)
+    vec4 sssAlbedo;      // rgb = single-scatter albedo (van de Hulst), w = subsurface mix
+    vec4 sssSigmaT;      // rgb = extinction 1/mfp, world units (#112)
 };
+// The shader mirrors this layout as raw vec4s — kMatStride in pathtrace.comp
+// must equal the vec4 count here.
+static_assert(sizeof(GPUMaterial) == 6 * sizeof(vec4));
 
 static float IntBits(int v)
 {
@@ -184,6 +190,8 @@ void PathTracer::Upload(const Scene& scene)
                 gm.emissive = vec4(m.emissive * m.emissiveStrength, 0);
                 gm.tex = vec4((float)layerFor(m.albedoMap, albedoLayers, albedoList),
                               (float)layerFor(m.metallicRoughnessMap, mrLayers, mrList), 0, 0);
+                gm.sssAlbedo = vec4(SssSingleScatterAlbedo(m.subsurfaceColor), m.subsurface);
+                gm.sssSigmaT = vec4(SssExtinction(m.subsurfaceRadius), 0);
                 materials.push_back(gm);
             }
             return it->second;
@@ -245,6 +253,8 @@ void PathTracer::Upload(const Scene& scene)
         floorMat.roughness = vec4(1.0f, 0.0f, 1.5f, 0); // opaque; ior unread when transmission = 0
         floorMat.emissive = vec4(0.0f);
         floorMat.tex = vec4(-1.0f, -1.0f, 0, 0); // untextured (0 would alias layer 0)
+        floorMat.sssAlbedo = vec4(0.0f);         // mix 0 = branch never taken
+        floorMat.sssSigmaT = vec4(1.0f, 1.0f, 1.0f, 0);
         materials.push_back(floorMat);
 
         const float kExtent = 300.0f;
