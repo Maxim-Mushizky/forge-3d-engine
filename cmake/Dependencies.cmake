@@ -91,7 +91,13 @@ FetchContent_Declare(lua
     GIT_TAG v5.4.8
     GIT_SHALLOW TRUE)
 
-FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold httplib lua)
+# --- xatlas (UV unwrapping, #81; MIT, no upstream CMakeLists) ------------------
+# Pinned to the same master commit Godot vendors; repo has been dormant since.
+FetchContent_Declare(xatlas
+    GIT_REPOSITORY https://github.com/jpcy/xatlas.git
+    GIT_TAG f700c7790aaa030e794b52ba7791a05c085faf0c)
+
+FetchContent_MakeAvailable(glfw glm glew imgui imguizmo tinygltf tinyobjloader manifold httplib lua xatlas)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -124,3 +130,12 @@ list(TRANSFORM LUA_SOURCES PREPEND ${lua_SOURCE_DIR}/)
 add_library(lua STATIC ${LUA_SOURCES})
 set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
 target_include_directories(lua PUBLIC ${lua_SOURCE_DIR})
+
+# xatlas ships exactly two files and builds with Premake upstream; compile the
+# single TU into its own target. SYSTEM include + -w keep this 10k-line
+# third-party TU from polluting our warning-clean build.
+add_library(xatlas STATIC ${xatlas_SOURCE_DIR}/source/xatlas/xatlas.cpp)
+target_include_directories(xatlas SYSTEM PUBLIC ${xatlas_SOURCE_DIR}/source/xatlas)
+target_compile_options(xatlas PRIVATE -w)
+find_package(Threads REQUIRED)
+target_link_libraries(xatlas PRIVATE Threads::Threads) # internal std::thread task scheduler

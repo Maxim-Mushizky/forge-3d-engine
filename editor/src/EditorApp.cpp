@@ -10,6 +10,7 @@
 #include <forge/core/Log.h>
 #include <forge/geometry/MeshEdit.h>
 #include <forge/geometry/MeshRemesh.h>
+#include <forge/geometry/UvUnwrap.h>
 #include <forge/renderer/Texture2D.h>
 #include <forge/scene/DropToGround.h>
 
@@ -1614,6 +1615,24 @@ void EditorApp::RemeshSelected()
     m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
 }
 
+void EditorApp::UnwrapSelected()
+{
+    Entity* e = m_Scene.Find(m_Selected);
+    if (!e || !e->mesh)
+        return;
+    if (m_Sculpt.Active())
+        m_Sculpt.Exit(); // xatlas re-indexes vertices; sculpt caches raw indices
+
+    std::shared_ptr<Mesh> before = e->mesh;
+    std::shared_ptr<Mesh> after = UnwrapUV(*before);
+    if (!after) {
+        FORGE_ERROR("Unwrap UVs failed (empty or fully degenerate mesh)");
+        return;
+    }
+    e->mesh = after;
+    m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, before, after));
+}
+
 void EditorApp::BooleanSelected(BooleanOp op)
 {
     if (m_Selection.size() != 2)
@@ -2066,6 +2085,10 @@ void EditorApp::DrawSidebar()
         Tip("Rebuild the surface as clean, even triangles.\nFixes stretched or messy geometry before sculpting");
         ImGui::SliderInt("Detail", &m_RemeshDetail, 32, 160);
         Tip("Higher keeps more detail but makes more triangles");
+
+        if (ImGui::Button("Unwrap UVs", ImVec2(-1, 30)))
+            UnwrapSelected();
+        Tip("Lay the surface out flat into a non-overlapping texture atlas.\nNeeded before painting or assigning image textures");
         ImGui::EndDisabled();
         if (!canModify)
             ImGui::TextDisabled("Select an object to modify.");
@@ -2602,6 +2625,23 @@ void EditorApp::DrawInspector()
             mat.albedoMap = nullptr;
             m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
         }
+    }
+
+    // UV atlas readout (#81). The coverage sum is O(tris), so cache it per
+    // mesh identity + version instead of recomputing every frame.
+    if (e->mesh) {
+        if (m_UvStatsMesh.lock() != e->mesh || m_UvStatsVersion != e->mesh->Version()) {
+            m_UvStatsMesh = e->mesh;
+            m_UvStatsVersion = e->mesh->Version();
+            m_UvStatsCoverage = UvAreaCoverage(e->mesh->Vertices(), e->mesh->Indices());
+        }
+        if (m_UvStatsCoverage <= 0.0f)
+            ImGui::TextDisabled("UVs: none (Modify > Unwrap UVs)");
+        else if (m_UvStatsCoverage > 1.02f) // charts stacked on one region (primitive-style UVs)
+            ImGui::Text("UVs: overlapping (%.0f%% of atlas area)", m_UvStatsCoverage * 100.0f);
+        else
+            ImGui::Text("UVs: atlas utilization %.0f%%", m_UvStatsCoverage * 100.0f);
+        Tip("How much of the texture square the mesh actually uses.\nOverlapping means faces share texture space - run Unwrap UVs");
     }
 
     ImGui::Spacing();

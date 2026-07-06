@@ -22,6 +22,7 @@ add_library(forge STATIC
     src/forge/geometry/MeshBoolean.cpp
     src/forge/geometry/MeshRemesh.cpp
     src/forge/geometry/MeshStats.cpp
+    src/forge/geometry/UvUnwrap.cpp
     src/forge/geometry/Spatial.cpp
     src/forge/geometry/Placement.cpp
     src/forge/raytrace/BVH.cpp
@@ -30,7 +31,7 @@ add_library(forge STATIC
 target_include_directories(forge PUBLIC src)
 target_include_directories(forge PRIVATE ${tinygltf_SOURCE_DIR} ${tinyobjloader_SOURCE_DIR} vendor)
 target_link_libraries(forge PUBLIC glfw libglew_static glm::glm opengl32)
-target_link_libraries(forge PRIVATE manifold::manifold)
+target_link_libraries(forge PRIVATE manifold::manifold xatlas)
 # Where the editor loads runtime assets (shaders, models) from. Defaults to the
 # in-tree assets dir for local dev; override with -D FORGE_ASSET_DIR="assets" to
 # resolve relative to the working dir for a portable deployment bundle.
