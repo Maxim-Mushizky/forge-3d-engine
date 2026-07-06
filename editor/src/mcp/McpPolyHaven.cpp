@@ -379,8 +379,10 @@ void EditorApp::ApplyPolyHavenDownload()
             } else if (job.applyArgs["name"].is_string()) {
                 const std::string name = job.applyArgs["name"];
                 for (Entity& cand : m_Scene.Entities())
-                    if (cand.name == name)
-                        e = &cand;
+                    if (cand.name == name) {
+                        e = &cand; // first match, same tie-break as FindToolTarget
+                        break;
+                    }
                 if (!e) {
                     job.error = "Downloaded, but no entity named \"" + name + "\"";
                     return;
