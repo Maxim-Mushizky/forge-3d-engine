@@ -26,7 +26,9 @@ add_executable(forge_tests
     test_placement.cpp
     test_mcpelements.cpp
     test_mcpsculpt.cpp
+    test_polyhaven.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
+    ${CMAKE_SOURCE_DIR}/editor/src/polyhaven/PolyHaven.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/Settings.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpProtocol.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpScript.cpp

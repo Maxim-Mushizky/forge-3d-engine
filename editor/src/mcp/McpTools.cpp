@@ -568,6 +568,50 @@ void EditorApp::RegisterMcpTools()
            {"clear", {{"type", "boolean"}}}}}},
         [this](const json& args) { return ToolSetTexture(args); });
 
+    // Async like render_image: network + disk run on a worker thread, the
+    // GL-side apply happens on the main thread in UpdatePolyHaven (#84).
+    m_McpProtocol.RegisterToolAsync(
+        "search_polyhaven",
+        "Search the Poly Haven CC0 asset library (#84). type: 'hdri' (real environment "
+        "skies for image-based lighting), 'texture' (photographed PBR material sets), "
+        "'model' (glTF props). query matches name/tags/categories; empty query lists the "
+        "most downloaded. Returns id/name/categories/tags/downloads/maxResolution per "
+        "asset — feed an id to download_polyhaven_asset. Needs internet on first use; "
+        "the catalog is cached and reused (marked stale:true when served offline).",
+        {{"type", "object"},
+         {"properties",
+          {{"type", {{"type", "string"}, {"enum", {"hdri", "texture", "model"}}}},
+           {"query", {{"type", "string"}}},
+           {"limit", {{"type", "integer"}, {"description", "max results, default 15, cap 50"}}}}},
+         {"required", {"type"}}},
+        [this](const json& args, ToolResponder respond) {
+            StartPolyHavenSearch(args, std::move(respond));
+        });
+
+    m_McpProtocol.RegisterToolAsync(
+        "download_polyhaven_asset",
+        "Download a Poly Haven asset into the local cache and apply it (#84). type 'hdri': "
+        "loads the .hdr as the environment sky + IBL (like set_environment; not undoable). "
+        "type 'texture': fetches the Diffuse and Rough maps; pass entity id/name (+ optional "
+        "materialSlot) to apply them as albedo + roughness textures (undoable; the mesh "
+        "needs UVs — unwrap_uv first), otherwise the cached file paths are returned for "
+        "set_texture. type 'model': imports the glTF (with its buffers/textures) into the "
+        "scene. resolution '1k'..'8k', default '2k'; the nearest published step is used. "
+        "Repeat downloads hit the cache and work offline. The asset id is recorded in the "
+        "scene for provenance.",
+        {{"type", "object"},
+         {"properties",
+          {{"asset", {{"type", "string"}, {"description", "asset id from search_polyhaven"}}},
+           {"type", {{"type", "string"}, {"enum", {"hdri", "texture", "model"}}}},
+           {"resolution", {{"type", "string"}, {"description", "'1k'..'8k', default '2k'"}}},
+           {"id", {{"type", "string"}, {"description", "target entity for texture apply"}}},
+           {"name", {{"type", "string"}, {"description", "target entity for texture apply"}}},
+           {"materialSlot", {{"type", "integer"}}}}},
+         {"required", {"asset", "type"}}},
+        [this](const json& args, ToolResponder respond) {
+            StartPolyHavenDownload(args, std::move(respond));
+        });
+
     m_McpProtocol.RegisterTool(
         "manage_light",
         "Lighting. Actions: spawn_point (position/color/intensity/range), set_point (entity "

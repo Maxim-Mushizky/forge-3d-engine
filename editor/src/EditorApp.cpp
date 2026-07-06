@@ -179,6 +179,8 @@ void EditorApp::Run()
         // Raster while sculpting: mid-stroke mesh edits would otherwise trigger a
         // BVH rebuild every frame. Same for geometry edits in RT mode: raster
         // preview until the scene settles (m_RTUploadPending).
+        UpdatePolyHaven(); // Poly Haven pump (#84): join worker, apply + respond on GL thread
+
         bool rtActive = (m_RayTracing && !m_Sculpt.Active() && !m_Edit.Active()) || m_Turntable.active;
         if (m_Turntable.active)
             UpdateTurntable(); // drives the path tracer directly, bypasses settle logic
@@ -705,6 +707,12 @@ std::string EditorApp::BuildExtrasJson() const
     j["bookmarks"] = std::move(bookmarks);
     j["spawnCounter"] = m_SpawnCounter;
     j["stlScale"] = m_StlScale;
+    if (!m_PolyProvenance.empty()) {
+        json ph = json::array();
+        for (const PolyProvenance& p : m_PolyProvenance)
+            ph.push_back({{"id", p.id}, {"type", p.type}, {"resolution", p.resolution}});
+        j["polyhaven"] = std::move(ph); // asset provenance (#84)
+    }
     return j.dump();
 }
 
@@ -802,6 +810,15 @@ void EditorApp::ApplyExtrasJson(const std::string& extras)
     }
     m_SpawnCounter = IntOr(j, "spawnCounter", m_SpawnCounter);
     m_StlScale = NumOr(j, "stlScale", m_StlScale);
+    // Provenance must describe THIS scene — unconditionally replaced, unlike
+    // the tunables above which keep their values when the key is absent.
+    m_PolyProvenance.clear();
+    if (auto s = j.find("polyhaven"); s != j.end() && s->is_array())
+        for (const json& p : *s)
+            if (p.is_object() && p.contains("id") && p["id"].is_string())
+                m_PolyProvenance.push_back({p["id"].get<std::string>(),
+                                            StrOr(p, "type", ""),
+                                            StrOr(p, "resolution", "")});
 }
 
 uint64_t EditorApp::SettingsHash() const
@@ -834,6 +851,11 @@ uint64_t EditorApp::SettingsHash() const
     bool ground = m_PathTracer.GroundPlane();
     mix(&ground, sizeof(ground));
     mix(&m_StlScale, sizeof(m_StlScale));
+    for (const PolyProvenance& p : m_PolyProvenance) { // #84: provenance is saved state
+        mix(p.id.data(), p.id.size());
+        mix(p.type.data(), p.type.size());
+        mix(p.resolution.data(), p.resolution.size());
+    }
     return h;
 }
 
@@ -879,6 +901,7 @@ void EditorApp::DoNewScene()
     m_Camera.ApplyBookmark({{0.0f, 0.5f, 0.0f}, 8.0f, 0.45f, 0.65f});
     m_SpawnCounter = 1;
     m_StlScale = 100.0f;
+    m_PolyProvenance.clear();
 
     MarkSaved();
     m_LastSceneHash = 0; // force RT re-upload

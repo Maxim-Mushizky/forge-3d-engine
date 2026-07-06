@@ -19,8 +19,10 @@
 #include <forge/renderer/Renderer.h>
 #include <forge/scene/Scene.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 struct ImFont;
@@ -162,6 +164,11 @@ private:
     ToolResult ToolManageScene(const nlohmann::json& args);
     ToolResult ToolExecuteScript(const nlohmann::json& args); // #78: Lua, one undo entry
     ToolResult ToolRenderViews(const nlohmann::json& args);   // #93: multi-view raster diagnostics
+    // --- Poly Haven asset library (#84) — bodies in mcp/McpPolyHaven.cpp ----
+    void StartPolyHavenSearch(const nlohmann::json& args, ToolResponder respond);
+    void StartPolyHavenDownload(const nlohmann::json& args, ToolResponder respond);
+    void UpdatePolyHaven();   // main-thread pump: joins a finished worker, applies + responds
+    void ApplyPolyHavenDownload(); // GL-side apply (HDRI/texture/import), main thread only
 
     Window m_Window;
     Renderer m_Renderer;
@@ -306,6 +313,42 @@ private:
         ToolResponder respond;  // held until the render converges
     };
     McpRenderJob m_McpRender;
+
+    // Poly Haven fetch (#84): the worker thread does network + disk only; the
+    // main-thread pump (UpdatePolyHaven) joins it, runs the GL-side apply and
+    // answers the MCP request. One job at a time — overlapping calls are
+    // rejected like overlapping renders.
+    struct PolyHavenJob {
+        bool active = false;
+        std::atomic<bool> done{false};
+        std::thread worker;
+        // Written by the worker; the main thread reads them only after
+        // join(), which provides the happens-before edge.
+        nlohmann::json result;      // tool payload on success
+        std::string error;          // non-empty = tool fails with this message
+        std::string applyKind;      // "" (search) | "hdri" | "texture" | "model"
+        std::string applyPath;      // downloaded main file (absolute)
+        std::string applyRoughPath; // texture Rough map; may be empty
+        nlohmann::json applyArgs;   // original tool args (entity target etc.)
+        ToolResponder respond;
+
+        ~PolyHavenJob()
+        {
+            if (worker.joinable())
+                worker.join(); // never leak a running downloader past shutdown
+        }
+    };
+    PolyHavenJob m_PolyJob;
+
+    // Poly Haven asset ids applied to this scene, persisted in the extras
+    // header for provenance (#84). CC0 needs no attribution; this is so a
+    // scene records where its assets came from.
+    struct PolyProvenance {
+        std::string id;
+        std::string type;       // hdri | texture | model
+        std::string resolution; // "2k" etc.
+    };
+    std::vector<PolyProvenance> m_PolyProvenance;
 };
 
 } // namespace forge
