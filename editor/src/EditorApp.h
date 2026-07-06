@@ -321,6 +321,7 @@ private:
     struct PolyHavenJob {
         bool active = false;
         std::atomic<bool> done{false};
+        std::atomic<bool> cancel{false}; // shutdown: worker stops between files
         std::thread worker;
         // Written by the worker; the main thread reads them only after
         // join(), which provides the happens-before edge.
@@ -334,6 +335,8 @@ private:
 
         ~PolyHavenJob()
         {
+            cancel = true; // worker checks between files; a mid-transfer wait
+                           // is bounded by the HttpClient receive timeout
             if (worker.joinable())
                 worker.join(); // never leak a running downloader past shutdown
         }

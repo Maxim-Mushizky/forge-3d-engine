@@ -2,6 +2,9 @@
 
 #include "polyhaven/PolyHaven.h"
 
+#include "mcp/McpProtocol.h"
+
+#include <cstdio>
 #include <string>
 
 // Poly Haven asset-library kernel (#84). The contract: catalog parsing skips
@@ -116,6 +119,16 @@ void TestSelectHdriFile()
     auto mid = SelectHdriFile(files, "2k");
     CHECK(mid && mid->relPath == "meadow_1k.hdr");
 
+    // An exr-only step at the requested resolution must not shadow an .hdr
+    // published at another step.
+    const json exrShadow = json::parse(R"({
+        "hdri": {
+            "2k": {"hdr": {"url": "https://dl.polyhaven.org/x/m_2k.hdr", "size": 2}},
+            "4k": {"exr": {"url": "https://dl.polyhaven.org/x/m_4k.exr", "size": 4}}
+        }})");
+    auto shadowed = SelectHdriFile(exrShadow, "4k");
+    CHECK(shadowed && shadowed->relPath == "m_2k.hdr");
+
     CHECK(!SelectHdriFile(json::parse(R"({"gltf": {}})"), "4k").has_value());
     CHECK(!SelectHdriFile(json::parse("[1]"), "4k").has_value());
 }
@@ -215,6 +228,28 @@ void TestCachePaths()
     CHECK(dir.size() >= 9 && dir.substr(dir.size() - 9) == "polyhaven");
 }
 
+void TestInvalidUtf8ResultSurvivesDump()
+{
+    // Cache paths inherit %LOCALAPPDATA%'s ANSI-codepage bytes: a non-ASCII
+    // username puts invalid UTF-8 into tool results. The protocol dump must
+    // degrade (U+FFFD) instead of throwing out of the async responder, where
+    // nothing above catches (#84 review finding 1).
+    McpProtocol protocol;
+    protocol.RegisterTool(
+        "echo_bad_path", "test", {{"type", "object"}},
+        [](const nlohmann::json&) {
+            return ToolResult::Text("C:/Users/Jos\xE9/AppData/file.hdr"); // lone 0xE9: latin-1 é
+        });
+    std::string response;
+    protocol.HandleMessage(
+        R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo_bad_path"}})",
+        [&response](std::string body) { response = std::move(body); });
+    CHECK(!response.empty()); // a strict dump would have thrown -> no response
+    const auto parsed = nlohmann::json::parse(response, nullptr, /*allow_exceptions=*/false);
+    CHECK(!parsed.is_discarded());
+    CHECK(parsed.contains("result") && parsed["result"].contains("content"));
+}
+
 } // namespace
 
 void RunPolyHavenTests()
@@ -227,6 +262,8 @@ void RunPolyHavenTests()
     TestPathAndIdValidation();
     TestSplitHttpsUrl();
     TestCachePaths();
+    TestInvalidUtf8ResultSurvivesDump();
+    std::printf("[ok] polyhaven kernel tests done\n");
 }
 
 } // namespace forge::test

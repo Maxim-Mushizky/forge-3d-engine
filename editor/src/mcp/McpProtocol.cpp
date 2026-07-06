@@ -186,9 +186,13 @@ void McpProtocol::HandleMessage(const std::string& body,
                 if (*responded)
                     return;
                 *responded = true;
+                // error_handler_t::replace: tool results may carry filesystem
+                // paths in the OS ANSI codepage (non-ASCII usernames), which
+                // aren't valid UTF-8 — a strict dump would throw here, and on
+                // the async path nothing above catches (#84).
                 respond(MakeResult(id, json{{"content", std::move(r.content)},
                                             {"isError", r.isError}})
-                            .dump());
+                            .dump(-1, ' ', false, json::error_handler_t::replace));
             };
             // Refuse NaN/Inf arguments before the handler runs: nothing has
             // mutated yet, so "clean error, zero mutation" holds for every

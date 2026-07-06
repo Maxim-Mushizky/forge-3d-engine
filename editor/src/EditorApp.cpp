@@ -752,6 +752,10 @@ vec3 Vec3Or(const nlohmann::json& o, const char* key, const vec3& fallback)
 void EditorApp::ApplyExtrasJson(const std::string& extras)
 {
     using nlohmann::json;
+    // Provenance describes THIS scene, so it resets even when the extras are
+    // missing/unparseable — the tunables below deliberately keep their values
+    // in that case, but a stale asset list must never leak into another file.
+    m_PolyProvenance.clear();
     json j = json::parse(extras, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object())
         return; // old or hand-edited file without extras: keep current settings
@@ -810,9 +814,6 @@ void EditorApp::ApplyExtrasJson(const std::string& extras)
     }
     m_SpawnCounter = IntOr(j, "spawnCounter", m_SpawnCounter);
     m_StlScale = NumOr(j, "stlScale", m_StlScale);
-    // Provenance must describe THIS scene — unconditionally replaced, unlike
-    // the tunables above which keep their values when the key is absent.
-    m_PolyProvenance.clear();
     if (auto s = j.find("polyhaven"); s != j.end() && s->is_array())
         for (const json& p : *s)
             if (p.is_object() && p.contains("id") && p["id"].is_string())

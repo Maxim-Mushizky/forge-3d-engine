@@ -4,6 +4,7 @@
 #include "polyhaven/PolyHaven.h"
 
 #include <forge/core/Log.h>
+#include <forge/renderer/TextureSource.h>
 
 #include <json.hpp>
 
@@ -35,7 +36,13 @@ constexpr int kMaxResolutionSteps = 8;
 
 ToolResult Err(std::string msg) { return ToolResult::Text(std::move(msg), /*error=*/true); }
 
-ToolResult JsonResult(const json& j) { return ToolResult::Text(j.dump(2)); }
+// error_handler_t::replace: cache paths inherit the ANSI-codepage bytes of
+// %LOCALAPPDATA% (non-ASCII usernames), which are not valid UTF-8 — a strict
+// dump would throw right in the pump.
+ToolResult JsonResult(const json& j)
+{
+    return ToolResult::Text(j.dump(2, ' ', false, json::error_handler_t::replace));
+}
 
 std::string ReadFileText(const std::string& path)
 {
@@ -118,63 +125,78 @@ void EditorApp::StartPolyHavenSearch(const json& args, ToolResponder respond)
     const std::string query = args.value("query", "");
     const size_t limit = (size_t)std::clamp(args.value("limit", 15), 1, 50);
 
-    m_PolyJob.active = true;
+    // `active` is set LAST: if the json copy or the thread constructor throws,
+    // McpProtocol answers the error and the job must not be left wedged.
     m_PolyJob.done = false;
     m_PolyJob.respond = std::move(respond);
     if (m_PolyJob.worker.joinable())
         m_PolyJob.worker.join(); // finished long ago; pump already consumed it
 
     m_PolyJob.worker = std::thread([job = &m_PolyJob, apiType, query, limit] {
-        const std::string catalogPath = CatalogCachePath(PolyHavenCacheDir(), apiType);
+        try {
+            const std::string catalogPath = CatalogCachePath(PolyHavenCacheDir(), apiType);
 
-        // Serve from the disk cache while it's fresh; the catalog changes
-        // rarely and the response is ~1 MB.
-        std::string text;
-        std::error_code ec;
-        const auto mtime = std::filesystem::last_write_time(catalogPath, ec);
-        if (!ec && std::filesystem::file_time_type::clock::now() - mtime < std::chrono::hours(1))
-            text = ReadFileText(catalogPath);
+            // Serve from the disk cache while it's fresh; the catalog changes
+            // rarely and the response is ~1 MB. Parse-validated before use —
+            // a cached garbage body must not brick search for the whole TTL.
+            std::vector<PolyAsset> catalog;
+            std::error_code ec;
+            const auto mtime = std::filesystem::last_write_time(catalogPath, ec);
+            if (!ec &&
+                std::filesystem::file_time_type::clock::now() - mtime < std::chrono::hours(1))
+                catalog = ParseAssetCatalog(ReadFileText(catalogPath));
 
-        bool stale = false;
-        if (text.empty()) {
-            const HttpResult res =
-                HttpsGet(kPolyHavenApiHost, "/assets?type=" + apiType, kUserAgent);
-            if (res.Ok()) {
-                text.assign(res.body.begin(), res.body.end());
-                if (!WriteFileBytes(catalogPath, res.body.data(), res.body.size()))
-                    FORGE_WARN("Couldn't cache Poly Haven catalog at %s", catalogPath.c_str());
-            } else {
-                text = ReadFileText(catalogPath); // any age beats nothing when offline
-                stale = !text.empty();
-                if (text.empty()) {
-                    job->error = "Poly Haven catalog request failed (" + TransportError(res) +
-                                 ") and no cached catalog for '" + apiType +
-                                 "' — check the connection and retry";
-                    job->done = true;
-                    return;
+            bool stale = false;
+            if (catalog.empty()) {
+                const HttpResult res =
+                    HttpsGet(kPolyHavenApiHost, "/assets?type=" + apiType, kUserAgent);
+                if (res.Ok()) {
+                    catalog = ParseAssetCatalog(
+                        std::string(res.body.begin(), res.body.end()));
+                    if (catalog.empty()) {
+                        // 200 with a garbage body (CDN error page): don't cache it.
+                        job->error = "Poly Haven catalog for '" + apiType +
+                                     "' parsed empty — the API answered with something "
+                                     "unexpected; retry later";
+                        job->done = true;
+                        return;
+                    }
+                    if (!WriteFileBytes(catalogPath, res.body.data(), res.body.size()))
+                        FORGE_WARN("Couldn't cache Poly Haven catalog at %s",
+                                   catalogPath.c_str());
+                } else {
+                    // Any-age cache beats nothing when offline.
+                    catalog = ParseAssetCatalog(ReadFileText(catalogPath));
+                    stale = !catalog.empty();
+                    if (catalog.empty()) {
+                        job->error = "Poly Haven catalog request failed (" +
+                                     TransportError(res) + ") and no cached catalog for '" +
+                                     apiType + "' — check the connection and retry";
+                        job->done = true;
+                        return;
+                    }
                 }
             }
-        }
 
-        const std::vector<PolyAsset> catalog = ParseAssetCatalog(text);
-        if (catalog.empty()) {
-            job->error = "Poly Haven catalog for '" + apiType + "' parsed empty";
-            job->done = true;
-            return;
+            json hits = json::array();
+            for (const PolyAsset& a : SearchAssets(catalog, query, limit))
+                hits.push_back({{"id", a.id},
+                                {"name", a.name},
+                                {"categories", a.categories},
+                                {"tags", a.tags},
+                                {"downloads", a.downloadCount},
+                                {"maxResolution", {a.maxResX, a.maxResY}}});
+            job->result = json{{"assets", std::move(hits)}, {"catalogSize", catalog.size()}};
+            if (stale)
+                job->result["stale"] = true; // offline: served from an aged cache
+        } catch (const std::exception& e) {
+            // A throw on this thread (filesystem conversions, bad_alloc) would
+            // otherwise std::terminate the editor.
+            job->error = std::string("Poly Haven search failed: ") + e.what();
         }
-        json hits = json::array();
-        for (const PolyAsset& a : SearchAssets(catalog, query, limit))
-            hits.push_back({{"id", a.id},
-                            {"name", a.name},
-                            {"categories", a.categories},
-                            {"tags", a.tags},
-                            {"downloads", a.downloadCount},
-                            {"maxResolution", {a.maxResX, a.maxResY}}});
-        job->result = json{{"assets", std::move(hits)}, {"catalogSize", catalog.size()}};
-        if (stale)
-            job->result["stale"] = true; // offline: served from an aged cache
         job->done = true;
     });
+    m_PolyJob.active = true;
 }
 
 void EditorApp::StartPolyHavenDownload(const json& args, ToolResponder respond)
@@ -203,7 +225,7 @@ void EditorApp::StartPolyHavenDownload(const json& args, ToolResponder respond)
         return;
     }
 
-    m_PolyJob.active = true;
+    // `active` last, same reasoning as StartPolyHavenSearch.
     m_PolyJob.done = false;
     m_PolyJob.respond = std::move(respond);
     m_PolyJob.applyKind = type;
@@ -212,6 +234,7 @@ void EditorApp::StartPolyHavenDownload(const json& args, ToolResponder respond)
         m_PolyJob.worker.join();
 
     m_PolyJob.worker = std::thread([job = &m_PolyJob, asset, type, resolution] {
+      try {
         const std::string dir = AssetCacheDir(PolyHavenCacheDir(), asset);
         const std::string filesPath = dir + "/files.json";
 
@@ -278,6 +301,11 @@ void EditorApp::StartPolyHavenDownload(const json& args, ToolResponder respond)
 
         json fileReport = json::array();
         for (const PolyFile& f : wanted) {
+            if (job->cancel.load()) { // editor shutting down: stop between files
+                job->error = "Download cancelled";
+                job->done = true;
+                return;
+            }
             const std::string dest = dir + "/" + f.relPath;
             bool cached = false;
             const std::string err = FetchFile(f, dest, cached);
@@ -306,8 +334,13 @@ void EditorApp::StartPolyHavenDownload(const json& args, ToolResponder respond)
                            {"type", type},
                            {"resolution", resolution},
                            {"files", std::move(fileReport)}};
-        job->done = true;
+      } catch (const std::exception& e) {
+          // A throw on this thread would std::terminate the editor.
+          job->error = std::string("Poly Haven download failed: ") + e.what();
+      }
+      job->done = true;
     });
+    m_PolyJob.active = true;
 }
 
 // GL-side application of a finished download. Runs on the main thread only;
@@ -317,6 +350,7 @@ void EditorApp::ApplyPolyHavenDownload()
     PolyHavenJob& job = m_PolyJob;
     const std::string asset = job.result.value("asset", "");
     const std::string resolution = job.result.value("resolution", "");
+    bool applied = false; // provenance is only for assets the scene actually uses
 
     if (job.applyKind == "hdri") {
         if (!LoadHDRIFile(job.applyPath)) {
@@ -324,33 +358,82 @@ void EditorApp::ApplyPolyHavenDownload()
             return;
         }
         job.result["applied"] = json{{"environment", job.applyPath}};
+        applied = true;
     } else if (job.applyKind == "texture") {
         if (job.applyArgs.contains("id") || job.applyArgs.contains("name")) {
-            json t;
-            for (const char* key : {"id", "name", "materialSlot"})
-                if (job.applyArgs.contains(key))
-                    t[key] = job.applyArgs[key];
-            t["slot"] = "albedo";
-            t["source"] = job.applyPath;
-            ToolResult albedo = ToolSetTexture(t);
-            if (albedo.isError) {
-                job.error = "Downloaded, but applying the albedo map failed: " +
-                            albedo.content.dump();
-                return;
-            }
-            json applied = json{{"albedo", job.applyPath}};
-            if (!job.applyRoughPath.empty()) {
-                t["slot"] = "roughness";
-                t["source"] = job.applyRoughPath;
-                ToolResult rough = ToolSetTexture(t);
-                if (rough.isError) {
-                    job.error = "Albedo applied, but the roughness map failed: " +
-                                rough.content.dump();
+            // Resolve the target like FindToolTarget does (id string, name
+            // fallback), then apply BOTH maps in one snapshot: validate-then-
+            // mutate, one undo entry, no albedo-without-roughness half-state.
+            Entity* e = nullptr;
+            if (job.applyArgs.contains("id") && job.applyArgs["id"].is_string()) {
+                const std::string idStr = job.applyArgs["id"];
+                try {
+                    e = m_Scene.Find(std::stoull(idStr));
+                } catch (const std::exception&) {
+                    e = nullptr;
+                }
+                if (!e) {
+                    job.error = "Downloaded, but no entity with id " + idStr;
                     return;
                 }
-                applied["roughness"] = job.applyRoughPath;
+            } else if (job.applyArgs["name"].is_string()) {
+                const std::string name = job.applyArgs["name"];
+                for (Entity& cand : m_Scene.Entities())
+                    if (cand.name == name)
+                        e = &cand;
+                if (!e) {
+                    job.error = "Downloaded, but no entity named \"" + name + "\"";
+                    return;
+                }
+            } else {
+                job.error = "Downloaded, but id/name must be strings";
+                return;
             }
-            job.result["applied"] = std::move(applied);
+            int slot = 0;
+            if (job.applyArgs.contains("materialSlot")) {
+                if (!job.applyArgs["materialSlot"].is_number_integer()) {
+                    job.error = "materialSlot must be an integer";
+                    return;
+                }
+                slot = job.applyArgs["materialSlot"].get<int>();
+                if (slot < 0 || slot >= (int)MaterialSlotCount(*e)) {
+                    job.error = "materialSlot " + std::to_string(slot) +
+                                " out of range: entity has " +
+                                std::to_string(MaterialSlotCount(*e)) + " material slot(s)";
+                    return;
+                }
+            }
+            const std::string albedoSource = "file:" + job.applyPath;
+            auto albedoTex = TextureFromSource(albedoSource, TextureChannel::Albedo);
+            if (!albedoTex) {
+                job.error = "Downloaded, but couldn't decode the albedo map: " + job.applyPath;
+                return;
+            }
+            std::shared_ptr<Texture2D> roughTex;
+            std::string mrSource;
+            if (!job.applyRoughPath.empty()) {
+                mrSource = "file:" + job.applyRoughPath;
+                roughTex = TextureFromSource(mrSource, TextureChannel::Roughness);
+                if (!roughTex) {
+                    job.error =
+                        "Downloaded, but couldn't decode the roughness map: " + job.applyRoughPath;
+                    return; // nothing mutated yet — the scene stays untouched
+                }
+            }
+            Entity before = *e;
+            Material& m = MaterialForSlot(*e, (uint32_t)slot);
+            m.albedoMap = albedoTex;
+            m.albedoSource = albedoSource;
+            if (roughTex) {
+                m.metallicRoughnessMap = roughTex;
+                m.mrSource = mrSource;
+            }
+            m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
+            json appliedJson = json{{"albedo", job.applyPath}};
+            if (roughTex)
+                appliedJson["roughness"] = job.applyRoughPath;
+            job.result["applied"] = std::move(appliedJson);
+            applied = true;
         } else {
             // No target entity: hand the agent the cached paths instead.
             job.result["hint"] =
@@ -362,11 +445,12 @@ void EditorApp::ApplyPolyHavenDownload()
             return;
         }
         job.result["applied"] = json{{"imported", job.applyPath}};
+        applied = true;
     }
 
     // Record provenance once per asset — CC0 needs no attribution, but the
-    // scene should say where its assets came from.
-    if (!asset.empty()) {
+    // scene should say which assets it actually uses.
+    if (applied && !asset.empty()) {
         bool known = false;
         for (const PolyProvenance& p : m_PolyProvenance)
             known |= p.id == asset;
@@ -383,13 +467,25 @@ void EditorApp::UpdatePolyHaven()
         m_PolyJob.worker.join(); // happens-before: worker writes are visible now
 
     ToolResponder respond = std::move(m_PolyJob.respond);
-    if (!m_PolyJob.error.empty()) {
-        respond(Err(m_PolyJob.error));
-    } else if (m_PolyJob.applyKind.empty()) {
-        respond(JsonResult(m_PolyJob.result)); // search: nothing to apply
-    } else {
-        ApplyPolyHavenDownload();
-        respond(m_PolyJob.error.empty() ? JsonResult(m_PolyJob.result) : Err(m_PolyJob.error));
+    // Nothing above Run() catches: a throw out of the apply or the responder
+    // (json copies, GL wrapper failures) must not std::terminate the editor.
+    try {
+        if (!m_PolyJob.error.empty()) {
+            respond(Err(m_PolyJob.error));
+        } else if (m_PolyJob.applyKind.empty()) {
+            respond(JsonResult(m_PolyJob.result)); // search: nothing to apply
+        } else {
+            ApplyPolyHavenDownload();
+            respond(m_PolyJob.error.empty() ? JsonResult(m_PolyJob.result)
+                                            : Err(m_PolyJob.error));
+        }
+    } catch (const std::exception& e) {
+        FORGE_ERROR("Poly Haven apply/respond threw: %s", e.what());
+        try {
+            respond(Err(std::string("Poly Haven request failed: ") + e.what()));
+        } catch (...) {
+            // Responder itself unusable; the HTTP side times out the request.
+        }
     }
 
     m_PolyJob.active = false;

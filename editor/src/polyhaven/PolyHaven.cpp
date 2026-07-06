@@ -34,18 +34,24 @@ int ResolutionSteps(const std::string& r)
 
 // Pick the best resolution key present in `node` (an object keyed by "1k",
 // "2k", ...): exact match, else largest below the request, else smallest
-// above. Returns an empty string when no valid key exists.
-std::string PickResolution(const json& node, const std::string& requested)
+// above. requireKey filters steps to those that actually carry the wanted
+// format (an exr-only step must not shadow an .hdr at another resolution).
+// Returns an empty string when no valid key exists.
+std::string PickResolution(const json& node, const std::string& requested,
+                           const char* requireKey = nullptr)
 {
     const int want = ResolutionSteps(requested);
     std::string below, above;
     int belowSteps = 0, aboveSteps = 0;
+    std::string exact;
     for (auto it = node.begin(); it != node.end(); ++it) {
         const int steps = ResolutionSteps(it.key());
         if (steps == 0 || !it.value().is_object())
             continue;
+        if (requireKey && !it.value().contains(requireKey))
+            continue;
         if (steps == want)
-            return it.key();
+            exact = it.key();
         if (steps < want && steps > belowSteps) {
             below = it.key();
             belowSteps = steps;
@@ -55,6 +61,8 @@ std::string PickResolution(const json& node, const std::string& requested)
             aboveSteps = steps;
         }
     }
+    if (!exact.empty())
+        return exact;
     return !below.empty() ? below : above;
 }
 
@@ -214,8 +222,8 @@ std::optional<PolyFile> SelectHdriFile(const nlohmann::json& files, const std::s
     if (!files.is_object() || !files.contains("hdri") || !files["hdri"].is_object())
         return std::nullopt;
     const json& ladder = files["hdri"];
-    const std::string res = PickResolution(ladder, resolution);
-    if (res.empty() || !ladder[res].contains("hdr"))
+    const std::string res = PickResolution(ladder, resolution, "hdr");
+    if (res.empty())
         return std::nullopt;
     return FileFromNode(ladder[res]["hdr"]);
 }
@@ -236,8 +244,8 @@ std::vector<PolyFile> SelectModelFiles(const nlohmann::json& files, const std::s
     if (!files.is_object() || !files.contains("gltf") || !files["gltf"].is_object())
         return out;
     const json& ladder = files["gltf"];
-    const std::string res = PickResolution(ladder, resolution);
-    if (res.empty() || !ladder[res].contains("gltf"))
+    const std::string res = PickResolution(ladder, resolution, "gltf");
+    if (res.empty())
         return out;
     const json& main = ladder[res]["gltf"];
     auto mainFile = FileFromNode(main);
