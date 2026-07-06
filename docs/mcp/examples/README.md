@@ -10,6 +10,7 @@ atomically on error.
 | `edit-mode-workflow.lua` | `mesh_elements` (face/edge, radius filter, `ofFaces`), `extrude_faces`, `extrude_edges`, `subdivide_faces`, `subdivide_edges`, `smooth`, `shade`, `mesh_stats` |
 | `layout-and-export.lua` | `group`, `ungroup`, `drop_to_ground`, `select`, `toggle_select`, `get_selection`, `clear_selection`, `box_select`, `snap_settings`, `export_stl` |
 | `sculpt-pear.lua` | `sculpt` (grab/inflate/smooth, `strokes`, negative-strength dent), `move_verts` (falloff), `subdivide`, `mesh_stats` |
+| `lathe-tableware.lua` | `spawn` with `primitive='lathe'` (walled cup profile, vase, turned table legs) and `primitive='sweep'` (cup handle along an arc), `mesh_stats` watertight checks |
 
 Element-id cheatsheet (edit-mode ops):
 

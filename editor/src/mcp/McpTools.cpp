@@ -460,7 +460,8 @@ void EditorApp::RegisterMcpTools()
     m_McpProtocol.RegisterTool(
         "manage_entity",
         "Create and organize scene entities. Actions: spawn (primitive: cube|sphere|plane|"
-        "cylinder|cone|torus|text, optional position/rotationDeg/scale/albedo/params), "
+        "cylinder|cone|torus|lathe|sweep|text, optional position/rotationDeg/scale/albedo/"
+        "params), "
         "delete, duplicate, rename (newName), set_transform (any of position/rotationDeg/"
         "scale), set_parent (parentId/parentName, empty = root). Targets resolve by id or "
         "name. Returns the affected entity. All actions are undoable.",
@@ -473,7 +474,9 @@ void EditorApp::RegisterMcpTools()
            {"name", {{"type", "string"}}},
            {"primitive",
             {{"type", "string"},
-             {"enum", {"cube", "sphere", "plane", "cylinder", "cone", "torus", "text"}}}},
+             {"enum",
+              {"cube", "sphere", "plane", "cylinder", "cone", "torus", "lathe", "sweep",
+               "text"}}}},
            {"newName", {{"type", "string"}}},
            {"parentId", {{"type", "string"}, {"description", "empty string = unparent to root"}}},
            {"parentName", {{"type", "string"}}},
@@ -488,7 +491,10 @@ void EditorApp::RegisterMcpTools()
              {"description",
               "primitive detail: sphere {rings,sectors}; plane {size,subdivisions}; "
               "cylinder/cone {sectors}; torus {minorRadius,majorSectors,minorSectors}; "
-              "text {text,depth,fontPath}"}}}}},
+              "lathe {profile:[[r,y],...] bottom->top revolved around local +Y, sectors, "
+              "closed} — walls come from a profile that goes up the outside and back down "
+              "the inside; sweep {profile:[[x,y],...] closed cross-section, path:[[x,y,z],"
+              "...]} extruded along the path without twist; text {text,depth,fontPath}"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolManageEntity(args); });
 
@@ -629,7 +635,10 @@ void EditorApp::RegisterMcpTools()
         "The forge.* functions mirror the other tools and take one table of the "
         "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
         "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}. "
-        "Writes: spawn{}, delete{}, "
+        "Writes: spawn{} (incl. primitive='lathe' params={profile={{r,y},... bottom->top "
+        "revolved around local +Y}, sectors, closed} and primitive='sweep' "
+        "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
+        "vases/legs/handles instead of sphere-pushing), delete{}, "
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
@@ -2028,6 +2037,58 @@ ToolResult EditorApp::ToolManageEntity(const json& args)
                                   : MeshFactory::Torus(params.value("minorRadius", 0.15f),
                                                        params.value("majorSectors", 48),
                                                        params.value("minorSectors", 24));
+        } else if (primitive == "lathe" || primitive == "sweep") {
+            // Point lists arrive as [[a,b],...] json arrays; a malformed entry
+            // rejects the spawn rather than silently dropping points (#111).
+            auto pointOk = [](const json& p, size_t dim) {
+                if (!p.is_array() || p.size() != dim)
+                    return false;
+                for (const json& c : p)
+                    if (!c.is_number())
+                        return false;
+                return true;
+            };
+            auto readVec2s = [&](const json& arr, std::vector<vec2>& out) {
+                if (!arr.is_array())
+                    return false;
+                for (const json& p : arr) {
+                    if (!pointOk(p, 2))
+                        return false;
+                    out.push_back({(float)p[0], (float)p[1]});
+                }
+                return true;
+            };
+            auto readVec3s = [&](const json& arr, std::vector<vec3>& out) {
+                if (!arr.is_array())
+                    return false;
+                for (const json& p : arr) {
+                    if (!pointOk(p, 3))
+                        return false;
+                    out.push_back({(float)p[0], (float)p[1], (float)p[2]});
+                }
+                return true;
+            };
+            std::vector<vec2> profile;
+            if (!readVec2s(params.value("profile", json()), profile))
+                return Err("params.profile must be [[a,b],...] number pairs");
+            if (primitive == "lathe") {
+                mesh = MeshFactory::Lathe(profile, params.value("sectors", 48),
+                                          params.value("closed", true));
+                if (!mesh)
+                    return Err("Degenerate or oversized lathe profile: need >= 2 distinct "
+                               "[r,y] points, r >= 0, not all on the axis, <= 4096 points "
+                               "and <= 2M projected vertices");
+            } else {
+                std::vector<vec3> path;
+                if (!readVec3s(params.value("path", json()), path))
+                    return Err("params.path must be [[x,y,z],...] number triples");
+                mesh = MeshFactory::Sweep(profile, path);
+                if (!mesh)
+                    return Err("Degenerate or oversized sweep input: need a closed profile "
+                               "with >= 3 distinct points and nonzero area (<= 4096 points), "
+                               "a path with >= 2 distinct points (<= 16384), and <= 2M "
+                               "projected vertices");
+            }
         } else if (primitive == "text") {
             const std::string text = params.value("text", "Forge");
             mesh = MeshFactory::Text(text, params.value("fontPath", "C:/Windows/Fonts/segoeui.ttf"),

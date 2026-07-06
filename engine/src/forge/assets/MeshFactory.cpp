@@ -1,5 +1,7 @@
 #include "MeshFactory.h"
 
+#include "forge/assets/MeshBuild.h"
+
 #include <glm/gtc/constants.hpp>
 
 #include <algorithm>
@@ -213,6 +215,24 @@ std::shared_ptr<Mesh> MeshFactory::Plane(float size, uint32_t subdivisions)
         }
     }
     return std::make_shared<Mesh>(std::move(vertices), std::move(indices));
+}
+
+std::shared_ptr<Mesh> MeshFactory::Lathe(const std::vector<vec2>& profile, uint32_t sectors,
+                                         bool closed)
+{
+    MeshData data;
+    if (!BuildLathe(profile, sectors, closed, data))
+        return nullptr;
+    return std::make_shared<Mesh>(std::move(data.vertices), std::move(data.indices));
+}
+
+std::shared_ptr<Mesh> MeshFactory::Sweep(const std::vector<vec2>& profile,
+                                         const std::vector<vec3>& path)
+{
+    MeshData data;
+    if (!BuildSweep(profile, path, data))
+        return nullptr;
+    return std::make_shared<Mesh>(std::move(data.vertices), std::move(data.indices));
 }
 
 // ---------------------------------------------------------------------------
