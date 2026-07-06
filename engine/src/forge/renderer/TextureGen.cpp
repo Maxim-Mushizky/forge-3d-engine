@@ -238,6 +238,7 @@ std::vector<uint8_t> BakeTexture(const TextureRecipe& recipe, bool encodeSrgb)
         return out;
     }
     std::vector<std::thread> pool;
+    pool.reserve(threads); // a reallocation throw with joinable threads would terminate
     const uint32_t chunk = (res + threads - 1) / threads;
     for (unsigned t = 0; t < threads; ++t) {
         uint32_t y0 = t * chunk, y1 = std::min(res, y0 + chunk);
