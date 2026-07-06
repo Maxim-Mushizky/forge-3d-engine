@@ -14,6 +14,7 @@
 #include <forge/geometry/MeshStats.h>
 #include <forge/geometry/Placement.h>
 #include <forge/geometry/Spatial.h>
+#include <forge/geometry/UvUnwrap.h>
 #include <forge/renderer/Texture2D.h>
 #include <forge/scene/DropToGround.h>
 
@@ -233,7 +234,8 @@ void EditorApp::RegisterMcpTools()
     m_McpProtocol.RegisterTool(
         "get_mesh_stats",
         "Topology diagnostics for an entity's mesh: triangle/vertex counts, degenerate "
-        "triangles, boundary and non-manifold edges, watertightness, UV presence, bounds.",
+        "triangles, boundary and non-manifold edges, watertightness, UV presence, UV area "
+        "coverage (~atlas utilization; >1 = overlapping charts), bounds.",
         {{"type", "object"},
          {"properties", {{"id", {{"type", "string"}}}, {"name", {{"type", "string"}}}}},
          {"additionalProperties", false}},
@@ -560,12 +562,18 @@ void EditorApp::RegisterMcpTools()
         "add resolution without smoothing), smooth (strength 0-1, iterations), boolean (op: "
         "union|subtract|intersect with otherId/otherName; replaces both operands), remesh "
         "(detail 32-160), mirror (bake X-mirror), extrude_face (pick a face via u/v or "
-        "origin/direction ray on the target, push it out by distance). All undoable.",
+        "origin/direction ray on the target, push it out by distance), unwrap_uv (generate "
+        "a non-overlapping UV atlas with xatlas; optional target resolution 256-4096, "
+        "default 1024 — the packed page can differ slightly, actual size/charts/"
+        "utilization returned in result.atlas; run before assigning image textures). "
+        "All undoable.",
         {{"type", "object"},
          {"properties",
           {{"action",
             {{"type", "string"},
-             {"enum", {"subdivide", "smooth", "boolean", "remesh", "mirror", "extrude_face"}}}},
+             {"enum",
+              {"subdivide", "smooth", "boolean", "remesh", "mirror", "extrude_face",
+               "unwrap_uv"}}}},
            {"id", {{"type", "string"}}},
            {"name", {{"type", "string"}}},
            {"keepShape", {{"type", "boolean"}}},
@@ -579,7 +587,8 @@ void EditorApp::RegisterMcpTools()
            {"v", {{"type", "number"}}},
            {"origin", {{"type", "array"}, {"items", {{"type", "number"}}}}},
            {"direction", {{"type", "array"}, {"items", {{"type", "number"}}}}},
-           {"distance", {{"type", "number"}}}}},
+           {"distance", {{"type", "number"}}},
+           {"resolution", {{"type", "integer"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolEditMesh(args); });
 
@@ -656,6 +665,8 @@ void EditorApp::RegisterMcpTools()
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
         "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
+        "unwrap_uv{optional resolution 256-4096} (non-overlapping UV atlas — run "
+        "before assigning image textures), "
         "look_at{}, set_render_settings{}. Editor surface (#91, script-only): "
         "camera{}/set_camera{}/store_view{}/recall_view{} (orbit pose, FOV, "
         "bookmarks 1-4), select{}/toggle_select{}/clear_selection{}/"
@@ -748,6 +759,8 @@ ToolResult EditorApp::ToolGetMeshStats(const json& args)
            {"nonManifoldEdges", s.nonManifoldEdges},
            {"watertight", s.watertight},
            {"hasUVs", s.hasUVs},
+           // ~atlas utilization when charts don't overlap; >1 = stacked UVs (#81)
+           {"uvAreaCoverage", UvAreaCoverage(e->mesh->Vertices(), e->mesh->Indices())},
            {"boundsMin", Vec3Json(s.bounds.min)},
            {"boundsMax", Vec3Json(s.bounds.max)},
            {"extents", Vec3Json(s.bounds.max - s.bounds.min)}};
@@ -2362,6 +2375,28 @@ ToolResult EditorApp::ToolEditMesh(const json& args)
     }
     if (action == "mirror")
         return swapMesh(MirrorBakeX(*e->mesh), "Mirror");
+    if (action == "unwrap_uv") {
+        UnwrapOptions opts;
+        opts.resolution = (uint32_t)std::clamp(args.value("resolution", 1024), 256, 4096);
+        // Call the kernel directly (not the UnwrapUV wrapper) so the atlas
+        // stats reach the agent — the packed page can differ from the request.
+        auto unwrapped =
+            UnwrapUVData(e->mesh->Vertices(), e->mesh->Indices(), e->mesh->Submeshes(), opts);
+        if (!unwrapped)
+            return Err("Unwrap UV failed (empty or degenerate input?)");
+        auto after = std::make_shared<Mesh>(std::move(unwrapped->vertices),
+                                            std::move(unwrapped->indices),
+                                            std::move(unwrapped->submeshes));
+        std::shared_ptr<Mesh> beforeMesh = e->mesh;
+        e->mesh = after;
+        m_Commands.Push(std::make_unique<MeshSwapCommand>(e->id, beforeMesh, after));
+        json j = EntityJson(m_Scene, *e);
+        j["atlas"] = {{"width", unwrapped->atlasWidth},
+                      {"height", unwrapped->atlasHeight},
+                      {"charts", unwrapped->chartCount},
+                      {"utilization", unwrapped->utilization}};
+        return JsonResult(j);
+    }
 
     if (action == "boolean") {
         std::string oerr;
@@ -2758,6 +2793,7 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("remesh", call(&EditorApp::ToolEditMesh, "remesh"));
         add("mirror", call(&EditorApp::ToolEditMesh, "mirror"));
         add("extrude_face", call(&EditorApp::ToolEditMesh, "extrude_face"));
+        add("unwrap_uv", call(&EditorApp::ToolEditMesh, "unwrap_uv"));
 
         add("place_relative", call(&EditorApp::ToolPlaceRelative, nullptr));
         add("snap_to_surface", call(&EditorApp::ToolSnapToSurface, nullptr));

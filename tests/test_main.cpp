@@ -17,6 +17,7 @@ void RunMcpTests();
 void RunMcpScriptTests();
 void RunMcpViewsTests();
 void RunMeshStatsTests();
+void RunUvUnwrapTests();
 void RunMeshBuildTests();
 void RunSpatialTests();
 void RunPlacementTests();
@@ -42,6 +43,7 @@ int main()
     RunMcpScriptTests();
     RunMcpViewsTests();
     RunMeshStatsTests();
+    RunUvUnwrapTests();
     RunMeshBuildTests();
     RunSpatialTests();
     RunPlacementTests();

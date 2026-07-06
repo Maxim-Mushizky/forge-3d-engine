@@ -19,6 +19,7 @@ add_executable(forge_tests
     test_mcpscript.cpp
     test_mcpviews.cpp
     test_meshstats.cpp
+    test_uvunwrap.cpp
     test_meshbuild.cpp
     test_spatial.cpp
     test_placement.cpp
@@ -33,6 +34,7 @@ add_executable(forge_tests
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpSculpt.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/MeshStats.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/UvUnwrap.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/Spatial.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/Placement.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/assets/SceneFormat.cpp
@@ -46,6 +48,6 @@ target_include_directories(forge_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/src
     ${CMAKE_SOURCE_DIR}/editor/src # GL-free editor kernels (DropRouter)
     ${tinygltf_SOURCE_DIR}) # bundled nlohmann json.hpp
-target_link_libraries(forge_tests PRIVATE glm::glm lua)
+target_link_libraries(forge_tests PRIVATE glm::glm lua xatlas) # xatlas: UvUnwrap kernel, still GL-free
 
 add_test(NAME forge_tests COMMAND forge_tests)

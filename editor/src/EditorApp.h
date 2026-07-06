@@ -55,6 +55,7 @@ private:
     void SubdivideSelected(bool keepShape);
     void DropSelectedToGround(); // rest each selected root on the surface below it
     void RemeshSelected();
+    void UnwrapSelected(); // regenerate a non-overlapping UV atlas (undoable, #81)
     void BooleanSelected(BooleanOp op); // first selected (op) second selected
     void ExportStlDialog();  // save dialog + export selection (or whole scene)
 
@@ -233,6 +234,11 @@ private:
     bool m_SubdivKeepShape = false;
     int m_RemeshDetail = 64; // 96+ gets very dense (a cube remeshes to ~150k tris at 96)
     std::string m_BoolStatus; // last boolean error, shown in the Modify section
+    // Inspector UV readout cache (#81): the coverage sum is O(tris), recompute
+    // only when the selected mesh (identity or version) changes.
+    std::weak_ptr<Mesh> m_UvStatsMesh;
+    uint64_t m_UvStatsVersion = 0;
+    float m_UvStatsCoverage = 0.0f; // summed UV-space triangle area
     char m_TextInput[64] = "Forge";
     float m_TextDepth = 0.25f;
 
