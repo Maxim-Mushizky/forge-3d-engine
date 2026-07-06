@@ -42,8 +42,8 @@ std::shared_ptr<Texture2D> TextureFromSource(const std::string& source, TextureC
         std::vector<uint8_t> rgba = BakeTexture(*recipe, /*encodeSrgb=*/srgb);
         if (channel == TextureChannel::Roughness)
             PackLuminanceToMR(rgba);
-        return std::make_shared<Texture2D>(rgba.data(), recipe->resolution, recipe->resolution, 4,
-                                           srgb);
+        const uint32_t res = ClampResolution(recipe->resolution); // matches the baked buffer
+        return std::make_shared<Texture2D>(rgba.data(), res, res, 4, srgb);
     }
 
     FORGE_ERROR("Unknown texture source (want file:<path> or proc:<json>): %s", source.c_str());

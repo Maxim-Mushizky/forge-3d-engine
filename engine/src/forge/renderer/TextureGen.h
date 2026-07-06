@@ -30,6 +30,14 @@ struct TextureRecipe {
     int axis = 0;         // stripes/gradient direction: 0 = u, 1 = v
 };
 
+// The one definition of the legal bake size. Parser, baker and texture
+// construction all clamp through here — sizing a texture from an unclamped
+// recipe field while the baker clamps would read past the baked buffer.
+inline uint32_t ClampResolution(uint32_t resolution)
+{
+    return resolution < 16 ? 16 : (resolution > 4096 ? 4096 : resolution);
+}
+
 // Parses {kind, resolution, seed, colorA, colorB, scale, octaves, distort,
 // ratio, axis} with the issue-spec aliases ringScale -> scale and
 // grainNoise -> distort. Out-of-range values clamp; a missing or unknown kind

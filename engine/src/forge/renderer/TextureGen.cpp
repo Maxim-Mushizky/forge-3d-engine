@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 namespace forge {
 
@@ -166,7 +167,7 @@ std::optional<TextureRecipe> RecipeFromJsonText(const std::string& jsonText)
         return c;
     };
 
-    r.resolution = (uint32_t)std::clamp(num("resolution", (float)r.resolution), 16.0f, 4096.0f);
+    r.resolution = ClampResolution((uint32_t)std::max(0.0f, num("resolution", (float)r.resolution)));
     r.seed = (uint32_t)std::max(0.0f, num("seed", 0.0f));
     r.colorA = color("colorA", r.colorA);
     r.colorB = color("colorB", r.colorB);
@@ -202,28 +203,50 @@ std::string RecipeToJsonText(const TextureRecipe& r)
 
 std::vector<uint8_t> BakeTexture(const TextureRecipe& recipe, bool encodeSrgb)
 {
-    const uint32_t res = std::clamp(recipe.resolution, 16u, 4096u);
+    const uint32_t res = ClampResolution(recipe.resolution);
     std::vector<uint8_t> out((size_t)res * res * 4);
 
     // 2x2 supersampling: hard checker/stripe edges average in LINEAR space, so
     // the mip-less path tracer (textureLod 0) doesn't shimmer on them.
     const float offs[2] = {0.25f, 0.75f};
     const float inv = 1.0f / (float)res;
-    for (uint32_t y = 0; y < res; ++y) {
-        for (uint32_t x = 0; x < res; ++x) {
-            vec3 c(0.0f);
-            for (float oy : offs)
-                for (float ox : offs)
-                    c += EvalRecipe(recipe, ((float)x + ox) * inv, ((float)y + oy) * inv);
-            c *= 0.25f;
-            uint8_t* px = &out[((size_t)y * res + x) * 4];
-            for (int i = 0; i < 3; ++i) {
-                float v = encodeSrgb ? SrgbEncode(c[i]) : std::clamp(c[i], 0.0f, 1.0f);
-                px[i] = (uint8_t)std::lround(v * 255.0f);
+    auto bakeRows = [&](uint32_t y0, uint32_t y1) {
+        for (uint32_t y = y0; y < y1; ++y) {
+            for (uint32_t x = 0; x < res; ++x) {
+                vec3 c(0.0f);
+                for (float oy : offs)
+                    for (float ox : offs)
+                        c += EvalRecipe(recipe, ((float)x + ox) * inv, ((float)y + oy) * inv);
+                c *= 0.25f;
+                uint8_t* px = &out[((size_t)y * res + x) * 4];
+                for (int i = 0; i < 3; ++i) {
+                    float v = encodeSrgb ? SrgbEncode(c[i]) : std::clamp(c[i], 0.0f, 1.0f);
+                    px[i] = (uint8_t)std::lround(v * 255.0f);
+                }
+                px[3] = 255;
             }
-            px[3] = 255;
         }
+    };
+
+    // Every texel is a pure function of the recipe and rows write disjoint
+    // ranges, so chunking rows across threads keeps the bytes deterministic
+    // while dividing the stall a big bake causes on the GL main thread (MCP
+    // handlers run between frames; a serial 4096^2 wood bake takes seconds).
+    unsigned threads = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+    if (threads <= 1 || res < 256) {
+        bakeRows(0, res);
+        return out;
     }
+    std::vector<std::thread> pool;
+    const uint32_t chunk = (res + threads - 1) / threads;
+    for (unsigned t = 0; t < threads; ++t) {
+        uint32_t y0 = t * chunk, y1 = std::min(res, y0 + chunk);
+        if (y0 >= y1)
+            break;
+        pool.emplace_back(bakeRows, y0, y1);
+    }
+    for (std::thread& th : pool)
+        th.join();
     return out;
 }
 

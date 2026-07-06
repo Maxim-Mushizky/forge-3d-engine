@@ -37,6 +37,14 @@ void TestBakeDeterministic()
     r.seed = 8;
     auto c = BakeTexture(r, false);
     CHECK(a != c);
+
+    // >= 256 takes the multithreaded bake path — bytes must stay deterministic.
+    r.resolution = 256;
+    r.kind = TextureKind::Noise;
+    CHECK(BakeTexture(r, false) == BakeTexture(r, false));
+
+    CHECK(ClampResolution(8) == 16 && ClampResolution(100000) == 4096 &&
+          ClampResolution(512) == 512);
 }
 
 void TestCheckerExactColors()
