@@ -60,9 +60,10 @@ void Renderer::BeginScene(const mat4& viewProjection, const vec3& cameraPosition
     m_Outlines.clear();
 }
 
-void Renderer::Submit(const Mesh& mesh, const mat4& transform, const Material& material, bool castShadow)
+void Renderer::Submit(const Mesh& mesh, const mat4& transform, const Material& material, bool castShadow,
+                      uint32_t firstIndex, uint32_t indexCount)
 {
-    m_Queue.push_back({&mesh, transform, material, castShadow});
+    m_Queue.push_back({&mesh, transform, material, castShadow, firstIndex, indexCount});
 }
 
 void Renderer::SubmitLight(const vec3& position, const vec3& color, float intensity, float range)
@@ -113,7 +114,7 @@ void Renderer::ShadowPass()
         if (!item.castShadow)
             continue;
         m_ShadowDepth->SetMat4("u_Model", item.transform);
-        item.mesh->Draw();
+        item.mesh->DrawRange(item.firstIndex, item.indexCount);
     }
 }
 
@@ -156,7 +157,7 @@ void Renderer::DrawItemMain(const DrawItem& item)
         }
         if (m_DebugView == DebugView::Wireframe)
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-        item.mesh->Draw();
+        item.mesh->DrawRange(item.firstIndex, item.indexCount);
         if (m_DebugView == DebugView::Wireframe)
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         return;
@@ -220,7 +221,7 @@ void Renderer::DrawItemMain(const DrawItem& item)
         shader->SetFloat("u_EnvIntensity", hasEnv ? m_Environment->intensity : 0.0f);
         shader->SetFloat("u_EnvRotation", hasEnv ? glm::radians(m_Environment->rotationDegrees) : 0.0f);
     }
-    item.mesh->Draw();
+    item.mesh->DrawRange(item.firstIndex, item.indexCount);
 }
 
 void Renderer::EndScene(const Framebuffer& target)

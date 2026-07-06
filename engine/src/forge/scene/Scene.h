@@ -28,9 +28,26 @@ struct Entity {
     std::string name;
     TransformComponent transform;
     std::shared_ptr<Mesh> mesh; // null = empty node (e.g. a group)
-    MaterialComponent material;
+    MaterialComponent material; // material slot 0 — kept as a direct field so
+                                // every single-material call site stays valid (#80)
+    std::vector<MaterialComponent> extraMaterials; // slots 1+ (multi-material meshes)
     LightComponent light; // point light when enabled (the mesh is just its gizmo)
 };
+
+// Material slot access (#80): slot 0 = Entity::material, slot n>=1 =
+// extraMaterials[n-1]. Out-of-range slots fall back to slot 0 so a mesh whose
+// submeshes reference more slots than the entity carries still renders.
+inline uint32_t MaterialSlotCount(const Entity& e) { return 1 + (uint32_t)e.extraMaterials.size(); }
+
+inline const MaterialComponent& MaterialForSlot(const Entity& e, uint32_t slot)
+{
+    return (slot == 0 || slot > e.extraMaterials.size()) ? e.material : e.extraMaterials[slot - 1];
+}
+
+inline MaterialComponent& MaterialForSlot(Entity& e, uint32_t slot)
+{
+    return (slot == 0 || slot > e.extraMaterials.size()) ? e.material : e.extraMaterials[slot - 1];
+}
 
 struct RaycastHit {
     UUID entity = 0;

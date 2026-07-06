@@ -135,6 +135,15 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
         const tinygltf::Mesh& gltfMesh = model.meshes[meshIdx];
         mat3 normalMat = mat3(glm::transpose(glm::inverse(world)));
 
+        // All primitives of one glTF mesh merge into ONE part (#80): shared
+        // vertex/index buffers plus a submesh range per primitive. Primitives
+        // sharing a glTF material share a slot.
+        std::vector<Vertex> meshVertices;
+        std::vector<uint32_t> meshIndices;
+        std::vector<Submesh> submeshes;
+        std::vector<Material> slotMaterials;                 // slot -> material
+        std::unordered_map<int, uint32_t> slotOfGltfMaterial; // glTF material index (-1 = none) -> slot
+
         for (size_t p = 0; p < gltfMesh.primitives.size(); ++p) {
             const tinygltf::Primitive& prim = gltfMesh.primitives[p];
             if (prim.mode != TINYGLTF_MODE_TRIANGLES && prim.mode != -1)
@@ -190,28 +199,54 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
                     indices[i] = i;
             }
 
+            // Per primitive, before merging: computing over the merged buffers
+            // would clobber good normals from primitives that have them.
             if (!hasNormals)
                 ComputeNormals(vertices, indices);
 
-            ImportedPart part;
-            part.name = !gltfMesh.name.empty() ? gltfMesh.name : "mesh" + std::to_string(meshIdx);
-            if (gltfMesh.primitives.size() > 1)
-                part.name += "." + std::to_string(p);
-
-            if (prim.material >= 0) {
-                const tinygltf::Material& mat = model.materials[prim.material];
-                const auto& pbr = mat.pbrMetallicRoughness;
-                part.material.albedo = vec3((float)pbr.baseColorFactor[0], (float)pbr.baseColorFactor[1],
-                                            (float)pbr.baseColorFactor[2]);
-                part.material.metallic = (float)pbr.metallicFactor;
-                part.material.roughness = (float)pbr.roughnessFactor;
-                part.material.albedoMap = getTexture(pbr.baseColorTexture.index, /*srgb=*/true);
-                part.material.metallicRoughnessMap = getTexture(pbr.metallicRoughnessTexture.index, /*srgb=*/false);
+            uint32_t slot;
+            if (auto it = slotOfGltfMaterial.find(prim.material); it != slotOfGltfMaterial.end()) {
+                slot = it->second;
+            } else {
+                slot = (uint32_t)slotMaterials.size();
+                slotOfGltfMaterial[prim.material] = slot;
+                Material m; // primitives without a glTF material get the defaults
+                if (prim.material >= 0) {
+                    const tinygltf::Material& mat = model.materials[prim.material];
+                    const auto& pbr = mat.pbrMetallicRoughness;
+                    m.albedo = vec3((float)pbr.baseColorFactor[0], (float)pbr.baseColorFactor[1],
+                                    (float)pbr.baseColorFactor[2]);
+                    m.metallic = (float)pbr.metallicFactor;
+                    m.roughness = (float)pbr.roughnessFactor;
+                    m.albedoMap = getTexture(pbr.baseColorTexture.index, /*srgb=*/true);
+                    m.metallicRoughnessMap = getTexture(pbr.metallicRoughnessTexture.index, /*srgb=*/false);
+                }
+                slotMaterials.push_back(std::move(m));
             }
 
-            part.mesh = std::make_shared<Mesh>(std::move(vertices), std::move(indices));
-            parts.push_back(std::move(part));
+            const uint32_t vertexBase = (uint32_t)meshVertices.size();
+            const uint32_t firstIndex = (uint32_t)meshIndices.size();
+            meshVertices.insert(meshVertices.end(), vertices.begin(), vertices.end());
+            meshIndices.reserve(meshIndices.size() + indices.size());
+            for (uint32_t i : indices)
+                meshIndices.push_back(vertexBase + i);
+            submeshes.push_back({firstIndex, (uint32_t)indices.size(), slot});
         }
+
+        if (meshVertices.empty() || meshIndices.empty())
+            continue;
+
+        ImportedPart part;
+        part.name = !gltfMesh.name.empty() ? gltfMesh.name : "mesh" + std::to_string(meshIdx);
+        if (!slotMaterials.empty()) {
+            part.material = slotMaterials.front();
+            part.extraMaterials.assign(slotMaterials.begin() + 1, slotMaterials.end());
+        }
+        // Single-slot meshes stay submesh-free: the whole-buffer fast path.
+        if (slotMaterials.size() <= 1)
+            submeshes.clear();
+        part.mesh = std::make_shared<Mesh>(std::move(meshVertices), std::move(meshIndices), std::move(submeshes));
+        parts.push_back(std::move(part));
     }
     return parts;
 }

@@ -2,10 +2,13 @@
 
 #include <GL/glew.h>
 
+#include <algorithm>
+
 namespace forge {
 
-Mesh::Mesh(std::vector<Vertex> vertices, std::vector<uint32_t> indices)
-    : m_Vertices(std::move(vertices)), m_Indices(std::move(indices))
+Mesh::Mesh(std::vector<Vertex> vertices, std::vector<uint32_t> indices, std::vector<Submesh> submeshes)
+    : m_Vertices(std::move(vertices)), m_Indices(std::move(indices)),
+      m_Submeshes(SanitizeSubmeshes(std::move(submeshes), m_Indices.size()))
 {
     for (const Vertex& v : m_Vertices)
         m_Bounds.Expand(v.position);
@@ -59,6 +62,18 @@ void Mesh::Draw() const
 {
     glBindVertexArray(m_VAO);
     glDrawElements(GL_TRIANGLES, (GLsizei)m_Indices.size(), GL_UNSIGNED_INT, nullptr);
+    glBindVertexArray(0);
+}
+
+void Mesh::DrawRange(uint32_t firstIndex, uint32_t indexCount) const
+{
+    if (firstIndex >= m_Indices.size())
+        return;
+    uint32_t available = (uint32_t)m_Indices.size() - firstIndex;
+    uint32_t count = indexCount == 0 ? available : std::min(indexCount, available);
+    glBindVertexArray(m_VAO);
+    glDrawElements(GL_TRIANGLES, (GLsizei)count, GL_UNSIGNED_INT,
+                   (const void*)(uintptr_t)(firstIndex * sizeof(uint32_t)));
     glBindVertexArray(0);
 }
 

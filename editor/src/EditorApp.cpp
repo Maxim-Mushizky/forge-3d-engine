@@ -217,7 +217,15 @@ void EditorApp::RenderScene()
         if (!e.mesh)
             continue;
         // Light gizmo meshes don't cast shadows (a light casting its own shadow looks broken).
-        m_Renderer.Submit(*e.mesh, world, e.material, !e.light.enabled);
+        // Multi-material meshes (#80) submit one draw per submesh with its slot's material.
+        const auto& subs = e.mesh->Submeshes();
+        if (subs.empty()) {
+            m_Renderer.Submit(*e.mesh, world, e.material, !e.light.enabled);
+        } else {
+            for (const Submesh& sm : subs)
+                m_Renderer.Submit(*e.mesh, world, MaterialForSlot(e, sm.materialSlot), !e.light.enabled,
+                                  sm.firstIndex, sm.indexCount);
+        }
     }
     // Every selected entity gets an outline (primary brighter); selecting a
     // group highlights its whole subtree, since the group node has no mesh.
@@ -260,6 +268,17 @@ uint64_t EditorApp::SceneHash() const
         mix(&e.material.emissiveStrength, sizeof(e.material.emissiveStrength));
         mix(&e.material.transmission, sizeof(e.material.transmission));
         mix(&e.material.ior, sizeof(e.material.ior));
+        // Extra material slots (#80): an edit to any slot must re-upload.
+        // (Submesh ranges are immutable per mesh, so the mesh pointer covers them.)
+        for (const Material& m : e.extraMaterials) {
+            mix(&m.albedo, sizeof(m.albedo));
+            mix(&m.metallic, sizeof(m.metallic));
+            mix(&m.roughness, sizeof(m.roughness));
+            mix(&m.emissive, sizeof(m.emissive));
+            mix(&m.emissiveStrength, sizeof(m.emissiveStrength));
+            mix(&m.transmission, sizeof(m.transmission));
+            mix(&m.ior, sizeof(m.ior));
+        }
         mix(&e.light, sizeof(e.light));
         const Mesh* mesh = e.mesh.get();
         mix(&mesh, sizeof(mesh));
@@ -1382,6 +1401,7 @@ bool EditorApp::ImportModel(const std::string& path)
         Entity& e = m_Scene.CreateEntity(p.name);
         e.mesh = p.mesh;
         e.material = p.material;
+        e.extraMaterials = p.extraMaterials; // slots 1+ for multi-material meshes (#80)
         if (rootId) {
             e.parent = rootId; // local identity: mesh data already shares the model's space
         } else {
@@ -2500,25 +2520,41 @@ void EditorApp::DrawInspector()
     vec3Row("Scale", e->transform.scale, 0.02f, 1.0f, nullptr, m_SnapEnabled ? m_SnapScale : 0.0f);
 
     sepText("Material");
-    ImGui::ColorEdit3("Albedo", &e->material.albedo.x);
+    // Multi-material meshes (#80): pick which slot the widgets below edit.
+    // Slot 0 is the base material every entity has; imports add slots 1+.
+    m_InspectorSlot = glm::clamp(m_InspectorSlot, 0, (int)MaterialSlotCount(*e) - 1);
+    if (MaterialSlotCount(*e) > 1) {
+        std::string preview = "Slot " + std::to_string(m_InspectorSlot);
+        if (ImGui::BeginCombo("Material slot", preview.c_str())) {
+            for (int s = 0; s < (int)MaterialSlotCount(*e); ++s) {
+                std::string label = "Slot " + std::to_string(s);
+                if (ImGui::Selectable(label.c_str(), s == m_InspectorSlot))
+                    m_InspectorSlot = s;
+            }
+            ImGui::EndCombo();
+        }
+        Tip("This mesh has several material slots; each covers part of the surface");
+    }
+    Material& mat = MaterialForSlot(*e, (uint32_t)m_InspectorSlot);
+    ImGui::ColorEdit3("Albedo", &mat.albedo.x);
     Tip("The object's base color");
     track();
-    ImGui::SliderFloat("Metallic", &e->material.metallic, 0.0f, 1.0f);
+    ImGui::SliderFloat("Metallic", &mat.metallic, 0.0f, 1.0f);
     Tip("0 = plastic or wood, 1 = metal");
     track();
-    ImGui::SliderFloat("Roughness", &e->material.roughness, 0.0f, 1.0f);
+    ImGui::SliderFloat("Roughness", &mat.roughness, 0.0f, 1.0f);
     Tip("0 = polished mirror, 1 = matte");
     track();
-    ImGui::ColorEdit3("Emissive", &e->material.emissive.x);
+    ImGui::ColorEdit3("Emissive", &mat.emissive.x);
     track();
-    ImGui::SliderFloat("Emission", &e->material.emissiveStrength, 0.0f, 20.0f);
+    ImGui::SliderFloat("Emission", &mat.emissiveStrength, 0.0f, 20.0f);
     Tip("Makes the object glow and light the scene");
     track();
-    ImGui::SliderFloat("Transmission", &e->material.transmission, 0.0f, 1.0f);
+    ImGui::SliderFloat("Transmission", &mat.transmission, 0.0f, 1.0f);
     Tip("0 = solid, 1 = clear like glass or water");
     track();
-    if (e->material.transmission > 0.0f) {
-        ImGui::SliderFloat("IOR", &e->material.ior, 1.0f, 2.5f);
+    if (mat.transmission > 0.0f) {
+        ImGui::SliderFloat("IOR", &mat.ior, 1.0f, 2.5f);
         Tip("How much light bends: water 1.33, glass 1.5, diamond 2.4");
         track();
     }
@@ -2529,11 +2565,11 @@ void EditorApp::DrawInspector()
                       float ior) {
         if (ImGui::SmallButton(label)) {
             Entity before = *e;
-            e->material.albedo = albedo;
-            e->material.metallic = metallic;
-            e->material.roughness = roughness;
-            e->material.transmission = transmission;
-            e->material.ior = ior;
+            mat.albedo = albedo;
+            mat.metallic = metallic;
+            mat.roughness = roughness;
+            mat.transmission = transmission;
+            mat.ior = ior;
             m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
         }
     };
@@ -2559,11 +2595,11 @@ void EditorApp::DrawInspector()
         ImGui::SliderFloat("Range", &e->light.range, 0.5f, 100.0f);
         track();
     }
-    if (e->material.albedoMap) {
-        ImGui::Text("Albedo map: %ux%u", e->material.albedoMap->Width(), e->material.albedoMap->Height());
+    if (mat.albedoMap) {
+        ImGui::Text("Albedo map: %ux%u", mat.albedoMap->Width(), mat.albedoMap->Height());
         if (ImGui::Button("Remove texture")) {
             Entity before = *e;
-            e->material.albedoMap = nullptr;
+            mat.albedoMap = nullptr;
             m_Commands.Push(std::make_unique<EditEntityCommand>(before, *e));
         }
     }
