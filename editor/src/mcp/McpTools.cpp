@@ -78,6 +78,24 @@ static bool GetVec3(const json& args, const char* key, vec3& out)
     return args.contains(key) && Vec3FromJson(args[key], out);
 }
 
+// Applies optional orbit-pose args (focalPoint/distance/pitchDeg/yawDeg/
+// fovDeg) to a camera; each field only when present. Shared by set_camera and
+// render_image (#138) so both speak the same parameterization.
+static void ApplyPoseArgs(const json& args, EditorCamera& cam)
+{
+    EditorCamera::Bookmark b = cam.GetBookmark();
+    GetVec3(args, "focalPoint", b.focalPoint);
+    if (args.contains("distance") && args["distance"].is_number())
+        b.distance = std::max(0.05f, (float)args["distance"]);
+    if (args.contains("pitchDeg") && args["pitchDeg"].is_number())
+        b.pitch = glm::radians(std::clamp((float)args["pitchDeg"], -88.0f, 88.0f));
+    if (args.contains("yawDeg") && args["yawDeg"].is_number())
+        b.yaw = glm::radians((float)args["yawDeg"]);
+    cam.ApplyBookmark(b);
+    if (args.contains("fovDeg") && args["fovDeg"].is_number())
+        cam.SetFOV((float)args["fovDeg"]);
+}
+
 static json MaterialJson(const Material& m)
 {
     json j;
@@ -510,12 +528,15 @@ void EditorApp::RegisterMcpTools()
     // editor stays interactive during the render (see UpdateMcpRender).
     m_McpProtocol.RegisterToolAsync(
         "render_image",
-        "Path-traced render of the scene from the current camera at the given resolution "
-        "and samples-per-pixel. Runs in the background; the editor stays responsive. "
-        "Optional per-render quality overrides (#92): bounces 1-16 (raise to 8+ for glass "
-        "interiors), denoise + denoiseStrength 0-1, and thin-lens depth of field via "
-        "aperture (world units, 0 = pinhole) + focusDist (distance to the sharp plane; "
-        "omit to focus on the camera's orbit point). Overrides apply to this render only "
+        "Path-traced render of the scene at the given resolution and samples-per-pixel. "
+        "Camera: the live editor camera by default, or an explicit hermetic pose via "
+        "focalPoint/distance/pitchDeg/yawDeg/fovDeg (same orbit parameterization as "
+        "set_camera; #138) — pass the pose to make renders reproducible even if the "
+        "viewport camera moves between calls. Runs in the background; the editor stays "
+        "responsive. Optional per-render quality overrides (#92): bounces 1-16 (raise to "
+        "8+ for glass interiors), denoise + denoiseStrength 0-1, and thin-lens depth of "
+        "field via aperture (world units, 0 = pinhole) + focusDist (distance to the sharp "
+        "plane; omit to focus on the orbit point). Overrides apply to this render only "
         "- the editor's interactive settings are untouched.",
         {{"type", "object"},
          {"properties",
@@ -526,7 +547,15 @@ void EditorApp::RegisterMcpTools()
            {"denoise", {{"type", "boolean"}, {"description", "default = editor setting"}}},
            {"denoiseStrength", {{"type", "number"}, {"description", "0-1, default = editor setting"}}},
            {"aperture", {{"type", "number"}, {"description", "lens radius, 0-1, 0 = no DoF"}}},
-           {"focusDist", {{"type", "number"}, {"description", "focus distance in world units"}}}}},
+           {"focusDist", {{"type", "number"}, {"description", "focus distance in world units"}}},
+           {"focalPoint",
+            {{"type", "array"},
+             {"items", {{"type", "number"}}},
+             {"description", "explicit pose: orbit target [x,y,z], default = editor camera"}}},
+           {"distance", {{"type", "number"}, {"description", "explicit pose: orbit distance, min 0.05"}}},
+           {"pitchDeg", {{"type", "number"}, {"description", "explicit pose: -88 to 88"}}},
+           {"yawDeg", {{"type", "number"}, {"description", "explicit pose: degrees"}}},
+           {"fovDeg", {{"type", "number"}, {"description", "explicit pose: 10-120"}}}}},
          {"additionalProperties", false}},
         [this](const json& args, ToolResponder respond) {
             if (m_McpRender.active || m_Turntable.active) {
@@ -542,11 +571,16 @@ void EditorApp::RegisterMcpTools()
             // Per-render overrides live on the job (or one-shot PathTracer state);
             // editor members stay untouched, and the first interactive
             // UpdateRayTracer after the job re-applies them anyway.
+            // #138: hermetic pose — the optional pose args land on a copy of
+            // the editor camera, so the render neither depends on nor disturbs
+            // whatever the live viewport camera does mid-session.
+            EditorCamera cam = m_Camera;
+            ApplyPoseArgs(args, cam);
             const float aperture = std::clamp(args.value("aperture", 0.0f), 0.0f, 1.0f);
             float focusDist = args.value("focusDist", -1.0f);
             if (focusDist <= 0.0f)
-                focusDist = glm::length(m_Camera.FocalPoint() - m_Camera.Position());
-            const mat4& view = m_Camera.View();
+                focusDist = glm::length(cam.FocalPoint() - cam.Position());
+            const mat4& view = cam.View();
             m_PathTracer.SetLens(aperture, focusDist,
                                  vec3(view[0][0], view[1][0], view[2][0]),
                                  vec3(view[0][1], view[1][1], view[2][1]));
@@ -554,16 +588,20 @@ void EditorApp::RegisterMcpTools()
                                     std::clamp(args.value("denoiseStrength", m_DenoiseStrength),
                                                0.0f, 1.0f));
             m_PathTracer.ResetAccumulation();
+            // #138: identical scene + pose + spp must reproduce identical
+            // pixels; the RNG frame counter restarts so every MCP render
+            // walks the same sample sequence.
+            m_PathTracer.ResetFrameCounter();
 
             m_McpRender.active = true;
             m_McpRender.bounces = std::clamp(args.value("bounces", m_Bounces), 1, 16);
             m_McpRender.sppTarget = std::clamp(args.value("spp", 256), 8, 4096);
             // Projection rebuilt for the requested aspect; the viewport's own
             // matrix would letterbox-stretch anything non-viewport-shaped.
-            m_McpRender.viewProj = glm::perspective(glm::radians(m_Camera.FOV()),
+            m_McpRender.viewProj = glm::perspective(glm::radians(cam.FOV()),
                                                     (float)w / (float)h, 0.1f, 1000.0f) *
                                    view;
-            m_McpRender.camPos = m_Camera.Position();
+            m_McpRender.camPos = cam.Position();
             m_McpRender.respond = std::move(respond);
         });
 
@@ -606,7 +644,10 @@ void EditorApp::RegisterMcpTools()
               "lathe {profile:[[r,y],...] bottom->top revolved around local +Y, sectors, "
               "closed} — walls come from a profile that goes up the outside and back down "
               "the inside; sweep {profile:[[x,y],...] closed cross-section, path:[[x,y,z],"
-              "...]} extruded along the path without twist; text {text,depth,fontPath}"}}}}},
+              "...]} extruded along the path without twist — the section reads as drawn "
+              "looking back along the start tangent, world +Y up: a +z path maps section "
+              "(x,y) to world (x,y), a vertical path to world (x,-z) (#138); "
+              "text {text,depth,fontPath}"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolManageEntity(args); });
 
@@ -737,7 +778,9 @@ void EditorApp::RegisterMcpTools()
         "edit_mesh",
         "Semantic modeling ops on an entity's mesh. Actions: subdivide (keepShape: true = "
         "add resolution without smoothing), smooth (strength 0-1, iterations), boolean (op: "
-        "union|subtract|intersect with otherId/otherName; replaces both operands), remesh "
+        "union|subtract|intersect with otherId/otherName; replaces both operands — the "
+        "result keeps the target's name and id, so chained cuts need no re-lookup, #138), "
+        "remesh "
         "(detail 32-160), mirror (bake X-mirror), extrude_face (pick a face via u/v or "
         "origin/direction ray on the target, push it out by distance), unwrap_uv (generate "
         "a non-overlapping UV atlas with xatlas; optional target resolution 256-4096, "
@@ -846,7 +889,8 @@ void EditorApp::RegisterMcpTools()
         "Writes: spawn{} (incl. primitive='lathe' params={profile={{r,y},... bottom->top "
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
-        "vases/legs/handles instead of sphere-pushing), delete{}, "
+        "vases/legs/handles instead of sphere-pushing; a +z path maps section (x,y) to "
+        "world (x,y), #138), delete{}, "
         "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{slot for "
         "multi-material meshes; subsurface/subsurfaceColor/subsurfaceRadius = SSS, #112}, "
         "set_texture{slot='albedo'|'roughness', source=file path "
@@ -854,7 +898,8 @@ void EditorApp::RegisterMcpTools()
         "colorB, scale, ...} — wood grain, glaze bands; needs UVs (unwrap_uv first)}, "
         "spawn_point_light{}, set_point_light{}, set_sun{}, set_environment{}, "
         "place_relative{}, snap_to_surface{}, align{}, distribute{}, "
-        "subdivide{}, smooth{}, boolean{}, remesh{}, mirror{}, extrude_face{}, "
+        "subdivide{}, smooth{}, boolean{} (result keeps the target's name+id, #138), "
+        "remesh{}, mirror{}, extrude_face{}, "
         "unwrap_uv{optional resolution 256-4096} (non-overlapping UV atlas — run "
         "before assigning image textures), "
         "look_at{}, set_render_settings{}. Editor surface (#91, script-only): "
@@ -1803,17 +1848,7 @@ ToolResult EditorApp::ToolCameraOp(const json& args)
     if (action == "set") {
         // Orbit-parameterized on purpose: eye position is derived, so scripts
         // set focal point / distance / angles, same as the mouse does.
-        EditorCamera::Bookmark b = m_Camera.GetBookmark();
-        GetVec3(args, "focalPoint", b.focalPoint);
-        if (args.contains("distance") && args["distance"].is_number())
-            b.distance = std::max(0.05f, (float)args["distance"]);
-        if (args.contains("pitchDeg") && args["pitchDeg"].is_number())
-            b.pitch = glm::radians(std::clamp((float)args["pitchDeg"], -88.0f, 88.0f));
-        if (args.contains("yawDeg") && args["yawDeg"].is_number())
-            b.yaw = glm::radians((float)args["yawDeg"]);
-        m_Camera.ApplyBookmark(b);
-        if (args.contains("fovDeg") && args["fovDeg"].is_number())
-            m_Camera.SetFOV((float)args["fovDeg"]);
+        ApplyPoseArgs(args, m_Camera);
         if (args.contains("orthographic") && args["orthographic"].is_boolean())
             m_Camera.SetOrthographic(args["orthographic"]);
         return JsonResult(pose());

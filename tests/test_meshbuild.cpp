@@ -252,6 +252,56 @@ void TestSweepStraightPathIsPrism()
     }
 }
 
+void BoundsOf(const MeshData& m, vec3& lo, vec3& hi)
+{
+    lo = vec3(std::numeric_limits<float>::max());
+    hi = -lo;
+    for (const Vertex& v : m.vertices) {
+        lo = glm::min(lo, v.position);
+        hi = glm::max(hi, v.position);
+    }
+}
+
+void TestSweepSectionOrientationHorizontalPath()
+{
+    // #138: pins the absolute frame convention — looking back along the start
+    // tangent with world +Y as screen-up, the section reads as drawn, so a +Z
+    // path maps section (x, y) onto world (x, y). A right triangle is
+    // asymmetric under every 90-degree rotation and mirror, so any other
+    // frame produces different bounds.
+    const std::vector<vec2> tri = {{0, 0}, {2, 0}, {0, 1}};
+    MeshData m;
+    CHECK(BuildSweep(tri, {{0, 0, 0}, {0, 0, 1}}, m));
+    CHECK(Stats(m).watertight);
+    vec3 lo, hi;
+    BoundsOf(m, lo, hi);
+    CHECK(ApproxEq(lo.x, 0.0f, 1e-6f));
+    CHECK(ApproxEq(hi.x, 2.0f, 1e-6f));
+    CHECK(ApproxEq(lo.y, 0.0f, 1e-6f));
+    CHECK(ApproxEq(hi.y, 1.0f, 1e-6f));
+    CHECK(ApproxEq(lo.z, 0.0f, 1e-6f));
+    CHECK(ApproxEq(hi.z, 1.0f, 1e-6f));
+}
+
+void TestSweepSectionOrientationVerticalPath()
+{
+    // Near-vertical fallback (-Z up hint): a +Y path maps section (x, y) to
+    // world (x, -z) — the top-view convention, bit-compatible with the frame
+    // every pre-#138 vertical sweep already had.
+    const std::vector<vec2> tri = {{0, 0}, {2, 0}, {0, 1}};
+    MeshData m;
+    CHECK(BuildSweep(tri, {{0, 0, 0}, {0, 2, 0}}, m));
+    CHECK(Stats(m).watertight);
+    vec3 lo, hi;
+    BoundsOf(m, lo, hi);
+    CHECK(ApproxEq(lo.x, 0.0f, 1e-6f));
+    CHECK(ApproxEq(hi.x, 2.0f, 1e-6f));
+    CHECK(ApproxEq(lo.y, 0.0f, 1e-6f));
+    CHECK(ApproxEq(hi.y, 2.0f, 1e-6f));
+    CHECK(ApproxEq(lo.z, -1.0f, 1e-6f));
+    CHECK(ApproxEq(hi.z, 0.0f, 1e-6f));
+}
+
 void TestSweepNormalizesSectionWinding()
 {
     // Clockwise input must produce the identical outward-oriented solid.
@@ -366,6 +416,8 @@ void RunMeshBuildTests()
     TestLatheRejectsOversizedInput();
     TestLatheSectorClamp();
     TestSweepStraightPathIsPrism();
+    TestSweepSectionOrientationHorizontalPath();
+    TestSweepSectionOrientationVerticalPath();
     TestSweepNormalizesSectionWinding();
     TestSweepBentPathKeepsSectionRigid();
     TestSweepSeamIsBitExact();

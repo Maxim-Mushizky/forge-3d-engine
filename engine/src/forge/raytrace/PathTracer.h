@@ -21,6 +21,11 @@ public:
 
     void Resize(uint32_t width, uint32_t height); // no-op if unchanged; resets accumulation
     void ResetAccumulation() { m_SampleCount = 0; }
+    // Restart the RNG frame counter. Interactive rendering never calls this
+    // (a monotonic counter decorrelates noise across accumulation restarts);
+    // one-shot MCP renders do, so identical scene + pose + spp reproduce the
+    // exact sample sequence and therefore the exact pixels (#138).
+    void ResetFrameCounter() { m_FrameIndex = 0; }
 
     // Matte floor at y=0 so objects have ground contact/shadows like the raster grid.
     void SetGroundPlane(bool enabled) { m_GroundPlane = enabled; }
@@ -68,7 +73,9 @@ private:
     uint32_t m_AlbedoArray = 0, m_MrArray = 0;      // GL_TEXTURE_2D_ARRAY (sRGB / linear)
     uint32_t m_Width = 0, m_Height = 0;
     int m_SampleCount = 0;
-    int m_FrameIndex = 0; // never resets: decorrelates noise across accumulation restarts
+    int m_FrameIndex = 0; // interactive: monotonic (decorrelates noise across
+                          // accumulation restarts); MCP renders restart it for
+                          // run-to-run determinism (ResetFrameCounter, #138)
     bool m_GroundPlane = true;
     float m_Aperture = 0.0f, m_FocusDist = 8.0f;
     vec3 m_CamRight{1.0f, 0.0f, 0.0f}, m_CamUp{0.0f, 1.0f, 0.0f};

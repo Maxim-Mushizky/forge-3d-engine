@@ -1690,10 +1690,13 @@ void EditorApp::BooleanSelected(BooleanOp op)
     composite->Add(std::make_unique<DeleteEntityCommand>(eb));
     m_Scene.Remove(eb.id);
 
-    const char* opName = op == BooleanOp::Union      ? "Union"
-                         : op == BooleanOp::Subtract ? "Subtract"
-                                                     : "Intersect";
-    Entity& result = m_Scene.CreateEntity(std::string(opName) + " " + std::to_string(m_SpawnCounter++));
+    // #138: the result inherits the first operand's name AND id — a boolean is
+    // conceptually an edit of the target, so chained cuts against the same
+    // name need no rename-back, and selections/scripts/children holding the
+    // target's id stay valid. Both sources were removed above, so reusing the
+    // id cannot collide; undo/redo replay removal before insertion either way.
+    Entity& result = m_Scene.CreateEntity(ea.name);
+    result.id = ea.id;
     result.mesh = r.mesh;          // world-space baked
     result.material = ea.material; // first object's look carries over
     composite->Add(std::make_unique<AddEntityCommand>(result));
