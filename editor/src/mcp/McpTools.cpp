@@ -343,7 +343,9 @@ void EditorApp::RegisterMcpTools()
         "and uniformly rescales both, and returns IoU/Dice plus pass vs threshold, "
         "the silhouette PNG, and a diff PNG (gray = match, green = render only, "
         "magenta = reference only). IoU >= ~0.9 = matching shape; proportion errors "
-        "show as one-sided green/magenta bands.",
+        "show as one-sided green/magenta bands. Its ingest counterpart is "
+        "analyze_reference (#135), which turns a reference image into a simplified "
+        "outline + landmarks to model FROM.",
         {{"type", "object"},
          {"properties",
           {{"id", {{"type", "string"}}},
@@ -361,6 +363,42 @@ void EditorApp::RegisterMcpTools()
          {"required", {"reference"}},
          {"additionalProperties", false}},
         [this](const json& args) { return ToolCompareSilhouette(args); });
+
+    m_McpProtocol.RegisterTool(
+        "analyze_reference",
+        "Ingest half of the shape loop (compare_silhouette is the iterate half, "
+        "#135): binarize a reference image, trace its silhouette to a simplified "
+        "polygon outline (with holes and any extra outlines), and report landmarks "
+        "— bbox, centroid, widest row / tallest column, extremities — plus optional "
+        "per-row spans. Everything is reported in bbox-centered model space (x "
+        "right, y UP, the larger bbox side spanning 1.0 unit), ready to feed sweep "
+        "sections and lathe profiles. Re-rasterizes the simplified polygons and "
+        "self-reports IoU vs the source mask. mirror=\"x\" adds a half-profile "
+        "(r,y) folded about the vertical axis, plus a lathe-ready profile when its "
+        "ends leave the axis. Numbers only — no images.",
+        {{"type", "object"},
+         {"properties",
+          {{"image",
+            {{"type", "string"}, {"description", "path to the reference image (png/jpg)"}}},
+           {"maxPoints",
+            {{"type", "integer"},
+             {"description",
+              "outline point budget, 8-512, default 64; holes and extra outlines "
+              "use min(this, 32)"}}},
+           {"tolerancePx",
+            {{"type", "number"},
+             {"description", "simplification tolerance in px, 0-50, default 1.0"}}},
+           {"mirror",
+            {{"type", "string"},
+             {"enum", {"x"}},
+             {"description", "\"x\" folds a half-profile about the vertical axis"}}},
+           {"spanRows",
+            {{"type", "integer"},
+             {"description", "sample this many evenly-spaced per-row spans, 0-4096, "
+                             "default 0 = none"}}}}},
+         {"required", {"image"}},
+         {"additionalProperties", false}},
+        [this](const json& args) { return ToolAnalyzeReference(args); });
 
     m_McpProtocol.RegisterTool(
         "raycast",
@@ -888,7 +926,8 @@ void EditorApp::RegisterMcpTools()
         "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
         "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}, "
         "measure{a/b or entity+axis — #114 distances/extents}, compare_silhouette{"
-        "reference, view — returns IoU numbers; the diff images are MCP-only}. "
+        "reference, view — returns IoU numbers; the diff images are MCP-only}, "
+        "analyze_reference{image — outline + landmarks in model space, #135}. "
         "Writes: spawn{} (incl. primitive='lathe' params={profile={{r,y},... bottom->top "
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
@@ -1252,6 +1291,185 @@ ToolResult EditorApp::ToolCompareSilhouette(const json& args)
             {{"type", "image"}, {"data", diffB64}, {"mimeType", "image/png"}});
     }
     return result;
+}
+
+ToolResult EditorApp::ToolAnalyzeReference(const json& args)
+{
+    if (!args.contains("image") || !args["image"].is_string())
+        return Err("Provide \"image\" (path to the reference image)");
+    const std::string imagePath = args["image"];
+    // Lua numbers can arrive as doubles; read leniently, then clamp.
+    auto numArg = [&](const char* key, double def) {
+        return args.contains(key) && args[key].is_number() ? args[key].get<double>() : def;
+    };
+    const int maxPoints = std::clamp((int)std::lround(numArg("maxPoints", 64.0)), 8, 512);
+    const int holeBudget = std::min(maxPoints, 32); // holes/extras are supporting geometry
+    const float tolerancePx = (float)std::clamp(numArg("tolerancePx", 1.0), 0.0, 50.0);
+    const int spanRows = std::clamp((int)std::lround(numArg("spanRows", 0.0)), 0, 4096);
+    std::string mirror;
+    if (args.contains("mirror")) {
+        if (!args["mirror"].is_string())
+            return Err("mirror must be the string \"x\"");
+        mirror = args["mirror"];
+        if (mirror != "x")
+            return Err("mirror must be \"x\" (fold about the vertical axis) or omitted");
+    }
+
+    int refW = 0, refH = 0, refC = 0;
+    stbi_uc* refPixels = stbi_load(imagePath.c_str(), &refW, &refH, &refC, 4);
+    if (!refPixels)
+        return Err("Failed to load reference image \"" + imagePath +
+                   "\": " + stbi_failure_reason());
+    // RAII on the C buffer (#114): the kernel allocates image-sized transients,
+    // and a bad_alloc there must not leak the decode buffer.
+    const std::unique_ptr<stbi_uc, void (*)(void*)> refOwner(refPixels, stbi_image_free);
+
+    const SilhouetteMask mask = BinarizeImage(refPixels, refW, refH);
+    if (MaskArea(mask) == 0)
+        return Err("Reference image has no foreground after binarization");
+
+    const SilhouetteLandmarks lm = MaskLandmarks(mask);
+    std::vector<SilhouetteContour> contours = TraceContours(mask);
+    // Largest top-level outer = THE outline; the rest of the top-level outers are
+    // extra outlines. Holes attach to their parent.
+    int outlineIdx = -1;
+    double bestArea = -1.0;
+    for (int i = 0; i < (int)contours.size(); ++i)
+        if (contours[i].parent == -1 && !contours[i].hole && std::abs(contours[i].area) > bestArea) {
+            bestArea = std::abs(contours[i].area);
+            outlineIdx = i;
+        }
+    if (outlineIdx < 0)
+        return Err("Reference produced no outer contour");
+
+    // Bbox-centered model space: x right, y UP, larger bbox side spans 1.0, so
+    // the outline lands in [-0.5, 0.5]^2 — sweep-section- and lathe-ready.
+    const double cx = (lm.minX + lm.maxX + 1) / 2.0; // corner coords
+    const double cy = (lm.minY + lm.maxY + 1) / 2.0;
+    const double s = 1.0 / (double)std::max(lm.bboxWidth, lm.bboxHeight);
+    auto round5 = [](double v) { return std::round(v * 100000.0) / 100000.0; };
+    auto modelX = [&](double px) { return (px - cx) * s; };
+    auto modelY = [&](double py) { return (cy - py) * s; }; // flip to y-up
+    auto modelPt = [&](const vec2& p) -> json {
+        return {round5(modelX(p.x)), round5(modelY(p.y))};
+    };
+
+    // Simplify + emit one contour: points in model space (rounded), plus area
+    // and centroid computed in model space.
+    std::vector<SilhouetteContour> rasterSet; // all simplified polys for round-trip IoU
+    auto emitContour = [&](const std::vector<vec2>& pixelPts, int budget) -> json {
+        const std::vector<vec2> simp = SimplifyContour(pixelPts, budget, tolerancePx);
+        rasterSet.push_back(SilhouetteContour{simp, 0.0, false, -1});
+        std::vector<vec2> model;
+        json pts = json::array();
+        model.reserve(simp.size());
+        for (const vec2& p : simp) {
+            model.push_back(vec2((float)modelX(p.x), (float)modelY(p.y)));
+            pts.push_back(modelPt(p));
+        }
+        const vec2 c = PolygonCentroid(model);
+        json j;
+        j["points"] = pts;
+        j["area"] = round5(std::abs(PolygonSignedArea(model)));
+        j["centroid"] = {round5(c.x), round5(c.y)};
+        j["pointCount"] = (int)simp.size();
+        return j;
+    };
+    auto holesOf = [&](int parent) -> json {
+        json arr = json::array();
+        for (int i = 0; i < (int)contours.size(); ++i)
+            if (contours[i].parent == parent && contours[i].hole)
+                arr.push_back(emitContour(contours[i].points, holeBudget));
+        return arr;
+    };
+
+    json j;
+    j["image"] = {{"width", refW}, {"height", refH}};
+    j["mask"] = {{"area", lm.area},
+                 {"areaFractionImage", lm.areaFractionImage},
+                 {"fillFactor", lm.fillFactor}};
+    j["bbox"] = {{"x", lm.minX}, {"y", lm.minY},   {"width", lm.bboxWidth},
+                 {"height", lm.bboxHeight}, {"aspect", lm.aspect}};
+    j["centroid"] = modelPt(lm.centroid);
+    j["centroidPx"] = {round5(lm.centroid.x), round5(lm.centroid.y)};
+    j["extremities"] = {{"top", modelPt(lm.top)},
+                        {"bottom", modelPt(lm.bottom)},
+                        {"left", modelPt(lm.left)},
+                        {"right", modelPt(lm.right)}};
+    j["widestRow"] = {{"y", lm.widestRowY},
+                      {"yModel", round5(modelY(lm.widestRowY + 0.5))},
+                      {"left", lm.widestRowLeft},
+                      {"right", lm.widestRowRight},
+                      {"span", lm.widestRowSpan},
+                      {"spanModel", round5(lm.widestRowSpan * s)}};
+    j["tallestColumn"] = {{"x", lm.tallestColX},
+                          {"xModel", round5(modelX(lm.tallestColX + 0.5))},
+                          {"top", lm.tallestColTop},
+                          {"bottom", lm.tallestColBottom},
+                          {"span", lm.tallestColSpan},
+                          {"spanModel", round5(lm.tallestColSpan * s)}};
+
+    j["outline"] = emitContour(contours[outlineIdx].points, maxPoints);
+    j["holes"] = holesOf(outlineIdx); // the main outline's holes, top-level
+
+    json extra = json::array();
+    for (int i = 0; i < (int)contours.size(); ++i)
+        if (i != outlineIdx && contours[i].parent == -1 && !contours[i].hole) {
+            json e = emitContour(contours[i].points, holeBudget);
+            e["holes"] = holesOf(i);
+            extra.push_back(e);
+        }
+    j["extraOutlines"] = extra;
+
+    if (spanRows > 0) {
+        json rows = json::array();
+        for (const SilhouetteRowSpan& r : MaskRowSpans(mask, spanRows))
+            rows.push_back({{"y", r.y},
+                            {"yModel", round5(modelY(r.y + 0.5))},
+                            {"left", r.left},
+                            {"right", r.right},
+                            {"covered", r.covered}});
+        j["rowSpans"] = rows;
+    }
+
+    // Self-reported acceptance: re-rasterize every simplified polygon at the
+    // source size and score against the binarized mask (even-odd punches holes).
+    const SilhouetteMask rt = RasterizePolygons(rasterSet, refW, refH);
+    j["roundTripIoU"] = CompareMasks(rt, mask).iou;
+
+    const double pixelsPerUnit = (double)std::max(lm.bboxWidth, lm.bboxHeight);
+    j["scale"] = {{"pixelsPerUnit", pixelsPerUnit},
+                  {"modelToPixel", "px = center + point*pixelsPerUnit (y flipped)"}};
+
+    if (mirror == "x") {
+        // Fold the simplified outer in PIXEL space about the bbox center, then
+        // map to model space. FoldOutline emits bottom (max y) -> top (min y),
+        // which is already bottom -> top in y-up model space — the natural order
+        // for a lathe profile, so no reversal is applied (see report note).
+        const std::vector<vec2> foldPx =
+            FoldOutline(SimplifyContour(contours[outlineIdx].points, maxPoints, tolerancePx),
+                        (float)cx);
+        std::vector<vec2> hp; // model-space (r, y), bottom -> top
+        json hpPts = json::array();
+        for (const vec2& p : foldPx) {
+            const double rM = (double)p.x * s; // r is a length: scale, no origin shift
+            const double yM = modelY(p.y);
+            hp.push_back(vec2((float)rM, (float)yM));
+            hpPts.push_back({round5(rM), round5(yM)});
+        }
+        j["halfProfile"] = {{"axisXModel", 0.0}, {"points", hpPts}};
+        // A profile whose ends sit off the axis closes to the axis for a lathe.
+        if (!hp.empty() && (hp.front().x > 1e-3f || hp.back().x > 1e-3f)) {
+            json lp = json::array();
+            lp.push_back({0.0, round5(hp.front().y)});
+            for (const vec2& p : hp)
+                lp.push_back({round5(p.x), round5(p.y)});
+            lp.push_back({0.0, round5(hp.back().y)});
+            j["latheProfile"] = lp;
+        }
+    }
+
+    return JsonResult(j);
 }
 
 ToolResult EditorApp::ToolQuerySpatial(const json& args)
@@ -3296,6 +3514,7 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("query_spatial", call(&EditorApp::ToolQuerySpatial, nullptr));
         add("measure", call(&EditorApp::ToolMeasure, nullptr)); // #114
         add("compare_silhouette", call(&EditorApp::ToolCompareSilhouette, nullptr)); // #114: numbers only
+        add("analyze_reference", call(&EditorApp::ToolAnalyzeReference, nullptr)); // #135: numbers only
 
         add("spawn", call(&EditorApp::ToolManageEntity, "spawn"));
         add("delete", call(&EditorApp::ToolManageEntity, "delete"));
