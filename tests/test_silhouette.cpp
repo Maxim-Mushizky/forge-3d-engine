@@ -5,7 +5,9 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 // Suites for the silhouette kernel (#114): software rasterization, reference
@@ -236,6 +238,230 @@ static void BinarizeWhiteOnWhite()
     CHECK(m.pixels[2 * w + 2] == 0);     // ground stays ground
 }
 
+// Enclosed through-hole recovery (#134): backdrop seen THROUGH the object (a
+// donut's hole) never connects to the frame border, so the flood alone leaves
+// it foreground. A background-toned, sharp-rimmed, fully enclosed region now
+// punches back out.
+static void BinarizeDonutHoleRecovered()
+{
+    const int w = 32, h = 32;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t lum) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = p[1] = p[2] = lum;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 220); // ground
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            fill(x, y, 60); // 16x16 object
+    for (int y = 12; y < 20; ++y)
+        for (int x = 12; x < 20; ++x)
+            fill(x, y, 160); // hole: the ground occluded and shadowed —
+                             // inside the [med/2, med*4/5] window, rim sharp
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 16 * 16 - 8 * 8); // the ring, hole carved out
+    CHECK(m.pixels[9 * w + 9] != 0);       // ring is figure
+    CHECK(m.pixels[15 * w + 15] == 0);     // hole is ground again
+    CHECK(m.pixels[2 * w + 2] == 0);       // outer ground untouched
+}
+
+// A tone below HALF the ground brightness is object material, not backdrop
+// seen through a hole — real backdrops keep most of their light even
+// shadowed. The recess must survive recovery.
+static void BinarizeDarkRecessKept()
+{
+    const int w = 32, h = 32;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t lum) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = p[1] = p[2] = lum;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 220);
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            fill(x, y, 60);
+    for (int y = 12; y < 20; ++y)
+        for (int x = 12; x < 20; ++x)
+            fill(x, y, 90); // enclosed and sharp-rimmed, but 90 < 220/2 —
+                            // too dark for shadowed backdrop, no seed
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 16 * 16); // solid object, recess kept
+    CHECK(m.pixels[15 * w + 15] != 0);
+}
+
+// The chroma gate on recovery: a recess whose LUMINANCE reads as shadowed
+// backdrop but whose color is tinted is object material — backdrop seen
+// through a hole keeps the ground's neutrality. (The axe's brass vs the white
+// sweep.)
+static void BinarizeTintedRecessKept()
+{
+    const int w = 32, h = 32;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 220, 220, 220);
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            fill(x, y, 60, 60, 60);
+    for (int y = 12; y < 20; ++y)
+        for (int x = 12; x < 20; ++x)
+            fill(x, y, 180, 140, 100); // lum 147 sits in the shadow window,
+                                       // but spread 80 is nothing like the ground
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 16 * 16); // solid object, tinted recess kept
+    CHECK(m.pixels[15 * w + 15] != 0);
+}
+
+// On a COLORED ground the chroma guard has nothing to say, so hole recovery
+// must not run at all — with the caps wide open it would punch this tinted
+// recess on luminance alone (its lum 120 sits mid shadow-window of the warm
+// ground's 226). Colored grounds keep pre-#134 behavior exactly.
+static void BinarizeColoredGroundNoRecovery()
+{
+    const int w = 32, h = 32;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 240, 225, 200); // warm studio paper, spread 40
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            fill(x, y, 60, 60, 60);
+    for (int y = 12; y < 20; ++y)
+        for (int x = 12; x < 20; ++x)
+            fill(x, y, 160, 110, 70); // enclosed tinted recess, sharp-rimmed
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 16 * 16); // solid object, recess kept
+    CHECK(m.pixels[15 * w + 15] != 0);
+}
+
+// The chroma gate on the flood itself (#134's blade-leak case): a warm-tinted
+// bright object whose rim ramps into a white ground at under kEdgeStep per
+// pixel. The gradient gate alone would roll straight through; the border's
+// chroma model says the object is not ground no matter how bright.
+static void BinarizeTintedObjectOnWhiteKept()
+{
+    const int w = 32, h = 32;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 250, 250, 250); // pure white ground
+    for (int y = 10; y < 22; ++y)
+        for (int x = 10; x < 22; ++x)
+            fill(x, y, 252, 244, 236); // lum 245: one gradient step from the
+                                       // ground, but visibly warm (spread 16)
+    for (int y = 13; y < 19; ++y)
+        for (int x = 13; x < 19; ++x)
+            fill(x, y, 60, 60, 60); // dark core: with the gate broken the
+                                    // flood eats the warm rim and SUCCEEDS
+                                    // with just this core (36 px), instead of
+                                    // degenerating into an Otsu rescue that
+                                    // would pass the assertions anyway
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    // The object survives, plus a thin blur-halo of ground pixels whose 9x9
+    // chroma window overlaps it — the price of denoising the gate. Bounded,
+    // not exact: the halo shape depends on integer blur rounding.
+    const int area = MaskArea(m);
+    CHECK(area >= 12 * 12);
+    CHECK(area <= 20 * 20);
+    CHECK(m.pixels[16 * w + 16] != 0); // object center is figure
+    CHECK(m.pixels[11 * w + 11] != 0); // warm rim is figure
+    CHECK(m.pixels[4 * w + 4] == 0);   // ground is ground
+}
+
+// Specular highlight vs hole: sheen fades SMOOTHLY into the object, so the
+// recovery region leaks down the ramp across the whole figure and disqualifies
+// itself (open + over the area cap) — where a true hole's sharp rim would have
+// contained it. The issue's brushed-steel-sheen case.
+static void BinarizeHighlightNotPunched()
+{
+    const int w = 96, h = 96;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t lum) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = p[1] = p[2] = lum;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 220); // ground
+    for (int y = 8; y < 88; ++y)
+        for (int x = 8; x < 88; ++x) {
+            // Dark object with a highlight core near ground tone; the ramp
+            // slope (5/px) never exceeds the flood's gradient gate.
+            const int c = std::max(std::abs(x - 48), std::abs(y - 48));
+            fill(x, y, (uint8_t)std::max(60, 215 - 5 * c));
+        }
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 80 * 80); // nothing punched
+    CHECK(m.pixels[48 * w + 48] != 0);
+}
+
+// The topology guard: a shadow-toned pocket that ANCHORS real figure (dark
+// decoration enclosed inside it) must not punch — that would orphan the
+// decoration onto background. The pocket passes the enclosure, area, and
+// shadow-window tests (it is only 8% of the figure and sits mid-window), so
+// containment is the ONLY thing keeping it with the object.
+static void BinarizePocketAnchoringIslandKept()
+{
+    const int w = 48, h = 48;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t lum) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = p[1] = p[2] = lum;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 250); // white ground
+    for (int y = 4; y < 44; ++y)
+        for (int x = 4; x < 44; ++x)
+            fill(x, y, 120); // 40x40 object
+    for (int y = 12; y < 24; ++y)
+        for (int x = 12; x < 24; ++x)
+            fill(x, y, 160); // shadow-window pocket, sharp-rimmed, enclosed
+    for (int y = 16; y < 20; ++y)
+        for (int x = 16; x < 20; ++x)
+            fill(x, y, 40); // decoration island inside the pocket
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 40 * 40);     // whole object, pocket kept
+    CHECK(m.pixels[13 * w + 13] != 0); // pocket is figure
+    CHECK(m.pixels[17 * w + 17] != 0); // decoration too
+}
+
 static SilhouetteMask SolidRect(int maskW, int maskH, int x0, int y0, int w, int h)
 {
     SilhouetteMask m = MakeMask(maskW, maskH);
@@ -356,6 +582,13 @@ void RunSilhouetteTests()
     BinarizeOtsuPolarityAndSpecks();
     BinarizeOtsuFallbackPath();
     BinarizeWhiteOnWhite();
+    BinarizeDonutHoleRecovered();
+    BinarizeDarkRecessKept();
+    BinarizeTintedRecessKept();
+    BinarizeColoredGroundNoRecovery();
+    BinarizeTintedObjectOnWhiteKept();
+    BinarizeHighlightNotPunched();
+    BinarizePocketAnchoringIslandKept();
     NormalizeInvariances();
     CompareAndDiffValues();
     LatheCupAcceptance();

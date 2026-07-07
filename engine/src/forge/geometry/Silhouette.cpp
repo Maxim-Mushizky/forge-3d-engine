@@ -1,6 +1,7 @@
 #include "Silhouette.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace forge {
@@ -191,6 +192,254 @@ static void DropSpecks(SilhouetteMask& m)
             m.pixels[i] = 0;
 }
 
+// The flood's gradient gate, shared with enclosed-hole recovery: growth
+// crosses smooth shading (vignettes, soft shadows) but stops where adjacent
+// pixels step harder than this — JPEG-soft contours still clear it.
+static constexpr int kEdgeStep = 5;
+
+// Box-blurred chroma spread: per-pixel max(r,g,b) - min(r,g,b), averaged over
+// a clamped 9x9 window. Distance from the gray axis is what separates a
+// studio sweep (clinically neutral) from bright object material (warm steel,
+// brass reflections) when LUMINANCE cannot — an edge-lit blade rim ramps into
+// a white backdrop at under kEdgeStep per pixel for a hundred pixels, so the
+// gradient gate alone leaks (#134). Raw per-pixel spread is not usable: JPEG
+// chroma subsampling crushes tint in blown highlights and deep shadows; the
+// blur recovers a region's tint from its neighbors while true backdrop stays
+// at zero. The 4-px reach also wraps a protective band around the object, so
+// its blown rim (genuinely neutral in the data) survives with it instead of
+// eroding off the silhouette.
+static std::vector<uint8_t> BlurredChromaSpread(const uint8_t* rgba, int width, int height)
+{
+    constexpr int kR = 4; // blur radius; window = (2*kR+1)^2 taps
+    constexpr int kTaps = (2 * kR + 1) * (2 * kR + 1);
+    const size_t n = (size_t)width * height;
+    std::vector<uint8_t> spread(n);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t* p = &rgba[i * 4];
+        const uint8_t hi = std::max({p[0], p[1], p[2]});
+        const uint8_t lo = std::min({p[0], p[1], p[2]});
+        spread[i] = (uint8_t)(hi - lo);
+    }
+    // Separable sliding-window box sums (edge-replicated) — bit-identical to
+    // the naive (2R+1)^2 gather but O(n): this runs on the GL main thread for
+    // every opaque reference load, and 81 taps per pixel measured a 7x
+    // binarize slowdown. Row sums cap at 9*255 = 2295 (uint16); column sums
+    // of those cap well inside int.
+    std::vector<uint16_t> rowSum(n);
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* row = &spread[(size_t)y * width];
+        uint16_t* out = &rowSum[(size_t)y * width];
+        int sum = 0;
+        for (int dx = -kR; dx <= kR; ++dx)
+            sum += row[std::clamp(dx, 0, width - 1)];
+        out[0] = (uint16_t)sum;
+        for (int x = 1; x < width; ++x) {
+            sum += row[std::clamp(x + kR, 0, width - 1)] - row[std::clamp(x - kR - 1, 0, width - 1)];
+            out[x] = (uint16_t)sum;
+        }
+    }
+    std::vector<uint8_t> blur(n);
+    for (int x = 0; x < width; ++x) {
+        int sum = 0;
+        for (int dy = -kR; dy <= kR; ++dy)
+            sum += rowSum[(size_t)std::clamp(dy, 0, height - 1) * width + x];
+        blur[x] = (uint8_t)((sum + kTaps / 2) / kTaps);
+        for (int y = 1; y < height; ++y) {
+            sum += rowSum[(size_t)std::clamp(y + kR, 0, height - 1) * width + x] -
+                   rowSum[(size_t)std::clamp(y - kR - 1, 0, height - 1) * width + x];
+            blur[(size_t)y * width + x] = (uint8_t)((sum + kTaps / 2) / kTaps);
+        }
+    }
+    return blur;
+}
+
+// Enclosed through-hole recovery (#134): the border flood cannot reach
+// backdrop seen THROUGH the object (an axe head's cutouts), so those pixels
+// land in the figure. Re-run the flood's physics from the inside: seed at
+// figure pixels with backdrop-neutral chroma anywhere above half the border's
+// brightness (the wide top is load-bearing — a sheen region must swallow its
+// whole bright ramp so it dies open or over-cap), grow with the flood's
+// gradient+chroma gates, then apply the SHADOW test to the region's median in
+// verdict (c): a through-hole shows the ground occluded and shadowed, between
+// half and four fifths of the border's brightness — meaningfully darker,
+// never brighter, never near-black (β≈0.5..0.8 in shadow-detection terms).
+// Punch the region back to background only when it
+//   (a) is fully enclosed — touches neither the image border nor the outer
+//       background (a region the flood merely failed to seed is not a hole);
+//   (b) sits between minArea (JPEG salt would pepper the mask with pinhole
+//       punches — and no-op on hole-free images must stay bit-identical) and
+//       40% of the figure (bigger reads as a mis-flood; the caller's
+//       degeneracy checks own that call);
+//   (c) has a region MEDIAN inside the shadow window — one bright seed inside
+//       noise must not drag a sheen patch through;
+//   (d) anchors no foreground island — a shadowed pocket with decoration
+//       inside it passes every other test, but punching it would orphan the
+//       decoration onto background; a true hole has nothing inside. Only an
+//       island wrapped by exactly ONE candidate counts (containment is the
+//       evidence): a steel band pinched between two candidate regions is not
+//       held by either, and a sub-5%-of-the-candidate island is JPEG noise,
+//       not decoration.
+// Interior highlights fail structurally: sheen fades smoothly into the
+// object, so its region leaks across the whole figure and dies open or over
+// the area cap; bright steel pockets fail (c). The whole pass is skipped on
+// dark grounds (median < 128): "shadowed backdrop" is unreadable there and
+// the window would select object shadow instead. The CALLER additionally
+// skips it on non-neutral grounds, where punchCap sits at 255 and the chroma
+// guard — the only thing keeping tinted recesses safe — would be inert.
+static void PunchEnclosedHoles(const std::vector<uint8_t>& lum, const std::vector<uint8_t>& sblur,
+                               int width, int height, int median, int seedDelta, int punchCap,
+                               std::vector<uint8_t>& bg)
+{
+    if (median < 128)
+        return;
+    const int shadowLo = median / 2;
+    const int shadowHi = median * 4 / 5;
+    const int seedHi = median + seedDelta; // growth may climb brighter; seeds may not
+
+    const int n = width * height;
+    int64_t fgArea = 0;
+    for (int i = 0; i < n; ++i)
+        if (!bg[i])
+            ++fgArea;
+    const int64_t minArea = std::max<int64_t>(9, fgArea / 1000);
+    const int64_t maxArea = fgArea * 2 / 5;
+
+    // Pass 1: gradient+chroma-limited regions grown from backdrop-toned
+    // seeds — the outer flood's growth rules, run from the inside. Candidates
+    // must stay a few flags each: the seed window accepts most mid-to-bright
+    // figure pixels, so a grainy grayscale figure can fragment into a
+    // candidate per pixel (a 4 MP reference measured 2 GB with a 1 KB
+    // histogram embedded per candidate).
+    struct Candidate {
+        int64_t area = 0;
+        bool open = false;     // touches the image border or the outer background
+        bool anchored = false; // a contained figure island leans on it (pass 3)
+        bool punch = false;    // final verdict
+    };
+    std::vector<int32_t> region((size_t)n, -1); // -1 = not a hole candidate
+    std::vector<Candidate> cands;
+    std::vector<int> stack;
+    for (int i = 0; i < n; ++i) {
+        if (bg[i] || region[i] >= 0 || sblur[i] > punchCap || (int)lum[i] < shadowLo ||
+            (int)lum[i] > seedHi)
+            continue;
+        const int32_t id = (int32_t)cands.size();
+        cands.push_back({});
+        region[i] = id;
+        stack.push_back(i);
+        while (!stack.empty()) {
+            const int p = stack.back();
+            stack.pop_back();
+            ++cands[id].area;
+            const int x = p % width, y = p / width;
+            if (x == 0 || y == 0 || x == width - 1 || y == height - 1)
+                cands[id].open = true;
+            const int nb[4] = {x > 0 ? p - 1 : -1, x + 1 < width ? p + 1 : -1,
+                               y > 0 ? p - width : -1, y + 1 < height ? p + width : -1};
+            for (int q : nb) {
+                if (q < 0)
+                    continue;
+                if (bg[q])
+                    cands[id].open = true;
+                else if (region[q] < 0 && sblur[q] <= punchCap &&
+                         std::abs((int)lum[q] - (int)lum[p]) <= kEdgeStep) {
+                    region[q] = id;
+                    stack.push_back(q);
+                }
+            }
+        }
+    }
+    if (cands.empty())
+        return;
+
+    // Pass 2: the figure minus every candidate, labeled into components
+    // (plain adjacency — object structure, not tone, decides connectivity). A
+    // component is grounded when it reaches the outer background or the image
+    // border on its own, i.e. it survives any punch.
+    struct Component {
+        int64_t area = 0;
+        bool grounded = false;
+        int32_t cand = -1;  // the single adjacent candidate, -1 none yet
+        bool multi = false; // touches two or more candidates: contained by none
+    };
+    std::vector<int32_t> comp((size_t)n, -1);
+    std::vector<Component> comps;
+    for (int i = 0; i < n; ++i) {
+        if (bg[i] || region[i] >= 0 || comp[i] >= 0)
+            continue;
+        const int32_t id = (int32_t)comps.size();
+        comps.push_back({});
+        comp[i] = id;
+        stack.push_back(i);
+        while (!stack.empty()) {
+            const int p = stack.back();
+            stack.pop_back();
+            ++comps[id].area;
+            const int x = p % width, y = p / width;
+            if (x == 0 || y == 0 || x == width - 1 || y == height - 1)
+                comps[id].grounded = true;
+            const int nb[4] = {x > 0 ? p - 1 : -1, x + 1 < width ? p + 1 : -1,
+                               y > 0 ? p - width : -1, y + 1 < height ? p + width : -1};
+            for (int q : nb) {
+                if (q < 0)
+                    continue;
+                if (bg[q]) {
+                    comps[id].grounded = true;
+                } else if (region[q] >= 0) {
+                    if (comps[id].cand < 0)
+                        comps[id].cand = region[q];
+                    else if (comps[id].cand != region[q])
+                        comps[id].multi = true;
+                } else if (comp[q] < 0) {
+                    comp[q] = id;
+                    stack.push_back(q);
+                }
+            }
+        }
+    }
+
+    // Pass 3: an ungrounded island wrapped by exactly one candidate anchors
+    // it — unless the island is noise-sized relative to that candidate.
+    for (const Component& c : comps)
+        if (!c.grounded && !c.multi && c.cand >= 0 &&
+            c.area >= std::max<int64_t>(9, cands[c.cand].area / 20))
+            cands[c.cand].anchored = true;
+
+    // Verdict: cheap gates first; region medians only for the few candidates
+    // that survive them, with the 256-bin histograms accumulated in one extra
+    // sweep over just those regions.
+    std::vector<int32_t> shortIdx(cands.size(), -1);
+    int32_t shortCount = 0;
+    for (size_t c = 0; c < cands.size(); ++c)
+        if (!cands[c].open && !cands[c].anchored && cands[c].area >= minArea &&
+            cands[c].area <= maxArea)
+            shortIdx[c] = shortCount++;
+    if (shortCount == 0)
+        return;
+    std::vector<std::array<uint32_t, 256>> hists((size_t)shortCount); // zeroed
+    for (int i = 0; i < n; ++i)
+        if (region[i] >= 0 && shortIdx[region[i]] >= 0)
+            ++hists[shortIdx[region[i]]][lum[i]];
+    for (size_t c = 0; c < cands.size(); ++c) {
+        if (shortIdx[c] < 0)
+            continue;
+        const std::array<uint32_t, 256>& h = hists[shortIdx[c]];
+        int64_t seen = 0;
+        int regionMedian = 0;
+        for (int v = 0; v < 256; ++v) {
+            seen += h[v];
+            if (seen * 2 >= cands[c].area) {
+                regionMedian = v;
+                break;
+            }
+        }
+        cands[c].punch = regionMedian >= shadowLo && regionMedian <= shadowHi; // test (c)
+    }
+    for (int i = 0; i < n; ++i)
+        if (region[i] >= 0 && cands[region[i]].punch)
+            bg[i] = 1;
+}
+
 // Background flood from the border: product shots have a ground touching the
 // frame edge. Growth is GRADIENT-limited, not tone-limited — the ground is
 // smooth (vignettes, soft shadows) while the figure boundary is an edge, so
@@ -199,21 +448,32 @@ static void DropSpecks(SilhouetteMask& m)
 // a white ground — the case a global threshold fundamentally splits wrong)
 // with the object. The absolute tolerance applies only to SEEDING, so a
 // figure cropped by the frame edge doesn't seed a leak from inside itself.
-// Costs: through-holes in the object fill in (supply an alpha matte when they
-// matter). False when the result degenerates; caller falls back to Otsu.
-static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, int width, int height,
-                                  SilhouetteMask& out)
+// Growth is additionally CHROMA-limited (#134): the flood never enters pixels
+// tinted beyond the border's own spread, which is what stops it where the
+// gradient gate cannot — an edge-lit steel rim ramping seamlessly into a
+// white sweep. On a colored ground the cap derives from the border's spread
+// and goes wide, degrading gracefully to the pure gradient behavior.
+// Through-holes the flood can't reach are recovered afterwards
+// (PunchEnclosedHoles); an alpha matte remains the explicit override.
+// False when the result degenerates; caller falls back to Otsu.
+static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, const std::vector<uint8_t>& sblur,
+                                  int width, int height, SilhouetteMask& out)
 {
     const int n = width * height;
-    std::vector<uint8_t> border;
+    std::vector<uint8_t> border, sborder;
     border.reserve((size_t)2 * (width + height));
+    sborder.reserve((size_t)2 * (width + height));
+    auto sample = [&](size_t i) {
+        border.push_back(lum[i]);
+        sborder.push_back(sblur[i]);
+    };
     for (int x = 0; x < width; ++x) {
-        border.push_back(lum[(size_t)x]);
-        border.push_back(lum[(size_t)(height - 1) * width + x]);
+        sample((size_t)x);
+        sample((size_t)(height - 1) * width + x);
     }
     for (int y = 1; y + 1 < height; ++y) {
-        border.push_back(lum[(size_t)y * width]);
-        border.push_back(lum[(size_t)y * width + width - 1]);
+        sample((size_t)y * width);
+        sample((size_t)y * width + width - 1);
     }
     if (border.empty())
         return false;
@@ -221,18 +481,32 @@ static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, int width, in
         std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
         return (int)v[v.size() / 2];
     };
+    auto madOf = [&](std::vector<uint8_t>& v, int med) {
+        std::vector<uint8_t> dev(v.size());
+        for (size_t i = 0; i < v.size(); ++i)
+            dev[i] = (uint8_t)std::abs((int)v[i] - med);
+        return medianOf(dev);
+    };
     const int median = medianOf(border);
-    std::vector<uint8_t> dev(border.size());
-    for (size_t i = 0; i < border.size(); ++i)
-        dev[i] = (uint8_t)std::abs((int)border[i] - median);
-    const int mad = medianOf(dev);
-
+    const int mad = madOf(border, median);
     const int seedDelta = std::max(24, 3 * mad);
-    constexpr int kEdgeStep = 5; // JPEG-soft contours still step harder than a vignette
+    const int smedian = medianOf(sborder);
+    const int smad = madOf(sborder, smedian);
+    // The chroma model only speaks when the border says the ground is
+    // NEUTRAL: on a colored ground the spread of object material sits inside
+    // the ground's own spread, the gate would flap on JPEG chroma noise, and
+    // hole-free references must stay bit-identical to the pre-#134 flood.
+    // Flood gate strict (a leak erases whole object regions); punch gate loose
+    // (JPEG mosquito noise inside a real hole must not fragment it — the punch
+    // has four other guards).
+    const bool neutralGround = smedian <= 8;
+    const int floodCap = neutralGround ? smedian + std::max(2, 3 * smad) : 255;
+    const int punchCap = neutralGround ? smedian + std::max(8, 3 * smad) : 255;
+
     std::vector<uint8_t> bg((size_t)n, 0);
     std::vector<int> stack;
     auto seed = [&](int i) {
-        if (!bg[i] && std::abs((int)lum[i] - median) <= seedDelta) {
+        if (!bg[i] && std::abs((int)lum[i] - median) <= seedDelta && sblur[i] <= floodCap) {
             bg[i] = 1;
             stack.push_back(i);
         }
@@ -253,7 +527,8 @@ static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, int width, in
         const int nb[4] = {x > 0 ? p - 1 : -1, x + 1 < width ? p + 1 : -1,
                            y > 0 ? p - width : -1, y + 1 < height ? p + width : -1};
         for (int q : nb)
-            if (q >= 0 && !bg[q] && std::abs((int)lum[q] - (int)lum[p]) <= kEdgeStep) {
+            if (q >= 0 && !bg[q] && sblur[q] <= floodCap &&
+                std::abs((int)lum[q] - (int)lum[p]) <= kEdgeStep) {
                 bg[q] = 1;
                 stack.push_back(q);
                 ++bgCount;
@@ -265,6 +540,15 @@ static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, int width, in
     // (fg = 0 must fall back to Otsu, not report an empty success).
     if (fg < std::max(1, n / 100) || (int64_t)fg * 100 > (int64_t)n * 95)
         return false; // flood leaked through the figure, or found no ground
+
+    // After the degeneracy verdict, not before: recovery only ever shrinks the
+    // figure, and a mask that needed the Otsu fallback should not be rescued
+    // into a different segmentation by hole-punching. Neutral grounds only:
+    // with punchCap at 255 the punch would run on luminance alone and eat
+    // tinted recesses — colored grounds keep pre-#134 behavior exactly, and
+    // holes there remain the documented alpha-matte case.
+    if (neutralGround)
+        PunchEnclosedHoles(lum, sblur, width, height, median, seedDelta, punchCap, bg);
 
     out = MakeMask(width, height);
     for (int i = 0; i < n; ++i)
@@ -302,7 +586,8 @@ SilhouetteMask BinarizeImage(const uint8_t* rgba, int width, int height)
         ++hist[lum[i]];
     }
 
-    if (BinarizeByBorderFlood(lum, width, height, m)) {
+    const std::vector<uint8_t> sblur = BlurredChromaSpread(rgba, width, height);
+    if (BinarizeByBorderFlood(lum, sblur, width, height, m)) {
         DropSpecks(m);
         return m;
     }

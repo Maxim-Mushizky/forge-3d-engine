@@ -337,7 +337,9 @@ void EditorApp::RegisterMcpTools()
         "compare_silhouette",
         "Shape verification against a reference image (#114): software-rasterizes "
         "the entity subtree (or whole scene) into a binary orthographic silhouette, "
-        "binarizes the reference (alpha matte when present, else Otsu), tight-crops "
+        "binarizes the reference (alpha matte when present, else border flood with "
+        "Otsu fallback; enclosed through-holes in opaque references — backdrop seen "
+        "through cutouts — are recovered automatically, #134), tight-crops "
         "and uniformly rescales both, and returns IoU/Dice plus pass vs threshold, "
         "the silhouette PNG, and a diff PNG (gray = match, green = render only, "
         "magenta = reference only). IoU >= ~0.9 = matching shape; proportion errors "
