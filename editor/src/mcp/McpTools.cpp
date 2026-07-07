@@ -969,7 +969,9 @@ void EditorApp::RegisterMcpTools()
         "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
         "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}, "
         "measure{a/b or entity+axis — #114 distances/extents}, compare_silhouette{"
-        "reference, view — returns IoU numbers; the diff images are MCP-only}, "
+        "reference, view — returns IoU numbers incl. regions[]; or "
+        "references={{path,view},...} for the multi-view gate, #137 — returns "
+        "combined{iou=min}+views[]; the diff images are MCP-only}, "
         "analyze_reference{image — outline + landmarks in model space, #135}. "
         "Writes: spawn{} (incl. primitive='lathe' params={profile={{r,y},... bottom->top "
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
@@ -1223,15 +1225,6 @@ ToolResult EditorApp::ToolMeasure(const json& args)
         j["center"] = Vec3Json((wb.min + wb.max) * 0.5f);
     }
     return JsonResult(j);
-}
-
-// The axis-aligned views compare_silhouette accepts. references[] entries are
-// checked against this before ANY rasterization: a bad batch must fail whole,
-// not after N-1 expensive compares (#137).
-static bool IsSilhouetteView(const std::string& view)
-{
-    return view == "front" || view == "back" || view == "left" || view == "right" ||
-           view == "top";
 }
 
 ToolResult EditorApp::ToolCompareSilhouette(const json& args)

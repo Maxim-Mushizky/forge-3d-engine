@@ -68,6 +68,16 @@ std::optional<mat4> SilhouetteViewProj(const std::string& view, const AABB& boun
     return glm::ortho(-half, half, -half, half, 0.01f, dist + glm::length(he) * 2.0f) * viewM;
 }
 
+bool IsSilhouetteView(const std::string& view)
+{
+    // Probe the real projection with a unit box rather than mirroring its
+    // name list: adding a view to SilhouetteViewProj updates this for free.
+    AABB unit;
+    unit.Expand(vec3(0.0f));
+    unit.Expand(vec3(1.0f));
+    return SilhouetteViewProj(view, unit).has_value();
+}
+
 // Floor division for the subpixel -> pixel bbox (int truncation rounds toward
 // zero, which overshoots for negatives).
 static int64_t FloorDiv(int64_t a, int64_t b)

@@ -35,6 +35,11 @@ int MaskArea(const SilhouetteMask& mask); // covered pixel count
 // unknown view name or invalid bounds.
 std::optional<mat4> SilhouetteViewProj(const std::string& view, const AABB& bounds);
 
+// True when `view` names one of the axis-aligned silhouette views — evaluated
+// against SilhouetteViewProj itself, so the accepted set can never drift from
+// the projections that actually exist (#137 batch pre-validation).
+bool IsSilhouetteView(const std::string& view);
+
 // OR the mesh's coverage into `mask` (accumulates across calls, so multi-mesh
 // subtrees rasterize into one silhouette). mvp = viewProj * model. Vertices
 // snap to a 1/16-subpixel integer grid and edges evaluate in int64 — exact
