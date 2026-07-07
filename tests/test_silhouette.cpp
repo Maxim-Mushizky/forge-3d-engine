@@ -1306,6 +1306,11 @@ static void CombineViewScoresGate()
 
     // >= is inclusive: exactly-at-threshold passes, matching the single-view rule.
     CHECK(CombineViewScores({0.8f}, 0.8f).allPass);
+
+    // The batch pre-validation predicate mirrors SilhouetteViewProj by
+    // construction (#137) — pin both answers anyway.
+    CHECK(IsSilhouetteView("front") && IsSilhouetteView("top"));
+    CHECK(!IsSilhouetteView("diagonal") && !IsSilhouetteView(""));
 }
 
 // The issue's two-reference scenario at kernel level (#137): a front view that
