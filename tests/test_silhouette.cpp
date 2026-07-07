@@ -903,6 +903,85 @@ static void BinaryFastPathNotTakenOnPhotoLikeInput()
     CHECK(MaskArea(m) == 16 * 16);             // whole object solid, no punch
 }
 
+// The area floor (#142 review): a figure peppered with pinholes (grainy Otsu
+// output) traces to 257 loops by default — the exactness contract — while
+// minArea 4.0 drops every 1-px hole before the quadratic parent pass.
+static void TracePinholeFloor()
+{
+    SilhouetteMask m = SolidRect(64, 64, 0, 0, 64, 64);
+    for (int gy = 0; gy < 16; ++gy)
+        for (int gx = 0; gx < 16; ++gx)
+            m.pixels[(size_t)(4 * gy + 2) * 64 + (4 * gx + 2)] = 0; // 256 pinholes
+    CHECK(TraceContours(m).size() == 257); // default: exact, everything kept
+    const std::vector<SilhouetteContour> floored = TraceContours(m, 4.0);
+    CHECK(floored.size() == 1);
+    if (!floored.empty()) {
+        CHECK(!floored[0].hole);
+        CHECK(floored[0].parent == -1);
+    }
+}
+
+// A 1-px hole's 4-point loop must survive simplification as a real polygon
+// (#142 review): its corner deviation (~0.707 px) sits under tolerance 1.0,
+// and the early-out used to fire with only the two anchors kept — a 2-point
+// "polygon" the rasterizer silently skips, welding the hole shut.
+static void SimplifyTinyHoleStaysPolygon()
+{
+    SilhouetteMask m = SolidRect(12, 12, 2, 2, 8, 8);
+    m.pixels[(size_t)6 * 12 + 6] = 0; // 1-px hole
+    std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 2);
+    int hole = -1;
+    for (int i = 0; i < (int)cs.size(); ++i)
+        if (cs[i].hole)
+            hole = i;
+    CHECK(hole >= 0);
+    if (hole < 0)
+        return;
+    CHECK(cs[hole].points.size() == 4);
+    for (SilhouetteContour& c : cs)
+        c.points = SimplifyContour(c.points, 32, 1.0f);
+    CHECK(cs[hole].points.size() >= 3);
+    // IoU on a 1-px hole is brittle; the pin is the hole pixel itself: a
+    // 3-point simplification of the unit square still leaves its center
+    // outside the covered set under even-odd fill.
+    const SilhouetteMask rt = RasterizePolygons(cs, 12, 12);
+    CHECK(rt.pixels[(size_t)6 * 12 + 6] == 0); // hole pixel stays uncovered
+    CHECK(rt.pixels[(size_t)6 * 12 + 5] != 0); // its neighbor stays figure
+}
+
+// Parent CHAIN through three levels (#142 review): a blob with a hole with an
+// island inside the hole. The island is an OUTER contour whose parent is the
+// HOLE — emission must not lose it, and the trace stays round-trip exact.
+static void TraceIslandParentChain()
+{
+    SilhouetteMask m = SolidRect(30, 30, 2, 2, 26, 26);
+    for (int y = 6; y < 24; ++y)
+        for (int x = 6; x < 24; ++x)
+            m.pixels[(size_t)y * 30 + x] = 0; // hole
+    for (int y = 10; y < 20; ++y)
+        for (int x = 10; x < 20; ++x)
+            m.pixels[(size_t)y * 30 + x] = 255; // island inside the hole
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 3);
+    int outer = -1, hole = -1, island = -1;
+    for (int i = 0; i < (int)cs.size(); ++i) {
+        if (cs[i].hole)
+            hole = i;
+        else if (cs[i].parent == -1)
+            outer = i;
+        else
+            island = i;
+    }
+    CHECK(outer >= 0 && hole >= 0 && island >= 0);
+    if (outer < 0 || hole < 0 || island < 0)
+        return;
+    CHECK(cs[hole].parent == outer);
+    CHECK(cs[island].parent == hole);
+    CHECK(!cs[island].hole && cs[island].area > 0.0);
+    CHECK(RasterizePolygons(cs, 30, 30).pixels == m.pixels);
+}
+
 void RunSilhouetteTests()
 {
     RasterTriangleCoverage();
@@ -936,6 +1015,9 @@ void RunSilhouetteTests()
     FoldVaseProfile();
     BinaryImageFastPath();
     BinaryFastPathNotTakenOnPhotoLikeInput();
+    TracePinholeFloor();
+    SimplifyTinyHoleStaysPolygon();
+    TraceIslandParentChain();
     std::printf("[ok] silhouette kernel tests done\n");
 }
 

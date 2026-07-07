@@ -850,7 +850,7 @@ static bool PointInPolygon(const vec2& pt, const std::vector<vec2>& poly)
     return inside;
 }
 
-std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask)
+std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask, double minArea)
 {
     std::vector<SilhouetteContour> contours;
     const int w = mask.width, h = mask.height;
@@ -970,9 +970,39 @@ std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask)
         contours.push_back(std::move(contour));
     }
 
+    // Area floor: drop sub-minArea loops (and their parallel reps) BEFORE the
+    // quadratic parent pass — the caller opted into losing pinholes it cannot
+    // use in exchange for bounded work here.
+    if (minArea > 0.0) {
+        size_t keep = 0;
+        for (size_t i = 0; i < contours.size(); ++i)
+            if (std::abs(contours[i].area) >= minArea) {
+                if (keep != i) {
+                    contours[keep] = std::move(contours[i]);
+                    reps[keep] = reps[i];
+                }
+                ++keep;
+            }
+        contours.resize(keep);
+        reps.resize(keep);
+    }
+
     // Immediate parent = the smallest-|area| OTHER contour whose polygon
-    // contains this contour's representative center. Loops are few after speck
-    // removal, so O(loops^2 * points) is fine.
+    // contains this contour's representative center. DropSpecks removes only
+    // COVERED specks — uncovered pinholes survive it and can number in the
+    // thousands on a grainy mask — so this quadratic pass is bounded by the
+    // caller's minArea floor plus the bbox prefilter below, not by any
+    // "loops are few" assumption.
+    std::vector<vec2> bbLo(contours.size()), bbHi(contours.size());
+    for (size_t i = 0; i < contours.size(); ++i) {
+        vec2 lo = contours[i].points[0], hi = lo;
+        for (const vec2& p : contours[i].points) {
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+        }
+        bbLo[i] = lo;
+        bbHi[i] = hi;
+    }
     for (size_t i = 0; i < contours.size(); ++i) {
         const int rp = reps[i];
         if (rp < 0)
@@ -981,7 +1011,14 @@ std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask)
         double bestArea = 0.0;
         int best = -1;
         for (size_t j = 0; j < contours.size(); ++j) {
-            if (j == i || !PointInPolygon(center, contours[j].points))
+            if (j == i)
+                continue;
+            // Bbox reject first: a point inside a polygon is inside its bbox,
+            // so this is pure pruning — PNPOLY only runs on real candidates.
+            if (center.x < bbLo[j].x || center.x > bbHi[j].x || center.y < bbLo[j].y ||
+                center.y > bbHi[j].y)
+                continue;
+            if (!PointInPolygon(center, contours[j].points))
                 continue;
             const double aj = std::abs(contours[j].area);
             if (best < 0 || aj < bestArea) {
@@ -1082,7 +1119,11 @@ std::vector<vec2> SimplifyContour(const std::vector<vec2>& points, int maxPoints
     pushInterval(a1, a0);
     while (!pq.empty() && keptCount < maxPoints) {
         const Interval top = pq.top();
-        if (top.dist <= (double)tolerance)
+        // Tolerance early-out only once a real polygon exists: a 1-px hole's
+        // corner deviation (~0.707) sits under a 1.0 tolerance, and breaking
+        // at the two anchors alone returned a 2-point "polygon" that the
+        // rasterizer silently skips — welding tiny holes shut (#142 review).
+        if (top.dist <= (double)tolerance && keptCount >= 3)
             break; // every remaining deviation is within tolerance
         pq.pop();
         kept[(size_t)top.pos] = 1; // intervals only split, never move -> never stale

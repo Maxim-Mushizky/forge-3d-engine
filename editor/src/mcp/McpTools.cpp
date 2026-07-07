@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -368,7 +369,8 @@ void EditorApp::RegisterMcpTools()
         "analyze_reference",
         "Ingest half of the shape loop (compare_silhouette is the iterate half, "
         "#135): binarize a reference image, trace its silhouette to a simplified "
-        "polygon outline (with holes and any extra outlines), and report landmarks "
+        "polygon outline (with holes, islands nested inside them, and any extra "
+        "outlines), and report landmarks "
         "— bbox, centroid, widest row / tallest column, extremities — plus optional "
         "per-row spans. Everything is reported in bbox-centered model space (x "
         "right, y UP, the larger bbox side spanning 1.0 unit), ready to feed sweep "
@@ -1329,7 +1331,13 @@ ToolResult EditorApp::ToolAnalyzeReference(const json& args)
         return Err("Reference image has no foreground after binarization");
 
     const SilhouetteLandmarks lm = MaskLandmarks(mask);
-    std::vector<SilhouetteContour> contours = TraceContours(mask);
+    // Area floor (#142 review): a grainy scan or dithered reference peppers
+    // thousands of pinhole loops, and the kernel's parent pass is quadratic in
+    // loop count — on the GL main thread, with no cancel. Sub-speck loops
+    // carry no usable shape at this scale; the floor's cost shows up honestly
+    // in roundTripIoU.
+    std::vector<SilhouetteContour> contours =
+        TraceContours(mask, std::max(4.0, 1e-4 * (double)lm.area));
     // Largest top-level outer = THE outline; the rest of the top-level outers are
     // extra outlines. Holes attach to their parent.
     int outlineIdx = -1;
@@ -1354,12 +1362,25 @@ ToolResult EditorApp::ToolAnalyzeReference(const json& args)
         return {round5(modelX(p.x)), round5(modelY(p.y))};
     };
 
-    // Simplify + emit one contour: points in model space (rounded), plus area
-    // and centroid computed in model space.
-    std::vector<SilhouetteContour> rasterSet; // all simplified polys for round-trip IoU
-    auto emitContour = [&](const std::vector<vec2>& pixelPts, int budget) -> json {
-        const std::vector<vec2> simp = SimplifyContour(pixelPts, budget, tolerancePx);
+    // Parent links -> children lists once (O(contours)), for the recursive
+    // emission below (outer -> holes -> islands -> ...).
+    std::vector<std::vector<int>> children(contours.size());
+    for (int i = 0; i < (int)contours.size(); ++i)
+        if (contours[i].parent >= 0)
+            children[(size_t)contours[i].parent].push_back(i);
+
+    // Emit one simplified contour: points in model space (rounded), plus area
+    // and centroid computed in model space. Every emitted polygon also feeds
+    // rasterSet so roundTripIoU scores exactly what the JSON reports.
+    std::vector<SilhouetteContour> rasterSet;
+    int emittedCount = 0;
+    auto emitSimplified = [&](const std::vector<vec2>& simp) -> json {
+        // A loop simplified below a triangle would be a "polygon" the
+        // rasterizer silently skips — drop it; droppedContours picks it up.
+        if (simp.size() < 3)
+            return json();
         rasterSet.push_back(SilhouetteContour{simp, 0.0, false, -1});
+        ++emittedCount;
         std::vector<vec2> model;
         json pts = json::array();
         model.reserve(simp.size());
@@ -1368,20 +1389,70 @@ ToolResult EditorApp::ToolAnalyzeReference(const json& args)
             pts.push_back(modelPt(p));
         }
         const vec2 c = PolygonCentroid(model);
-        json j;
-        j["points"] = pts;
-        j["area"] = round5(std::abs(PolygonSignedArea(model)));
-        j["centroid"] = {round5(c.x), round5(c.y)};
-        j["pointCount"] = (int)simp.size();
-        return j;
+        json jc;
+        jc["points"] = pts;
+        jc["area"] = round5(std::abs(PolygonSignedArea(model)));
+        jc["centroid"] = {round5(c.x), round5(c.y)};
+        jc["pointCount"] = (int)simp.size();
+        return jc;
     };
-    auto holesOf = [&](int parent) -> json {
-        json arr = json::array();
-        for (int i = 0; i < (int)contours.size(); ++i)
-            if (contours[i].parent == parent && contours[i].hole)
-                arr.push_back(emitContour(contours[i].points, holeBudget));
-        return arr;
+    auto emitContour = [&](const std::vector<vec2>& pixelPts, int budget) -> json {
+        return emitSimplified(SimplifyContour(pixelPts, budget, tolerancePx));
     };
+    // Largest-first order + per-level caps keep the JSON bounded on a
+    // pathological mask; droppedContours reports what the caps cut.
+    constexpr size_t kMaxHolesPerOuter = 64;
+    constexpr size_t kMaxIslandsPerHole = 16; // also caps extraOutlines
+    auto largestFirst = [&](std::vector<int>& idx, size_t cap) {
+        std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+            return std::abs(contours[a].area) > std::abs(contours[b].area);
+        });
+        if (idx.size() > cap)
+            idx.resize(cap);
+    };
+    // Recursive shape (#142 review): each outer carries its holes, each hole
+    // carries the islands inside it, and an island recurses like any outer —
+    // without this, an outer contour whose parent is a hole simply vanished
+    // from the JSON (and from the round-trip score).
+    std::function<json(int, int)> emitOuter; // assigned below; holes need it for islands
+    auto attachHoles = [&](int idx, json& outer) {
+        std::vector<int> holeIdx;
+        for (int c : children[(size_t)idx])
+            if (contours[c].hole)
+                holeIdx.push_back(c);
+        largestFirst(holeIdx, kMaxHolesPerOuter);
+        json holes = json::array();
+        for (int h : holeIdx) {
+            json hj = emitContour(contours[h].points, holeBudget);
+            if (hj.is_null())
+                continue;
+            std::vector<int> islandIdx;
+            for (int c : children[(size_t)h])
+                if (!contours[c].hole)
+                    islandIdx.push_back(c);
+            largestFirst(islandIdx, kMaxIslandsPerHole);
+            json islands = json::array();
+            for (int isl : islandIdx) {
+                const json ij = emitOuter(isl, holeBudget);
+                if (!ij.is_null())
+                    islands.push_back(ij);
+            }
+            hj["islands"] = islands;
+            holes.push_back(hj);
+        }
+        outer["holes"] = holes;
+    };
+    emitOuter = [&](int idx, int budget) -> json {
+        json outer = emitContour(contours[idx].points, budget);
+        if (!outer.is_null())
+            attachHoles(idx, outer);
+        return outer;
+    };
+
+    // Simplify the outer ONCE: the outline emission and the mirror fold below
+    // share outerSimp (#142 review nit — they used identical arguments).
+    const std::vector<vec2> outerSimp =
+        SimplifyContour(contours[outlineIdx].points, maxPoints, tolerancePx);
 
     json j;
     j["image"] = {{"width", refW}, {"height", refH}};
@@ -1409,17 +1480,30 @@ ToolResult EditorApp::ToolAnalyzeReference(const json& args)
                           {"span", lm.tallestColSpan},
                           {"spanModel", round5(lm.tallestColSpan * s)}};
 
-    j["outline"] = emitContour(contours[outlineIdx].points, maxPoints);
-    j["holes"] = holesOf(outlineIdx); // the main outline's holes, top-level
+    json mainOutline = emitSimplified(outerSimp);
+    if (mainOutline.is_null()) // cannot happen for a traced loop; belt only
+        return Err("Reference produced no outer contour");
+    attachHoles(outlineIdx, mainOutline);
+    j["holes"] = mainOutline["holes"]; // the main outline's holes stay top-level
+    mainOutline.erase("holes");
+    j["outline"] = mainOutline;
 
-    json extra = json::array();
+    std::vector<int> extraIdx;
     for (int i = 0; i < (int)contours.size(); ++i)
-        if (i != outlineIdx && contours[i].parent == -1 && !contours[i].hole) {
-            json e = emitContour(contours[i].points, holeBudget);
-            e["holes"] = holesOf(i);
+        if (i != outlineIdx && contours[i].parent == -1 && !contours[i].hole)
+            extraIdx.push_back(i);
+    largestFirst(extraIdx, kMaxIslandsPerHole); // extras share the 16 cap
+    json extra = json::array();
+    for (int i : extraIdx) {
+        const json e = emitOuter(i, holeBudget);
+        if (!e.is_null())
             extra.push_back(e);
-        }
+    }
     j["extraOutlines"] = extra;
+    // Contours traced but not emitted (size caps / degenerate simplification);
+    // the kernel's area floor drops upstream of this count and its effect
+    // shows up in roundTripIoU instead.
+    j["droppedContours"] = (int)contours.size() - emittedCount;
 
     if (spanRows > 0) {
         json rows = json::array();
@@ -1442,13 +1526,12 @@ ToolResult EditorApp::ToolAnalyzeReference(const json& args)
                   {"modelToPixel", "px = center + point*pixelsPerUnit (y flipped)"}};
 
     if (mirror == "x") {
-        // Fold the simplified outer in PIXEL space about the bbox center, then
-        // map to model space. FoldOutline emits bottom (max y) -> top (min y),
-        // which is already bottom -> top in y-up model space — the natural order
-        // for a lathe profile, so no reversal is applied (see report note).
-        const std::vector<vec2> foldPx =
-            FoldOutline(SimplifyContour(contours[outlineIdx].points, maxPoints, tolerancePx),
-                        (float)cx);
+        // Fold the simplified outer (outerSimp, shared with the outline
+        // emission) in PIXEL space about the bbox center, then map to model
+        // space. FoldOutline emits bottom (max y) -> top (min y), which is
+        // already bottom -> top in y-up model space — the natural order for a
+        // lathe profile, so no reversal is applied.
+        const std::vector<vec2> foldPx = FoldOutline(outerSimp, (float)cx);
         std::vector<vec2> hp; // model-space (r, y), bottom -> top
         json hpPts = json::array();
         for (const vec2& p : foldPx) {

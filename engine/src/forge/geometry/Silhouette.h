@@ -131,9 +131,15 @@ struct SilhouetteContour {
 // loops come back with positive area, holes negative; collinear runs are
 // merged (a rect is 4 points); each loop's immediate parent is the smallest
 // containing other loop by even-odd point test. Rasterizing the UNSIMPLIFIED
-// result reproduces the source mask exactly (see RasterizePolygons). Empty or
-// invalid mask -> empty vector.
-std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask);
+// result reproduces the source mask exactly (see RasterizePolygons). A
+// nonzero minArea drops every loop with |area| < minArea (px^2) before parent
+// assignment — a deliberate exactness-for-bounded-work trade: a pathological
+// mask (grainy scan, checkerboard dither) peppers thousands of pinhole loops
+// into the quadratic parent pass. The default stays 0.0 because the
+// trace<->raster inverse is this kernel's contract; dropping detail is policy
+// and belongs to callers. Empty or invalid mask -> empty vector.
+std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask,
+                                             double minArea = 0.0);
 
 // Simplify a CLOSED contour to at most maxPoints vertices, stopping earlier
 // once the largest deviation of a dropped point falls to <= tolerance (px).
