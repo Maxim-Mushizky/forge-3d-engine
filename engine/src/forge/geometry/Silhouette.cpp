@@ -960,6 +960,26 @@ vec3 MaskPxToWorld(const mat4& viewProj, int width, int height, vec2 px, float n
     return vec3(world) / world.w; // ortho keeps w = 1; dividing is free correctness
 }
 
+// --- multi-view (#137): combined gate over per-view scores ---------------------
+
+ViewScoreSummary CombineViewScores(const std::vector<float>& ious, float threshold)
+{
+    ViewScoreSummary s;
+    if (ious.empty())
+        return s; // zeroed defaults: no views never verifies a shape claim
+    s.minIou = ious[0];
+    s.allPass = true;
+    double sum = 0.0; // double accumulation, one cast at the end
+    for (const float iou : ious) {
+        s.minIou = std::min(s.minIou, iou);
+        sum += (double)iou;
+        if (!(iou >= threshold)) // >= : exactly-at-threshold passes, like the single view
+            s.allPass = false;
+    }
+    s.meanIou = (float)(sum / (double)ious.size());
+    return s;
+}
+
 // --- outline extraction (#135) ------------------------------------------------
 
 double PolygonSignedArea(const std::vector<vec2>& points)

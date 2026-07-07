@@ -1281,6 +1281,65 @@ static void NormalizedToWorldChain()
     CHECK(ApproxEq(world.y, half - (16.0f / 64.0f) * 2.0f * half, 1e-3f)); // +1.02
 }
 
+// CombineViewScores (#137): min is the gate, mean is the trend, and an empty
+// view list never verifies.
+static void CombineViewScoresGate()
+{
+    const ViewScoreSummary mixed = CombineViewScores({0.9f, 0.7f}, 0.8f);
+    CHECK(mixed.minIou == 0.7f);
+    // (0.9f + 0.7f) / 2 is NOT exactly 0.8f: the two float significands sum
+    // odd (15099494 + 11744051), so the double mean lands exactly halfway
+    // between adjacent floats and ties-to-even rounds one ULP BELOW 0.8f.
+    CHECK(ApproxEq(mixed.meanIou, 0.8f));
+    CHECK(!mixed.allPass); // 0.7 < 0.8: one failing view fails the set
+
+    const ViewScoreSummary passing = CombineViewScores({0.9f, 0.85f}, 0.8f);
+    CHECK(passing.minIou == 0.85f);
+    CHECK(passing.allPass);
+    CHECK(ApproxEq(passing.meanIou, 0.875f));
+
+    // Empty input scores zero and FAILS: no views never verifies a shape claim.
+    const ViewScoreSummary none = CombineViewScores({}, 0.5f);
+    CHECK(none.minIou == 0.0f);
+    CHECK(none.meanIou == 0.0f);
+    CHECK(!none.allPass);
+
+    // >= is inclusive: exactly-at-threshold passes, matching the single-view rule.
+    CHECK(CombineViewScores({0.8f}, 0.8f).allPass);
+}
+
+// The issue's two-reference scenario at kernel level (#137): a front view that
+// matches its reference exactly and a side view whose reference is twice as
+// wide — per-view IoUs and the combined gate pinned to hand-derived values.
+static void MultiViewRectPair()
+{
+    // "Front": render and reference are the same 32x128 rect. Both normalize
+    // to the identical height-filling column -> IoU exactly 1.
+    const SilhouetteMask frontMask = SolidRect(128, 128, 48, 0, 32, 128);
+    const SilhouetteMask frontRef = SolidRect(128, 128, 48, 0, 32, 128);
+    const SilhouetteDiff front =
+        CompareMasks(NormalizeMask(frontMask, 128), NormalizeMask(frontRef, 128));
+    CHECK(front.iou == 1.0f);
+
+    // "Side": the reference is twice as wide (64 vs 32, both full-height 128).
+    // Height dominates NormalizeMask (128 fills the frame, scale 1), so the
+    // widths survive and center: padX (128-32)/2 = 48 vs (128-64)/2 = 32 ->
+    // intersection 32*128, union 64*128 -> IoU exactly 0.5.
+    const SilhouetteMask sideMask = SolidRect(128, 128, 48, 0, 32, 128);
+    const SilhouetteMask sideRef = SolidRect(128, 128, 32, 0, 64, 128);
+    const SilhouetteDiff side =
+        CompareMasks(NormalizeMask(sideMask, 128), NormalizeMask(sideRef, 128));
+    CHECK(side.iou == 0.5f);
+
+    // Combined gate: min is the verdict. At 0.8 the side view fails the pair;
+    // at 0.5 the inclusive >= passes both. (1.0 + 0.5) / 2 is exact in float.
+    const ViewScoreSummary at08 = CombineViewScores({1.0f, 0.5f}, 0.8f);
+    CHECK(at08.minIou == 0.5f);
+    CHECK(at08.meanIou == 0.75f);
+    CHECK(!at08.allPass);
+    CHECK(CombineViewScores({1.0f, 0.5f}, 0.5f).allPass);
+}
+
 void RunSilhouetteTests()
 {
     RasterTriangleCoverage();
@@ -1327,6 +1386,8 @@ void RunSilhouetteTests()
     NormalizeTransformRoundTrip();
     MaskPxToWorldFrontView();
     NormalizedToWorldChain();
+    CombineViewScoresGate();
+    MultiViewRectPair();
     std::printf("[ok] silhouette kernel tests done\n");
 }
 

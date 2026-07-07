@@ -169,6 +169,18 @@ vec2 NormalizedToSourcePx(const NormalizeTransform& xform, vec2 normPx);
 // documented convention, not information).
 vec3 MaskPxToWorld(const mat4& viewProj, int width, int height, vec2 px, float ndcZ);
 
+// --- multi-view (#137): combined gate over per-view scores --------------------
+
+// Combined gate over per-view IoUs (#137): min is the honest score — a replica
+// with a failing side view is not a passing replica — and the mean is reported
+// for trend reading. Empty input scores zero and fails (no views never verifies).
+struct ViewScoreSummary {
+    float minIou = 0.0f;
+    float meanIou = 0.0f;
+    bool allPass = false; // every view >= threshold; false when views is empty
+};
+ViewScoreSummary CombineViewScores(const std::vector<float>& ious, float threshold);
+
 // --- outline extraction (#135): mask -> simplified polygon + landmarks --------
 // The ingest half of the shape loop (compare_silhouette is the iterate half):
 // turn a reference mask into vector geometry the modeling tools can consume —
