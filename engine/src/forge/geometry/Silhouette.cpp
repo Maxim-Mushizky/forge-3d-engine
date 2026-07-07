@@ -695,8 +695,10 @@ SilhouetteMask BinarizeImage(const uint8_t* rgba, int width, int height)
     return m;
 }
 
-SilhouetteMask NormalizeMask(const SilhouetteMask& in, int outSize)
+SilhouetteMask NormalizeMask(const SilhouetteMask& in, int outSize,
+                             NormalizeTransform& xform)
 {
+    xform = NormalizeTransform{}; // stale caller state must not survive an early-out
     SilhouetteMask out = MakeMask(outSize, outSize);
     if (in.width <= 0 || in.height <= 0 || outSize <= 0)
         return out;
@@ -725,6 +727,17 @@ SilhouetteMask NormalizeMask(const SilhouetteMask& in, int outSize)
         ow = std::max(1, (int)std::lround((double)bw * outSize / bh));
     }
     const int offX = (outSize - ow) / 2, offY = (outSize - oh) / 2;
+    // Record the crop+scale+pad so callers can map normalized pixels back to
+    // source pixels (#136) — NormalizedToSourcePx is this framing's inverse.
+    xform.srcMinX = minX;
+    xform.srcMinY = minY;
+    xform.srcW = bw;
+    xform.srcH = bh;
+    xform.scaledW = ow;
+    xform.scaledH = oh;
+    xform.padX = offX;
+    xform.padY = offY;
+    xform.valid = true;
     for (int y = 0; y < oh; ++y) {
         const int sy = minY + (int)((int64_t)y * bh / oh); // nearest sample
         for (int x = 0; x < ow; ++x) {
@@ -734,6 +747,12 @@ SilhouetteMask NormalizeMask(const SilhouetteMask& in, int outSize)
         }
     }
     return out;
+}
+
+SilhouetteMask NormalizeMask(const SilhouetteMask& in, int outSize)
+{
+    NormalizeTransform xform; // discarded: shape-only callers don't need the framing
+    return NormalizeMask(in, outSize, xform);
 }
 
 SilhouetteDiff CompareMasks(const SilhouetteMask& a, const SilhouetteMask& b)
@@ -781,6 +800,164 @@ std::vector<uint8_t> DiffImageRGBA(const SilhouetteMask& a, const SilhouetteMask
         img[i * 4 + 3] = 255;
     }
     return img;
+}
+
+// --- structured diff (#136): mismatch regions as data ------------------------
+
+DiffRegionList DiffRegions(const SilhouetteMask& a, const SilhouetteMask& b,
+                           int maxRegions, float minAreaFraction)
+{
+    DiffRegionList out;
+    if (a.width != b.width || a.height != b.height || a.width <= 0 || a.height <= 0)
+        return out; // mirrors CompareMasks: mismatched frames carry no diff
+    maxRegions = std::max(0, maxRegions);
+    minAreaFraction = std::max(0.0f, minAreaFraction);
+
+    const int w = a.width, h = a.height;
+    const int n = w * h;
+    // One pass classifies every pixel (0 = agree, 1 = A-only, 2 = B-only) and
+    // tallies the union, so areaFraction shares IoU's denominator without a
+    // second CompareMasks sweep.
+    std::vector<uint8_t> cls((size_t)n, 0);
+    int unionArea = 0;
+    for (int i = 0; i < n; ++i) {
+        const bool sa = a.pixels[i] != 0, sb = b.pixels[i] != 0;
+        if (sa || sb)
+            ++unionArea;
+        if (sa != sb)
+            cls[i] = sa ? 1 : 2;
+    }
+    if (unionArea == 0)
+        return out; // two empty masks agree everywhere: no regions to report
+
+    // Flood fill, 4-connected, same-class only (excess and missing never join
+    // across a shared border). Explicit stack: a snake region in a 1024^2 mask
+    // would blow the call stack under recursion. Pixels are consumed (class
+    // cleared) as they are pushed, so labeling stays one O(W*H) pass total.
+    std::vector<DiffRegion> found;
+    std::vector<int> stack;
+    for (int i = 0; i < n; ++i) {
+        const uint8_t regionClass = cls[i];
+        if (regionClass == 0)
+            continue;
+        DiffRegion r;
+        r.excess = regionClass == 1;
+        r.minX = w;
+        r.minY = h;
+        r.maxX = -1;
+        r.maxY = -1;
+        double sumX = 0.0, sumY = 0.0; // pixel-center sums, like MaskLandmarks
+        cls[i] = 0;
+        stack.push_back(i);
+        while (!stack.empty()) {
+            const int p = stack.back();
+            stack.pop_back();
+            const int x = p % w, y = p / w;
+            ++r.area;
+            sumX += (double)x + 0.5;
+            sumY += (double)y + 0.5;
+            r.minX = std::min(r.minX, x);
+            r.maxX = std::max(r.maxX, x);
+            r.minY = std::min(r.minY, y);
+            r.maxY = std::max(r.maxY, y);
+            const int nb[4] = {x > 0 ? p - 1 : -1, x + 1 < w ? p + 1 : -1,
+                               y > 0 ? p - w : -1, y + 1 < h ? p + w : -1};
+            for (int q : nb)
+                if (q >= 0 && cls[q] == regionClass) {
+                    cls[q] = 0;
+                    stack.push_back(q);
+                }
+        }
+        r.areaFraction = (float)r.area / (float)unionArea;
+        r.centroid = vec2((float)(sumX / (double)r.area), (float)(sumY / (double)r.area));
+        found.push_back(r);
+    }
+    out.totalRegions = (int)found.size();
+
+    // Speck floor first, cap second — the counters account for both, so a
+    // truncated list never silently reads as complete coverage.
+    std::vector<DiffRegion> kept;
+    kept.reserve(found.size());
+    for (const DiffRegion& r : found) {
+        if (r.areaFraction < minAreaFraction) {
+            ++out.droppedRegions;
+            out.droppedArea += r.area;
+        } else {
+            kept.push_back(r);
+        }
+    }
+    // Stable sort: regions tying on area/minY/minX keep raster-scan discovery
+    // order, so the emitted list is fully deterministic for tests.
+    std::stable_sort(kept.begin(), kept.end(),
+                     [](const DiffRegion& lhs, const DiffRegion& rhs) {
+                         if (lhs.area != rhs.area)
+                             return lhs.area > rhs.area;
+                         if (lhs.minY != rhs.minY)
+                             return lhs.minY < rhs.minY;
+                         return lhs.minX < rhs.minX;
+                     });
+    while ((int)kept.size() > maxRegions) {
+        ++out.droppedRegions;
+        out.droppedArea += kept.back().area;
+        kept.pop_back();
+    }
+    out.regions = std::move(kept);
+    return out;
+}
+
+float MaskMirrorSymmetryX(const SilhouetteMask& mask)
+{
+    const int w = mask.width, h = mask.height;
+    if (w <= 0 || h <= 0 || (size_t)w * h != mask.pixels.size())
+        return 0.0f;
+    int minX = w, maxX = -1;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = &mask.pixels[(size_t)y * w];
+        for (int x = 0; x < w; ++x)
+            if (row[x]) {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+            }
+    }
+    if (maxX < 0)
+        return 0.0f; // no shape is not a symmetric shape (matches CompareMasks' empty rule)
+
+    // x -> minX+maxX-x maps [minX, maxX] onto itself, so |mirror(M)| = |M| and
+    // union = 2*area - intersection without materializing the mirrored mask.
+    // int64 counters: 2*area on a many-megapixel reference mask would sit
+    // uncomfortably close to int range (the MaskLandmarks #114 lesson).
+    int64_t area = 0, inter = 0;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = &mask.pixels[(size_t)y * w];
+        for (int x = minX; x <= maxX; ++x)
+            if (row[x]) {
+                ++area;
+                if (row[minX + maxX - x])
+                    ++inter;
+            }
+    }
+    return (float)inter / (float)(2 * area - inter); // area >= 1, denominator > 0
+}
+
+vec2 NormalizedToSourcePx(const NormalizeTransform& xform, vec2 normPx)
+{
+    // scaledW/scaledH are >= 1 whenever valid; the extra check keeps a
+    // hand-built transform from dividing by zero.
+    if (!xform.valid || xform.scaledW <= 0 || xform.scaledH <= 0)
+        return normPx;
+    return {(float)xform.srcMinX + (normPx.x - (float)xform.padX) * (float)xform.srcW /
+                                       (float)xform.scaledW,
+            (float)xform.srcMinY + (normPx.y - (float)xform.padY) * (float)xform.srcH /
+                                       (float)xform.scaledH};
+}
+
+vec3 MaskPxToWorld(const mat4& viewProj, int width, int height, vec2 px, float ndcZ)
+{
+    const float ndcX = 2.0f * px.x / (float)width - 1.0f;
+    const float ndcY = 1.0f - 2.0f * px.y / (float)height; // row 0 = top, as rasterized
+    // No cached inverse: callers map a handful of points per compare.
+    const vec4 world = glm::inverse(viewProj) * vec4(ndcX, ndcY, ndcZ, 1.0f);
+    return vec3(world) / world.w; // ortho keeps w = 1; dividing is free correctness
 }
 
 // --- outline extraction (#135) ------------------------------------------------

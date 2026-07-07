@@ -346,7 +346,16 @@ void EditorApp::RegisterMcpTools()
         "magenta = reference only). IoU >= ~0.9 = matching shape; proportion errors "
         "show as one-sided green/magenta bands. Its ingest counterpart is "
         "analyze_reference (#135), which turns a reference image into a simplified "
-        "outline + landmarks to model FROM.",
+        "outline + landmarks to model FROM. Structured diff (#136): regions[] lists "
+        "the mismatch as data — 4-connected components over the diff classes, "
+        "largest first (capped, speck-filtered, remainder in regionSummary). type "
+        "'missing' = the reference has material there: grow or move something "
+        "toward centroidWorld; 'excess' = the model overshoots: shrink/trim there. "
+        "centroidWorld/bboxWorld are in the target's world frame on the view's "
+        "depth plane, so fixes are computable without reading any image. "
+        "symmetry.render/.reference score each silhouette against its own "
+        "left-right mirror (1.0 = perfectly bilateral): reference high + render "
+        "low = the build broke a symmetry the subject has.",
         {{"type", "object"},
          {"properties",
           {{"id", {{"type", "string"}}},
@@ -1250,9 +1259,14 @@ ToolResult EditorApp::ToolCompareSilhouette(const json& args)
     if (MaskArea(reference) == 0)
         return Err("Reference image has no foreground after binarization");
 
-    const SilhouetteMask a = NormalizeMask(rendered, size);
+    // The render's framing transform is kept: mismatch regions found in the
+    // normalized frame map back through it (then the viewport inverse) into
+    // the MODEL's world coordinates — where to grow/trim (#136).
+    NormalizeTransform renderXform;
+    const SilhouetteMask a = NormalizeMask(rendered, size, renderXform);
     const SilhouetteMask b = NormalizeMask(reference, size);
     const SilhouetteDiff diff = CompareMasks(a, b);
+    const DiffRegionList regionList = DiffRegions(a, b); // defaults: 16 regions, 0.2% speck floor
 
     json j{{"iou", diff.iou},
            {"dice", diff.dice},
@@ -1263,6 +1277,38 @@ ToolResult EditorApp::ToolCompareSilhouette(const json& args)
             {{"match", diff.intersection},
              {"renderOnly", diff.onlyA},
              {"referenceOnly", diff.onlyB}}}};
+
+    // Depth plane for world mapping: the target's bounds center projected
+    // through the same viewProj. In-plane axes are exact for the ortho views;
+    // the depth coordinate is a stated convention, not information.
+    const vec4 centerClip = *viewProj * vec4((bounds.min + bounds.max) * 0.5f, 1.0f);
+    const float ndcZ = centerClip.z / centerClip.w;
+    auto toWorld = [&](vec2 normPx) {
+        return MaskPxToWorld(*viewProj, rendered.width, rendered.height,
+                             NormalizedToSourcePx(renderXform, normPx), ndcZ);
+    };
+    json regionsJson = json::array();
+    for (const DiffRegion& r : regionList.regions) {
+        const vec3 cw = toWorld(r.centroid);
+        // Exclusive far corner so the box covers the last pixel; per-component
+        // min/max absorbs the image-vs-world y flip without view casing.
+        const vec3 c0 = toWorld(vec2((float)r.minX, (float)r.minY));
+        const vec3 c1 = toWorld(vec2((float)(r.maxX + 1), (float)(r.maxY + 1)));
+        const vec3 lo = glm::min(c0, c1), hi = glm::max(c0, c1);
+        regionsJson.push_back({{"type", r.excess ? "excess" : "missing"},
+                               {"areaFraction", r.areaFraction},
+                               {"areaPx", r.area},
+                               {"centroidPx", {r.centroid.x, r.centroid.y}},
+                               {"bboxPx", {r.minX, r.minY, r.maxX, r.maxY}},
+                               {"centroidWorld", Vec3Json(cw)},
+                               {"bboxWorld", {{"min", Vec3Json(lo)}, {"max", Vec3Json(hi)}}}});
+    }
+    j["regions"] = regionsJson;
+    j["regionSummary"] = {{"total", regionList.totalRegions},
+                          {"dropped", regionList.droppedRegions},
+                          {"droppedAreaPx", regionList.droppedArea}};
+    j["symmetry"] = {{"render", MaskMirrorSymmetryX(a)},
+                     {"reference", MaskMirrorSymmetryX(b)}};
 
     ToolResult result;
     // Metrics text first: the Lua binding surfaces content[0] only, so
