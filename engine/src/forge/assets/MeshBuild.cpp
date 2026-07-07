@@ -229,10 +229,19 @@ bool BuildSweep(const std::vector<vec2>& profile, const std::vector<vec3>& path,
     // Parallel transport: rotate the previous frame by exactly the rotation
     // between consecutive tangents (Rodrigues), so the section never spins
     // around the path — a Frenet frame would flip at inflection points.
+    // Seed convention (#138): the section reads as drawn when looking back
+    // along the start tangent with world +Y as screen-up — section x is
+    // screen-right (nor), section y is screen-up (bin). A +Z path therefore
+    // maps section (x, y) straight onto world (x, y). Near-vertical paths
+    // fall back to a -sign(tangent.y)*Z up hint: section (x, y) maps to
+    // world (x, -z) going up and (x, z) going down, which is bit-exactly
+    // the frame every pre-#138 vertical sweep already had in BOTH directions
+    // (an unsigned hint would rotate legacy downward sweeps 180 degrees).
     std::vector<vec3> nor(nPath), bin(nPath);
-    const vec3 ref = std::fabs(tan[0].y) < 0.9f ? vec3(0, 1, 0) : vec3(1, 0, 0);
-    nor[0] = glm::normalize(ref - tan[0] * glm::dot(ref, tan[0]));
-    bin[0] = glm::cross(tan[0], nor[0]);
+    const vec3 up = std::fabs(tan[0].y) < 0.9f ? vec3(0, 1, 0)
+                                               : vec3(0, 0, tan[0].y > 0.0f ? -1.0f : 1.0f);
+    bin[0] = glm::normalize(up - tan[0] * glm::dot(up, tan[0]));
+    nor[0] = glm::cross(bin[0], tan[0]); // keeps b = t x n, so winding below holds
     for (size_t i = 1; i < nPath; ++i) {
         const vec3 axis = glm::cross(tan[i - 1], tan[i]);
         const float sinA = glm::length(axis);

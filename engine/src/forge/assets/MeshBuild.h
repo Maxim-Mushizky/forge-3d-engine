@@ -47,6 +47,11 @@ bool BuildLathe(const std::vector<vec2>& profile, // (r, y) pairs, bottom -> top
 // are capped with a fan around the section centroid — sections must be
 // star-shaped about their centroid (circles, rectangles, rounded profiles),
 // which covers handles, aprons and rails.
+// Orientation (#138): the section appears as drawn when viewed looking back
+// along the start tangent with world +Y as screen-up — for a +Z path,
+// section (x, y) maps to world (x, y). Near-vertical paths use a
+// -sign(tangent.y)*Z up hint instead: section (x, y) maps to world (x, -z)
+// going up and (x, z) going down — the pre-#138 frames, preserved exactly.
 // Returns false for degenerate or oversized input: fewer than three distinct
 // section points, zero section area, fewer than two distinct path points,
 // non-finite values, more than 4096 section / 16384 path points, or a
