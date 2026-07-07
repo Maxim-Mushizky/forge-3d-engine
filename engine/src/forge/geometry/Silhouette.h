@@ -35,6 +35,11 @@ int MaskArea(const SilhouetteMask& mask); // covered pixel count
 // unknown view name or invalid bounds.
 std::optional<mat4> SilhouetteViewProj(const std::string& view, const AABB& bounds);
 
+// True when `view` names one of the axis-aligned silhouette views — evaluated
+// against SilhouetteViewProj itself, so the accepted set can never drift from
+// the projections that actually exist (#137 batch pre-validation).
+bool IsSilhouetteView(const std::string& view);
+
 // OR the mesh's coverage into `mask` (accumulates across calls, so multi-mesh
 // subtrees rasterize into one silhouette). mvp = viewProj * model. Vertices
 // snap to a 1/16-subpixel integer grid and edges evaluate in int64 — exact
@@ -168,6 +173,18 @@ vec2 NormalizedToSourcePx(const NormalizeTransform& xform, vec2 normPx);
 // in-plane world axes exact for the orthographic views and the depth axis a
 // documented convention, not information).
 vec3 MaskPxToWorld(const mat4& viewProj, int width, int height, vec2 px, float ndcZ);
+
+// --- multi-view (#137): combined gate over per-view scores --------------------
+
+// Combined gate over per-view IoUs (#137): min is the honest score — a replica
+// with a failing side view is not a passing replica — and the mean is reported
+// for trend reading. Empty input scores zero and fails (no views never verifies).
+struct ViewScoreSummary {
+    float minIou = 0.0f;
+    float meanIou = 0.0f;
+    bool allPass = false; // every view >= threshold; false when views is empty
+};
+ViewScoreSummary CombineViewScores(const std::vector<float>& ious, float threshold);
 
 // --- outline extraction (#135): mask -> simplified polygon + landmarks --------
 // The ingest half of the shape loop (compare_silhouette is the iterate half):

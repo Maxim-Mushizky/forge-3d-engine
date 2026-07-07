@@ -68,6 +68,16 @@ std::optional<mat4> SilhouetteViewProj(const std::string& view, const AABB& boun
     return glm::ortho(-half, half, -half, half, 0.01f, dist + glm::length(he) * 2.0f) * viewM;
 }
 
+bool IsSilhouetteView(const std::string& view)
+{
+    // Probe the real projection with a unit box rather than mirroring its
+    // name list: adding a view to SilhouetteViewProj updates this for free.
+    AABB unit;
+    unit.Expand(vec3(0.0f));
+    unit.Expand(vec3(1.0f));
+    return SilhouetteViewProj(view, unit).has_value();
+}
+
 // Floor division for the subpixel -> pixel bbox (int truncation rounds toward
 // zero, which overshoots for negatives).
 static int64_t FloorDiv(int64_t a, int64_t b)
@@ -958,6 +968,26 @@ vec3 MaskPxToWorld(const mat4& viewProj, int width, int height, vec2 px, float n
     // No cached inverse: callers map a handful of points per compare.
     const vec4 world = glm::inverse(viewProj) * vec4(ndcX, ndcY, ndcZ, 1.0f);
     return vec3(world) / world.w; // ortho keeps w = 1; dividing is free correctness
+}
+
+// --- multi-view (#137): combined gate over per-view scores ---------------------
+
+ViewScoreSummary CombineViewScores(const std::vector<float>& ious, float threshold)
+{
+    ViewScoreSummary s;
+    if (ious.empty())
+        return s; // zeroed defaults: no views never verifies a shape claim
+    s.minIou = ious[0];
+    s.allPass = true;
+    double sum = 0.0; // double accumulation, one cast at the end
+    for (const float iou : ious) {
+        s.minIou = std::min(s.minIou, iou);
+        sum += (double)iou;
+        if (!(iou >= threshold)) // >= : exactly-at-threshold passes, like the single view
+            s.allPass = false;
+    }
+    s.meanIou = (float)(sum / (double)ious.size());
+    return s;
 }
 
 // --- outline extraction (#135) ------------------------------------------------

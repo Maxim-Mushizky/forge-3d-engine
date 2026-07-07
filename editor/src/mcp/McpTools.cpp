@@ -363,7 +363,14 @@ void EditorApp::RegisterMcpTools()
         "converges; see docs/mcp/examples/closed-loop-fix.lua). "
         "symmetry.render/.reference score each silhouette against its own "
         "left-right mirror (1.0 = perfectly bilateral): reference high + render "
-        "low = the build broke a symmetry the subject has.",
+        "low = the build broke a symmetry the subject has. "
+        "Multi-view (#137): references=[{path,view}] runs the compare once per "
+        "entry against the same target (2-4 photos = real replica gating); "
+        "result = combined{iou=min across views — the honest gate, meanIou, "
+        "pass=all views pass} + views[] each carrying the full single-view "
+        "block incl. regions[]. Single-reference form unchanged. Views are the "
+        "axis-aligned set only; matching an arbitrary-yaw photo needs camera "
+        "calibration against it — future work.",
         {{"type", "object"},
          {"properties",
           {{"id", {{"type", "string"}}},
@@ -374,11 +381,28 @@ void EditorApp::RegisterMcpTools()
              {"description", "orthographic view axis, default front"}}},
            {"reference",
             {{"type", "string"}, {"description", "path to the reference image (png/jpg)"}}},
+           {"references",
+            {{"type", "array"},
+             {"minItems", 1},
+             {"maxItems", 8},
+             {"description",
+              "multi-view form (#137): one compare per entry; mutually "
+              "exclusive with reference/view"},
+             {"items",
+              {{"type", "object"},
+               {"properties",
+                {{"path",
+                  {{"type", "string"},
+                   {"description", "path to the reference image (png/jpg)"}}},
+                 {"view",
+                  {{"type", "string"}, {"enum", {"front", "back", "left", "right", "top"}}}}}},
+               {"required", {"path", "view"}},
+               {"additionalProperties", false}}}}},
            {"threshold",
-            {{"type", "number"}, {"description", "pass when IoU >= this, default 0.8"}}},
+            {{"type", "number"},
+             {"description", "pass when IoU >= this (every view, and combined), default 0.8"}}},
            {"size",
             {{"type", "integer"}, {"description", "mask resolution, 64-1024, default 256"}}}}},
-         {"required", {"reference"}},
          {"additionalProperties", false}},
         [this](const json& args) { return ToolCompareSilhouette(args); });
 
@@ -945,7 +969,9 @@ void EditorApp::RegisterMcpTools()
         "same named fields (vectors as {x,y,z} arrays). Reads: scene(), "
         "get_entity{}, mesh_stats{}, raycast{}, check_overlap{}, query_spatial{}, "
         "measure{a/b or entity+axis — #114 distances/extents}, compare_silhouette{"
-        "reference, view — returns IoU numbers; the diff images are MCP-only}, "
+        "reference, view — returns IoU numbers incl. regions[]; or "
+        "references={{path,view},...} for the multi-view gate, #137 — returns "
+        "combined{iou=min}+views[]; the diff images are MCP-only}, "
         "analyze_reference{image — outline + landmarks in model space, #135}. "
         "Writes: spawn{} (incl. primitive='lathe' params={profile={{r,y},... bottom->top "
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
@@ -1203,18 +1229,56 @@ ToolResult EditorApp::ToolMeasure(const json& args)
 
 ToolResult EditorApp::ToolCompareSilhouette(const json& args)
 {
-    const std::string view = args.value("view", "front");
-    if (!args.contains("reference") || !args["reference"].is_string())
-        return Err("Provide \"reference\" (path to the reference image)");
-    const std::string refPath = args["reference"];
+    // Two input forms (#137): the original single reference (+ optional view),
+    // or references=[{path, view}] gating the same target against several
+    // photos. Mutually exclusive — the registry's simple schemas can't express
+    // oneOf, so the handler owns the check.
+    const bool multiView = args.contains("references");
+    if (multiView && (args.contains("reference") || args.contains("view")))
+        return Err("Use either reference/view or references[], not both");
+
+    struct RefEntry {
+        std::string path;
+        std::string view;
+    };
+    std::vector<RefEntry> entries;
+    if (multiView) {
+        const json& refs = args["references"];
+        if (!refs.is_array() || refs.empty())
+            return Err("references must be a non-empty array of {path, view}");
+        if (refs.size() > 8)
+            return Err("references accepts at most 8 entries");
+        // Validate the WHOLE batch up front: the run below is all-or-nothing,
+        // so no entry may start work while a later one is malformed. Duplicate
+        // views are fine — two photos of the same face are legitimate.
+        for (size_t i = 0; i < refs.size(); ++i) {
+            const json& r = refs[i];
+            const std::string at = "references[" + std::to_string(i) + "]";
+            if (!r.is_object())
+                return Err(at + " must be an object {path, view}");
+            if (!r.contains("path") || !r["path"].is_string() ||
+                r["path"].get<std::string>().empty())
+                return Err(at + ".path must be a non-empty string (reference image path)");
+            if (!r.contains("view") || !r["view"].is_string() ||
+                !IsSilhouetteView(r["view"].get<std::string>()))
+                return Err(at + ".view must be one of front, back, left, right, top");
+            entries.push_back({r["path"].get<std::string>(), r["view"].get<std::string>()});
+        }
+    } else {
+        if (!args.contains("reference") || !args["reference"].is_string())
+            return Err("Provide \"reference\" (path to the reference image)");
+        entries.push_back({args["reference"].get<std::string>(), args.value("view", "front")});
+    }
+
     const double thresholdRaw = args.value("threshold", 0.8);
     if (!(thresholdRaw >= 0.0 && thresholdRaw <= 1.0))
         return Err("threshold must be in [0, 1]");
-    const float threshold = (float)thresholdRaw;
+    const float threshold = (float)thresholdRaw; // shared by every view
     const int size = std::clamp(args.value("size", 256), 64, 1024);
 
-    // Draw set: the target subtree, or every mesh in the scene. Light-gizmo
-    // spheres are skipped like in render_views — they'd bleed into the outline.
+    // Draw set: the target subtree, or every mesh in the scene — resolved once
+    // and shared across views. Light-gizmo spheres are skipped like in
+    // render_views — they'd bleed into the outline.
     std::unordered_set<UUID> subtree;
     if (args.contains("id") || args.contains("name")) {
         std::string error;
@@ -1241,111 +1305,189 @@ ToolResult EditorApp::ToolCompareSilhouette(const json& args)
     if (!bounds.Valid())
         return Err("Nothing to compare (no meshes)");
 
-    const std::optional<mat4> viewProj = SilhouetteViewProj(view, bounds);
-    if (!viewProj)
-        return Err("Unknown view \"" + view + "\" (front, back, left, right, or top)");
-
-    // Software rasterizer, not the GL renderer: exact mesh coverage, no
-    // shading/AA noise in a binary mask, and the whole path is unit-tested.
-    SilhouetteMask rendered = MakeMask(size, size);
-    for (const Entity* e : targets)
-        RasterizeSilhouette(e->mesh->Vertices(), e->mesh->Indices(),
-                            *viewProj * m_Scene.WorldTransform(e->id), rendered);
-    if (MaskArea(rendered) == 0)
-        return Err("Rendered silhouette is empty (degenerate geometry?)");
-
-    int refW = 0, refH = 0, refC = 0;
-    stbi_uc* refPixels = stbi_load(refPath.c_str(), &refW, &refH, &refC, 4);
-    if (!refPixels)
-        return Err("Failed to load reference image \"" + refPath +
-                   "\": " + stbi_failure_reason());
-    // RAII on the C buffer: BinarizeImage allocates image-sized transients,
-    // and a bad_alloc there unwinds to the protocol layer (which keeps the
-    // app running) — the decode buffer must not leak on that path.
-    const std::unique_ptr<stbi_uc, void (*)(void*)> refOwner(refPixels, stbi_image_free);
-    SilhouetteMask reference = BinarizeImage(refPixels, refW, refH);
-    if (MaskArea(reference) == 0)
-        return Err("Reference image has no foreground after binarization");
-
-    // The render's framing transform is kept: mismatch regions found in the
-    // normalized frame map back through it (then the viewport inverse) into
-    // the MODEL's world coordinates — where to grow/trim (#136).
-    NormalizeTransform renderXform;
-    const SilhouetteMask a = NormalizeMask(rendered, size, renderXform);
-    const SilhouetteMask b = NormalizeMask(reference, size);
-    const SilhouetteDiff diff = CompareMasks(a, b);
-    const DiffRegionList regionList = DiffRegions(a, b); // defaults: 16 regions, 0.2% speck floor
-
-    json j{{"iou", diff.iou},
-           {"dice", diff.dice},
-           {"pass", diff.iou >= threshold},
-           {"threshold", threshold},
-           {"view", view},
-           {"pixels",
-            {{"match", diff.intersection},
-             {"renderOnly", diff.onlyA},
-             {"referenceOnly", diff.onlyB}}}};
-
-    // Depth plane for world mapping: the target's bounds center projected
-    // through the same viewProj. In-plane axes are exact for the ortho views;
-    // the depth coordinate is a stated convention, not information.
-    const vec4 centerClip = *viewProj * vec4((bounds.min + bounds.max) * 0.5f, 1.0f);
-    const float ndcZ = centerClip.z / centerClip.w;
-    auto toWorld = [&](vec2 normPx) {
-        return MaskPxToWorld(*viewProj, rendered.width, rendered.height,
-                             NormalizedToSourcePx(renderXform, normPx), ndcZ);
+    // One reference/view compare — the whole single-view pipeline including
+    // the #136 regions/symmetry tail. Both argument forms run THIS lambda, so
+    // the shapes cannot drift apart; each call derives its own viewProj,
+    // framing transform, and depth plane — no state crosses views (#137).
+    struct ViewCompare {
+        json block;                // the single-view result JSON (iou..symmetry)
+        float iou = 0.0f;          // lifted out for CombineViewScores
+        std::string silhouettePng; // base64; empty = PNG encode failed, skip
+        std::string diffPng;
+        std::string error; // non-empty = this compare failed; call fails whole
     };
-    json regionsJson = json::array();
-    for (const DiffRegion& r : regionList.regions) {
-        const vec3 cw = toWorld(r.centroid);
-        // Exclusive far corner so the box covers the last pixel; per-component
-        // min/max absorbs the image-vs-world y flip without view casing.
-        const vec3 c0 = toWorld(vec2((float)r.minX, (float)r.minY));
-        const vec3 c1 = toWorld(vec2((float)(r.maxX + 1), (float)(r.maxY + 1)));
-        const vec3 lo = glm::min(c0, c1), hi = glm::max(c0, c1);
-        regionsJson.push_back({{"type", r.excess ? "excess" : "missing"},
-                               {"areaFraction", r.areaFraction},
-                               {"areaPx", r.area},
-                               {"centroidPx", {r.centroid.x, r.centroid.y}},
-                               {"bboxPx", {r.minX, r.minY, r.maxX, r.maxY}},
-                               {"centroidWorld", Vec3Json(cw)},
-                               {"bboxWorld", {{"min", Vec3Json(lo)}, {"max", Vec3Json(hi)}}}});
+    auto compareOneView = [&](const std::string& view, const std::string& refPath) {
+        ViewCompare out;
+        const std::optional<mat4> viewProj = SilhouetteViewProj(view, bounds);
+        if (!viewProj) {
+            // bounds are valid here, so only the view name can be at fault.
+            out.error = "Unknown view \"" + view + "\" (front, back, left, right, or top)";
+            return out;
+        }
+
+        // Software rasterizer, not the GL renderer: exact mesh coverage, no
+        // shading/AA noise in a binary mask, and the whole path is unit-tested.
+        SilhouetteMask rendered = MakeMask(size, size);
+        for (const Entity* e : targets)
+            RasterizeSilhouette(e->mesh->Vertices(), e->mesh->Indices(),
+                                *viewProj * m_Scene.WorldTransform(e->id), rendered);
+        if (MaskArea(rendered) == 0) {
+            out.error = "Rendered silhouette is empty (degenerate geometry?)";
+            return out;
+        }
+
+        int refW = 0, refH = 0, refC = 0;
+        stbi_uc* refPixels = stbi_load(refPath.c_str(), &refW, &refH, &refC, 4);
+        if (!refPixels) {
+            out.error = "Failed to load reference image \"" + refPath +
+                        "\": " + stbi_failure_reason();
+            return out;
+        }
+        // RAII on the C buffer: BinarizeImage allocates image-sized transients,
+        // and a bad_alloc there unwinds to the protocol layer (which keeps the
+        // app running) — the decode buffer must not leak on that path.
+        const std::unique_ptr<stbi_uc, void (*)(void*)> refOwner(refPixels, stbi_image_free);
+        SilhouetteMask reference = BinarizeImage(refPixels, refW, refH);
+        if (MaskArea(reference) == 0) {
+            out.error = "Reference image has no foreground after binarization";
+            return out;
+        }
+
+        // The render's framing transform is kept: mismatch regions found in the
+        // normalized frame map back through it (then the viewport inverse) into
+        // the MODEL's world coordinates — where to grow/trim (#136).
+        NormalizeTransform renderXform;
+        const SilhouetteMask a = NormalizeMask(rendered, size, renderXform);
+        const SilhouetteMask b = NormalizeMask(reference, size);
+        const SilhouetteDiff diff = CompareMasks(a, b);
+        const DiffRegionList regionList = DiffRegions(a, b); // defaults: 16 regions, 0.2% speck floor
+
+        json j{{"iou", diff.iou},
+               {"dice", diff.dice},
+               {"pass", diff.iou >= threshold},
+               {"threshold", threshold},
+               {"view", view},
+               {"pixels",
+                {{"match", diff.intersection},
+                 {"renderOnly", diff.onlyA},
+                 {"referenceOnly", diff.onlyB}}}};
+
+        // Depth plane for world mapping: the target's bounds center projected
+        // through the same viewProj. In-plane axes are exact for the ortho views;
+        // the depth coordinate is a stated convention, not information.
+        const vec4 centerClip = *viewProj * vec4((bounds.min + bounds.max) * 0.5f, 1.0f);
+        const float ndcZ = centerClip.z / centerClip.w;
+        auto toWorld = [&](vec2 normPx) {
+            return MaskPxToWorld(*viewProj, rendered.width, rendered.height,
+                                 NormalizedToSourcePx(renderXform, normPx), ndcZ);
+        };
+        json regionsJson = json::array();
+        for (const DiffRegion& r : regionList.regions) {
+            const vec3 cw = toWorld(r.centroid);
+            // Exclusive far corner so the box covers the last pixel; per-component
+            // min/max absorbs the image-vs-world y flip without view casing.
+            const vec3 c0 = toWorld(vec2((float)r.minX, (float)r.minY));
+            const vec3 c1 = toWorld(vec2((float)(r.maxX + 1), (float)(r.maxY + 1)));
+            const vec3 lo = glm::min(c0, c1), hi = glm::max(c0, c1);
+            regionsJson.push_back({{"type", r.excess ? "excess" : "missing"},
+                                   {"areaFraction", r.areaFraction},
+                                   {"areaPx", r.area},
+                                   {"centroidPx", {r.centroid.x, r.centroid.y}},
+                                   {"bboxPx", {r.minX, r.minY, r.maxX, r.maxY}},
+                                   {"centroidWorld", Vec3Json(cw)},
+                                   {"bboxWorld", {{"min", Vec3Json(lo)}, {"max", Vec3Json(hi)}}}});
+        }
+        j["regions"] = regionsJson;
+        j["regionSummary"] = {{"total", regionList.totalRegions},
+                              {"dropped", regionList.droppedRegions},
+                              {"droppedAreaPx", regionList.droppedArea}};
+        j["symmetry"] = {{"render", MaskMirrorSymmetryX(a)},
+                         {"reference", MaskMirrorSymmetryX(b)}};
+        out.iou = diff.iou;
+        out.block = std::move(j);
+
+        std::vector<uint8_t> silhouetteImg((size_t)size * size * 4);
+        for (size_t i = 0; i < a.pixels.size(); ++i) {
+            const uint8_t v = a.pixels[i] ? 255 : 0;
+            silhouetteImg[i * 4 + 0] = silhouetteImg[i * 4 + 1] = silhouetteImg[i * 4 + 2] = v;
+            silhouetteImg[i * 4 + 3] = 255;
+        }
+        out.silhouettePng = PixelsToPngBase64(silhouetteImg.data(), size, size);
+        const std::vector<uint8_t> diffImg = DiffImageRGBA(a, b);
+        if (!diffImg.empty())
+            out.diffPng = PixelsToPngBase64(diffImg.data(), size, size);
+        return out;
+    };
+
+    // The labeled image pair for one compare. The single form keeps today's
+    // exact labels (prefix empty); the array form prefixes "[view] " so the
+    // stream stays readable when several diffs follow one JSON block.
+    auto pushImages = [](ToolResult& result, const ViewCompare& vc, const std::string& prefix) {
+        if (!vc.silhouettePng.empty()) {
+            result.content.push_back(
+                {{"type", "text"}, {"text", prefix + "silhouette (normalized render mask)"}});
+            result.content.push_back(
+                {{"type", "image"}, {"data", vc.silhouettePng}, {"mimeType", "image/png"}});
+        }
+        if (!vc.diffPng.empty()) {
+            result.content.push_back(
+                {{"type", "text"},
+                 {"text",
+                  prefix + "diff (gray = match, green = render only, magenta = reference only)"}});
+            result.content.push_back(
+                {{"type", "image"}, {"data", vc.diffPng}, {"mimeType", "image/png"}});
+        }
+    };
+
+    if (!multiView) {
+        // Single form: the helper's block IS the top-level JSON — byte-identical
+        // to the pre-#137 tool (existing scripts and the closed-loop demo pin
+        // this shape; no combined/views keys here).
+        ViewCompare vc = compareOneView(entries[0].view, entries[0].path);
+        if (!vc.error.empty())
+            return Err(vc.error);
+        ToolResult result;
+        // Metrics text first: the Lua binding surfaces content[0] only, so
+        // forge.compare_silhouette returns the numbers (images are MCP-only).
+        result.content.push_back({{"type", "text"}, {"text", vc.block.dump(2)}});
+        pushImages(result, vc, "");
+        return result;
     }
-    j["regions"] = regionsJson;
-    j["regionSummary"] = {{"total", regionList.totalRegions},
-                          {"dropped", regionList.droppedRegions},
-                          {"droppedAreaPx", regionList.droppedArea}};
-    j["symmetry"] = {{"render", MaskMirrorSymmetryX(a)},
-                     {"reference", MaskMirrorSymmetryX(b)}};
+
+    // Array form: run every view, all-or-nothing — results buffer until the
+    // whole batch succeeded, so a mid-batch failure emits no partial content.
+    std::vector<ViewCompare> compares;
+    compares.reserve(entries.size());
+    std::vector<float> ious;
+    ious.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        ViewCompare vc = compareOneView(entries[i].view, entries[i].path);
+        if (!vc.error.empty())
+            return Err("references[" + std::to_string(i) + "] (\"" + entries[i].path +
+                       "\"): " + vc.error);
+        // The path rides along so an agent can tell entries apart when views
+        // repeat; everything else matches the single-view block exactly.
+        vc.block["reference"] = entries[i].path;
+        ious.push_back(vc.iou);
+        compares.push_back(std::move(vc));
+    }
+
+    // min across views is the honest gate — a replica with a failing side view
+    // is not a passing replica; the mean is reported for trend reading (#137).
+    const ViewScoreSummary combined = CombineViewScores(ious, threshold);
+    json j{{"combined",
+            {{"iou", combined.minIou},
+             {"meanIou", combined.meanIou},
+             {"pass", combined.allPass},
+             {"threshold", threshold}}},
+           {"views", json::array()}};
+    for (ViewCompare& vc : compares)
+        j["views"].push_back(std::move(vc.block));
 
     ToolResult result;
-    // Metrics text first: the Lua binding surfaces content[0] only, so
-    // forge.compare_silhouette returns the numbers (images are MCP-only).
     result.content.push_back({{"type", "text"}, {"text", j.dump(2)}});
-
-    std::vector<uint8_t> silhouetteImg((size_t)size * size * 4);
-    for (size_t i = 0; i < a.pixels.size(); ++i) {
-        const uint8_t v = a.pixels[i] ? 255 : 0;
-        silhouetteImg[i * 4 + 0] = silhouetteImg[i * 4 + 1] = silhouetteImg[i * 4 + 2] = v;
-        silhouetteImg[i * 4 + 3] = 255;
-    }
-    const std::string silB64 = PixelsToPngBase64(silhouetteImg.data(), size, size);
-    if (!silB64.empty()) {
-        result.content.push_back(
-            {{"type", "text"}, {"text", "silhouette (normalized render mask)"}});
-        result.content.push_back(
-            {{"type", "image"}, {"data", silB64}, {"mimeType", "image/png"}});
-    }
-    const std::vector<uint8_t> diffImg = DiffImageRGBA(a, b);
-    const std::string diffB64 =
-        diffImg.empty() ? std::string() : PixelsToPngBase64(diffImg.data(), size, size);
-    if (!diffB64.empty()) {
-        result.content.push_back(
-            {{"type", "text"},
-             {"text", "diff (gray = match, green = render only, magenta = reference only)"}});
-        result.content.push_back(
-            {{"type", "image"}, {"data", diffB64}, {"mimeType", "image/png"}});
-    }
+    for (size_t i = 0; i < compares.size(); ++i)
+        pushImages(result, compares[i], "[" + entries[i].view + "] ");
     return result;
 }
 
