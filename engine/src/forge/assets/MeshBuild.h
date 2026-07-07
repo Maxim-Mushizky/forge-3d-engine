@@ -44,9 +44,10 @@ bool BuildLathe(const std::vector<vec2>& profile, // (r, y) pairs, bottom -> top
 // parallel-transport frames (the frame rotates only as much as the tangent
 // does, so the section never twists around the path). The section winding is
 // normalized internally, so callers may pass it either way around. Both ends
-// are capped with a fan around the section centroid — sections must be
-// star-shaped about their centroid (circles, rectangles, rounded profiles),
-// which covers handles, aprons and rails.
+// are capped by ear-clipping the section, so any simple (non-self-
+// intersecting) polygon works — including the concave outlines
+// analyze_reference traces from an image (#135), which the centroid fan this
+// replaced overfilled at every notch.
 // Orientation (#138): the section appears as drawn when viewed looking back
 // along the start tangent with world +Y as screen-up — for a +Z path,
 // section (x, y) maps to world (x, y). Near-vertical paths use a

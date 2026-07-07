@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace forge {
 
@@ -177,6 +178,126 @@ bool BuildLathe(const std::vector<vec2>& profile, uint32_t sectors, bool closed,
     return true;
 }
 
+// Ear-clipping triangulation of a simple CCW polygon; returns index triples
+// into sec. Sweep caps used to fan around the section centroid, which only
+// covers sections star-shaped about it — outlines traced from reference
+// images (#135: an axe head with concave notches between its blades) are not,
+// and the fan overfilled every concavity. Ear containment tests check REFLEX
+// vertices only — the standard optimization that makes the whole run O(n^2)
+// worst case instead of O(n^3). All orientation/containment math runs in
+// double: pixel-derived sections carry long near-collinear runs that float
+// cross products misclassify.
+static std::vector<uint32_t> TriangulateSection(const std::vector<vec2>& sec)
+{
+    const uint32_t n = (uint32_t)sec.size();
+    std::vector<uint32_t> tris;
+    if (n < 3)
+        return tris;
+    tris.reserve(3 * (size_t)(n - 2));
+
+    // Doubly-linked ring over the live vertices.
+    std::vector<uint32_t> prev(n), next(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        prev[i] = (i + n - 1) % n;
+        next[i] = (i + 1) % n;
+    }
+    // Twice the signed area of corner (prev, i, next); > 0 = convex on a CCW
+    // ring. Collinear corners (== 0) count as reflex: they can still BLOCK an
+    // ear (conservative) but are never clipped as one — the degenerate-emit
+    // skip below consumes them.
+    auto cross = [&](uint32_t i) {
+        const vec2& a = sec[prev[i]];
+        const vec2& b = sec[i];
+        const vec2& c = sec[next[i]];
+        return ((double)b.x - a.x) * ((double)c.y - b.y) -
+               ((double)b.y - a.y) * ((double)c.x - b.x);
+    };
+    std::vector<char> reflex(n);
+    for (uint32_t i = 0; i < n; ++i)
+        reflex[i] = cross(i) <= 0.0;
+
+    // A convex corner is an ear when no reflex vertex lies inside its triangle
+    // (if ANY vertex lies inside an ear candidate, some reflex one does, so
+    // convex vertices need no test). A point exactly ON a triangle edge counts
+    // as blocking — clipping through a touching vertex would leave a zero-width
+    // sliver or a self-overlap. The ring walk from next[next[i]] to prev[i]
+    // structurally skips the triangle's own three vertices.
+    auto isEar = [&](uint32_t i) {
+        if (reflex[i])
+            return false;
+        const vec2& a = sec[prev[i]];
+        const vec2& b = sec[i];
+        const vec2& c = sec[next[i]];
+        for (uint32_t v = next[next[i]]; v != prev[i]; v = next[v]) {
+            if (!reflex[v])
+                continue;
+            const vec2& p = sec[v];
+            const double d0 = ((double)b.x - a.x) * ((double)p.y - a.y) -
+                              ((double)b.y - a.y) * ((double)p.x - a.x);
+            const double d1 = ((double)c.x - b.x) * ((double)p.y - b.y) -
+                              ((double)c.y - b.y) * ((double)p.x - b.x);
+            const double d2 = ((double)a.x - c.x) * ((double)p.y - c.y) -
+                              ((double)a.y - c.y) * ((double)p.x - c.x);
+            if (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0)
+                return false;
+        }
+        return true;
+    };
+
+    uint32_t live = n;
+    uint32_t cur = 0;
+    uint32_t sinceClip = 0;
+    auto clip = [&](uint32_t i) {
+        // A ~zero-area corner (collinear or duplicate points) still unlinks so
+        // the run is consumed — it just contributes no triangle.
+        if (std::fabs(cross(i)) > 1e-12)
+            tris.insert(tris.end(), {prev[i], i, next[i]});
+        const uint32_t p = prev[i], nx = next[i];
+        next[p] = nx;
+        prev[nx] = p;
+        --live;
+        // Unlinking changes exactly two corner angles; everything else keeps
+        // its convex/reflex status.
+        reflex[p] = cross(p) <= 0.0;
+        reflex[nx] = cross(nx) <= 0.0;
+        cur = p; // the predecessor may have just become an ear
+        sinceClip = 0;
+    };
+    while (live > 3) {
+        if (isEar(cur)) {
+            clip(cur);
+            continue;
+        }
+        cur = next[cur];
+        if (++sinceClip < live)
+            continue;
+        // A full cycle found no clippable ear: numerically degenerate input
+        // (collinear runs, duplicate points). Force-clip the flattest convex
+        // corner — smallest |cross| — or the current vertex if none is convex,
+        // so the loop always terminates: builds run serially on the GL main
+        // thread and must never hang, the walls are already built, and a
+        // slightly wrong cap on broken input beats no mesh.
+        uint32_t best = cur;
+        double bestAbs = std::numeric_limits<double>::max();
+        uint32_t v = cur;
+        do {
+            if (!reflex[v]) {
+                const double a = std::fabs(cross(v));
+                if (a < bestAbs) {
+                    bestAbs = a;
+                    best = v;
+                }
+            }
+            v = next[v];
+        } while (v != cur);
+        clip(best);
+    }
+    // The last three live vertices are the final triangle.
+    if (std::fabs(cross(cur)) > 1e-12)
+        tris.insert(tris.end(), {prev[cur], cur, next[cur]});
+    return tris;
+}
+
 bool BuildSweep(const std::vector<vec2>& profile, const std::vector<vec3>& path, MeshData& out)
 {
     out = {};
@@ -300,34 +421,37 @@ bool BuildSweep(const std::vector<vec2>& profile, const std::vector<vec3>& path,
         }
     }
 
-    // Fan caps around the section centroid (sections must be star-shaped about
-    // it). Ring positions repeat the wall expressions bit-exactly.
-    vec2 centroid(0.0f);
-    for (const vec2& p : sec)
-        centroid += p;
-    centroid /= (float)k;
+    // Ear-clipped caps (an outline traced from a reference image, #135, is
+    // routinely concave — the old centroid fan overfilled every notch). Ring
+    // positions repeat the wall expressions bit-exactly so cap rings weld
+    // onto wall rings. k vertices per cap, not k+1: the seam duplicate only
+    // existed so fan triangles j..j+1 could wrap past index 0, and cap UVs
+    // are planar — there is no UV seam to split; ear triples index arbitrary
+    // vertex pairs directly. The fan's centroid vertex is gone entirely.
     vec2 lo = sec[0], hi = sec[0];
     for (const vec2& p : sec) {
         lo = glm::min(lo, p);
         hi = glm::max(hi, p);
     }
     const vec2 extent = glm::max(hi - lo, vec2(1e-6f));
+    const std::vector<uint32_t> capTris = TriangulateSection(sec);
     for (int end = 0; end < 2; ++end) {
         const size_t i = end == 0 ? 0 : nPath - 1;
         const vec3 n = end == 0 ? -tan[i] : tan[i];
-        const uint32_t center = (uint32_t)out.vertices.size();
-        out.vertices.push_back({pathPts[i] + nor[i] * centroid.x + bin[i] * centroid.y, n,
-                                (centroid - lo) / extent});
-        for (size_t j = 0; j <= k; ++j) {
-            const size_t jj = j % k;
-            out.vertices.push_back({pathPts[i] + nor[i] * sec[jj].x + bin[i] * sec[jj].y, n,
-                                    (sec[jj] - lo) / extent});
-        }
-        for (uint32_t j = 0; j < (uint32_t)k; ++j) {
+        const uint32_t base = (uint32_t)out.vertices.size();
+        for (size_t j = 0; j < k; ++j)
+            out.vertices.push_back({pathPts[i] + nor[i] * sec[j].x + bin[i] * sec[j].y, n,
+                                    (sec[j] - lo) / extent});
+        // Ear triples are CCW in section space, whose +z is tan (nor x bin =
+        // tan): as-is they face the +tan end; the -tan start cap flips them —
+        // the same winding flip the fan caps did.
+        for (size_t t = 0; t + 2 < capTris.size(); t += 3) {
             if (end == 0)
-                out.indices.insert(out.indices.end(), {center, center + 2 + j, center + 1 + j});
+                out.indices.insert(out.indices.end(), {base + capTris[t], base + capTris[t + 2],
+                                                       base + capTris[t + 1]});
             else
-                out.indices.insert(out.indices.end(), {center, center + 1 + j, center + 2 + j});
+                out.indices.insert(out.indices.end(), {base + capTris[t], base + capTris[t + 1],
+                                                       base + capTris[t + 2]});
         }
     }
 

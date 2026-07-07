@@ -153,7 +153,11 @@ static void BinarizeOtsuFallbackPath()
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             const bool ring = x == 0 || y == 0 || x == w - 1 || y == h - 1;
-            fill(x, y, ring ? 30 : 210);
+            // Three grays (30 / 200 / 210), not two: a strict two-valued gray
+            // image would take the #135 fast path and never reach Otsu, so the
+            // bright fill carries two tones. The flood still degenerates (>95%
+            // fill) into the histogram split this test is here to pin.
+            fill(x, y, ring ? 30 : (x < w / 2 ? 200 : 210));
         }
     const SilhouetteMask m = BinarizeImage(img.data(), w, h);
     CHECK(MaskArea(m) == (w - 2) * (h - 2)); // the bright fill, ring excluded
@@ -176,10 +180,14 @@ static void BinarizeOtsuPolarityAndSpecks()
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
             fill(x, y, 220);
+    // Two dark object tones keep the image >= 3-valued (30 / 45 / 220): a strict
+    // two-valued gray one would take the #135 fast path instead of the border
+    // flood + majority polarity this test pins. The split is inside the figure,
+    // so both tones stay foreground.
     for (int y = 4; y < 12; ++y)
         for (int x = 4; x < 12; ++x)
-            fill(x, y, 30); // 64-px object
-    fill(14, 14, 30); // 1-px speck: 1 * 20 < 64 -> dropped
+            fill(x, y, x < 8 ? 30 : 45); // 64-px object
+    fill(14, 14, 30);                    // 1-px speck: 1 * 20 < 64 -> dropped
 
     const SilhouetteMask dark = BinarizeImage(img.data(), w, h);
     CHECK(MaskArea(dark) == 64);
@@ -187,12 +195,13 @@ static void BinarizeOtsuPolarityAndSpecks()
     CHECK(dark.pixels[14 * w + 14] == 0);
 
     // Inverted polarity: bright object on dark ground still reads as object.
+    // Two bright tones again keep it >= 3-valued (25 / 215 / 230).
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
             fill(x, y, 25);
     for (int y = 4; y < 12; ++y)
         for (int x = 4; x < 12; ++x)
-            fill(x, y, 230);
+            fill(x, y, x < 8 ? 230 : 215);
     const SilhouetteMask bright = BinarizeImage(img.data(), w, h);
     CHECK(MaskArea(bright) == 64);
     CHECK(bright.pixels[5 * w + 5] != 0);
@@ -571,6 +580,408 @@ static void LatheCupAcceptance()
     CHECK(mismatch < match);
 }
 
+// --- outline extraction (#135) ------------------------------------------------
+
+// Filled rect: one positive-area outer contour, collinear-merged to 4 points,
+// parent -1, and an EXACT round-trip (the rasterizer is the trace's inverse).
+static void TraceRectExact()
+{
+    const SilhouetteMask m = SolidRect(20, 20, 3, 4, 8, 6); // 8x6 rect
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 1);
+    if (cs.size() == 1) {
+        CHECK(cs[0].points.size() == 4);
+        CHECK(cs[0].area == 8.0 * 6.0); // positive == w*h
+        CHECK(!cs[0].hole);
+        CHECK(cs[0].parent == -1);
+    }
+    CHECK(RasterizePolygons(cs, m.width, m.height).pixels == m.pixels); // memcmp
+}
+
+// Rect with a rect hole: two contours, the hole negative-area with parent =
+// outer; even-odd re-rasterization preserves the hole exactly.
+static void TraceDonut()
+{
+    SilhouetteMask m = SolidRect(30, 30, 5, 5, 18, 18);
+    for (int y = 10; y < 18; ++y)
+        for (int x = 10; x < 18; ++x)
+            m.pixels[(size_t)y * 30 + x] = 0; // 8x8 hole
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 2);
+    int outer = -1, hole = -1;
+    for (int i = 0; i < (int)cs.size(); ++i)
+        (cs[i].hole ? hole : outer) = i;
+    CHECK(outer >= 0 && hole >= 0);
+    if (outer >= 0 && hole >= 0) {
+        CHECK(cs[outer].area > 0.0);
+        CHECK(cs[hole].area < 0.0);
+        CHECK(cs[hole].parent == outer);
+        CHECK(cs[outer].parent == -1);
+    }
+    CHECK(RasterizePolygons(cs, m.width, m.height).pixels == m.pixels);
+}
+
+// 2x2 diagonal checkerboard: the saddle rule crosses over so the two diagonal
+// squares read as ONE 8-connected loop (pinned here). Round-trip is exact
+// whichever way the saddle resolves, so BOTH assertions matter.
+static void TraceSaddleCheckerboard()
+{
+    SilhouetteMask m = MakeMask(2, 2);
+    m.pixels = {255, 0, 0, 255}; // covered (0,0) and (1,1)
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 1); // 8-connected: one loop, not two
+    if (cs.size() == 1)
+        CHECK(cs[0].area == 2.0); // two unit squares
+    CHECK(RasterizePolygons(cs, 2, 2).pixels == m.pixels);
+}
+
+// Two disjoint rects: two top-level outers, exact round-trip.
+static void TraceMultiComponent()
+{
+    SilhouetteMask m = MakeMask(40, 20);
+    auto set = [&](int x0, int x1, int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                m.pixels[(size_t)y * 40 + x] = 255;
+    };
+    set(3, 10, 3, 10);
+    set(25, 35, 5, 15);
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 2);
+    int tops = 0;
+    for (const SilhouetteContour& c : cs)
+        if (c.parent == -1 && !c.hole)
+            ++tops;
+    CHECK(tops == 2);
+    CHECK(RasterizePolygons(cs, m.width, m.height).pixels == m.pixels);
+}
+
+// A filled disc for the round-trip / budget suites (center-sampled).
+static SilhouetteMask FilledDisc(int size, double cx, double cy, double r)
+{
+    SilhouetteMask m = MakeMask(size, size);
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x) {
+            const double dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+            if (dx * dx + dy * dy <= r * r)
+                m.pixels[(size_t)y * size + x] = 255;
+        }
+    return m;
+}
+
+// The issue's shapes (notch / crescent / donut): full-res round-trip is EXACT;
+// simplified to budget 64 / tol 1.0 it re-rasterizes to IoU >= 0.98.
+static void RoundTripNotchCrescentDonut()
+{
+    const int W = 200;
+    auto roundTripEqual = [&](const SilhouetteMask& src) {
+        return RasterizePolygons(TraceContours(src), src.width, src.height).pixels ==
+               src.pixels;
+    };
+    auto simplifiedIoU = [&](const SilhouetteMask& src) {
+        std::vector<SilhouetteContour> cs = TraceContours(src);
+        for (SilhouetteContour& c : cs)
+            c.points = SimplifyContour(c.points, 64, 1.0f);
+        return CompareMasks(RasterizePolygons(cs, src.width, src.height), src).iou;
+    };
+
+    // Rect with a notch bitten out of the top edge (open concavity, no hole).
+    SilhouetteMask notch = SolidRect(W, W, 40, 40, 120, 100);
+    for (int y = 40; y < 80; ++y)
+        for (int x = 80; x < 120; ++x)
+            notch.pixels[(size_t)y * W + x] = 0;
+    CHECK(roundTripEqual(notch));
+    CHECK(simplifiedIoU(notch) >= 0.98f);
+
+    // Crescent: a disc minus an offset disc of equal radius (a fat crescent
+    // moon — blunt enough cusps to survive tol-1.0 simplification cleanly).
+    SilhouetteMask crescent = FilledDisc(W, 85, 100, 72);
+    for (int y = 0; y < W; ++y)
+        for (int x = 0; x < W; ++x) {
+            const double dx = x + 0.5 - 128, dy = y + 0.5 - 100;
+            if (dx * dx + dy * dy <= 66.0 * 66.0)
+                crescent.pixels[(size_t)y * W + x] = 0;
+        }
+    CHECK(MaskArea(crescent) > 0);
+    CHECK(roundTripEqual(crescent));
+    CHECK(simplifiedIoU(crescent) >= 0.98f);
+
+    // Donut: a disc with a concentric disc hole.
+    SilhouetteMask donut = FilledDisc(W, 100, 100, 70);
+    for (int y = 0; y < W; ++y)
+        for (int x = 0; x < W; ++x) {
+            const double dx = x + 0.5 - 100, dy = y + 0.5 - 100;
+            if (dx * dx + dy * dy <= 35.0 * 35.0)
+                donut.pixels[(size_t)y * W + x] = 0;
+        }
+    CHECK(roundTripEqual(donut));
+    CHECK(simplifiedIoU(donut) >= 0.98f);
+}
+
+// Budget is a hard cap and more budget never scores worse (monotone, loose).
+static void SimplifyBudgetRespected()
+{
+    const SilhouetteMask disc = FilledDisc(120, 60, 60, 50);
+    const std::vector<SilhouetteContour> cs = TraceContours(disc);
+    CHECK(cs.size() == 1);
+    if (cs.empty())
+        return;
+    float iou8 = 0.0f, iou64 = 0.0f;
+    for (int budget : {8, 16, 64}) {
+        std::vector<SilhouetteContour> s = cs;
+        s[0].points = SimplifyContour(cs[0].points, budget, 0.0f); // tol 0: budget binds
+        CHECK((int)s[0].points.size() <= budget);
+        const float iou = CompareMasks(RasterizePolygons(s, 120, 120), disc).iou;
+        if (budget == 8)
+            iou8 = iou;
+        else if (budget == 64)
+            iou64 = iou;
+    }
+    CHECK(iou64 >= iou8);
+}
+
+// Collinear runs cost nothing (a traced rect stays 4 points under a big budget)
+// and real corners are never dropped (a hand-built octagon keeps all 8).
+static void SimplifyCollinear()
+{
+    const SilhouetteMask r = SolidRect(30, 30, 5, 5, 15, 10);
+    const std::vector<SilhouetteContour> cs = TraceContours(r);
+    CHECK(cs.size() == 1);
+    if (!cs.empty())
+        CHECK(SimplifyContour(cs[0].points, 64, 1.0f).size() == 4);
+    const std::vector<vec2> oct = {{10, 0}, {20, 0}, {30, 10}, {30, 20},
+                                   {20, 30}, {10, 30}, {0, 20}, {0, 10}};
+    CHECK(SimplifyContour(oct, 64, 1.0f).size() == 8);
+}
+
+// Exact landmarks on a T-shape whose widest row (top bar) and tallest column
+// (stem) are deliberately different features.
+static void LandmarksRect()
+{
+    SilhouetteMask m = MakeMask(16, 16);
+    auto set = [&](int x0, int x1, int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                m.pixels[(size_t)y * 16 + x] = 255;
+    };
+    set(2, 14, 2, 5);  // wide top bar (12 x 3)
+    set(6, 10, 5, 12); // narrow stem (4 x 7)
+    const SilhouetteLandmarks lm = MaskLandmarks(m);
+    CHECK(lm.minX == 2 && lm.maxX == 13 && lm.minY == 2 && lm.maxY == 11);
+    CHECK(lm.bboxWidth == 12 && lm.bboxHeight == 10);
+    CHECK(ApproxEq(lm.aspect, 1.2f));
+    CHECK(lm.area == 64);
+    CHECK(ApproxEq(lm.centroid.x, 8.0f) && ApproxEq(lm.centroid.y, 5.6875f));
+    CHECK(lm.widestRowSpan == 12 && lm.widestRowY == 2 && lm.widestRowLeft == 2 &&
+          lm.widestRowRight == 13);
+    CHECK(lm.tallestColSpan == 10 && lm.tallestColX == 6 && lm.tallestColTop == 2 &&
+          lm.tallestColBottom == 11);
+    CHECK(ApproxEq(lm.top.x, 8.0f) && ApproxEq(lm.top.y, 2.5f));
+    CHECK(ApproxEq(lm.bottom.x, 8.0f) && ApproxEq(lm.bottom.y, 11.5f));
+    CHECK(ApproxEq(lm.left.x, 2.5f) && ApproxEq(lm.left.y, 3.5f));
+    CHECK(ApproxEq(lm.right.x, 13.5f) && ApproxEq(lm.right.y, 3.5f));
+    CHECK(ApproxEq(lm.fillFactor, 64.0f / (12.0f * 10.0f)));
+    CHECK(ApproxEq(lm.areaFractionImage, 64.0f / 256.0f));
+}
+
+// Exact row-span triplets on a T-shape sized so rows=3 samples integer rows.
+static void RowSpansTable()
+{
+    SilhouetteMask m = MakeMask(16, 16);
+    auto set = [&](int x0, int x1, int y0, int y1) {
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x)
+                m.pixels[(size_t)y * 16 + x] = 255;
+    };
+    set(2, 14, 1, 4);  // top bar rows 1..3
+    set(6, 10, 4, 10); // stem rows 4..9; bbox height 9 -> rows 1, 5, 9 sampled
+    const std::vector<SilhouetteRowSpan> s = MaskRowSpans(m, 3);
+    CHECK(s.size() == 3);
+    if (s.size() == 3) {
+        CHECK(s[0].y == 1 && s[0].left == 2 && s[0].right == 13 && s[0].covered == 12);
+        CHECK(s[1].y == 5 && s[1].left == 6 && s[1].right == 9 && s[1].covered == 4);
+        CHECK(s[2].y == 9 && s[2].left == 6 && s[2].right == 9 && s[2].covered == 4);
+    }
+}
+
+// Fold a symmetric vase's outline back to r(y) and confirm every folded radius
+// tracks the generating profile within 1.5 px, both ends present.
+static void FoldVaseProfile()
+{
+    const int W = 100;
+    const float cx = 50.0f;
+    struct Ctrl {
+        float y, r;
+    };
+    const std::vector<Ctrl> prof = {{10, 8}, {30, 6}, {60, 20}, {90, 12}};
+    auto radiusAt = [&](float y) -> float {
+        if (y <= prof.front().y)
+            return prof.front().r;
+        if (y >= prof.back().y)
+            return prof.back().r;
+        for (size_t i = 1; i < prof.size(); ++i)
+            if (y <= prof[i].y) {
+                const float t = (y - prof[i - 1].y) / (prof[i].y - prof[i - 1].y);
+                return prof[i - 1].r + t * (prof[i].r - prof[i - 1].r);
+            }
+        return prof.back().r;
+    };
+    SilhouetteMask m = MakeMask(W, W);
+    for (int y = (int)prof.front().y; y <= (int)prof.back().y; ++y) {
+        const float r = radiusAt((float)y + 0.5f);
+        for (int x = 0; x < W; ++x)
+            if (std::fabs((float)x + 0.5f - cx) <= r)
+                m.pixels[(size_t)y * W + x] = 255;
+    }
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 1);
+    if (cs.empty())
+        return;
+    const std::vector<vec2> fold =
+        FoldOutline(SimplifyContour(cs[0].points, 128, 1.0f), cx);
+    CHECK(fold.size() >= 2);
+    float maxErr = 0.0f;
+    for (const vec2& p : fold)
+        maxErr = std::max(maxErr, std::fabs(p.x - radiusAt(p.y)));
+    CHECK(maxErr <= 1.5f);
+    CHECK(fold.front().y > fold.back().y);         // bottom (max y) -> top (min y)
+    CHECK(ApproxEq(fold.front().y, 90.0f, 1.5f));  // bottom end present
+    CHECK(ApproxEq(fold.back().y, 10.0f, 1.5f));   // top end present
+}
+
+// The two-valued gray fast path: a silhouette PNG re-fed keeps its enclosed
+// hole (the dark-ground flood would weld it shut — this test fails if the fast
+// path is removed), and the polarity flip yields the identical mask.
+static void BinaryImageFastPath()
+{
+    const int W = 32;
+    SilhouetteMask donut = SolidRect(W, W, 8, 8, 16, 16);
+    for (int y = 13; y < 19; ++y)
+        for (int x = 13; x < 19; ++x)
+            donut.pixels[(size_t)y * W + x] = 0; // enclosed hole
+    std::vector<uint8_t> img((size_t)W * W * 4, 0);
+    auto paint = [&](bool figureWhite) {
+        for (int i = 0; i < W * W; ++i) {
+            const bool fig = donut.pixels[(size_t)i] != 0;
+            const uint8_t v = (fig == figureWhite) ? 255 : 0;
+            img[(size_t)i * 4 + 0] = img[(size_t)i * 4 + 1] = img[(size_t)i * 4 + 2] = v;
+            img[(size_t)i * 4 + 3] = 255; // opaque, like a compare_silhouette PNG
+        }
+    };
+    paint(true); // white figure on black ground
+    CHECK(BinarizeImage(img.data(), W, W).pixels == donut.pixels);
+    paint(false); // black figure on white ground -> same mask
+    CHECK(BinarizeImage(img.data(), W, W).pixels == donut.pixels);
+}
+
+// A 3-valued gray image (250 / 60 / 246) is NOT the fast path — the enclosed
+// same-tone region (246, deliberately a third value, not 250) goes through the
+// flood and stays FIGURE, because 246 is far above the shadow ceiling. This
+// guards the scope trap: a 250/60/250 image would be two-valued and skip Otsu.
+static void BinaryFastPathNotTakenOnPhotoLikeInput()
+{
+    const int W = 32;
+    std::vector<uint8_t> img((size_t)W * W * 4, 255);
+    auto fill = [&](int x, int y, uint8_t lum) {
+        uint8_t* p = &img[((size_t)y * W + x) * 4];
+        p[0] = p[1] = p[2] = lum;
+        p[3] = 255;
+    };
+    for (int y = 0; y < W; ++y)
+        for (int x = 0; x < W; ++x)
+            fill(x, y, 250); // ground
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            fill(x, y, 60); // object ring (dark outline seals the flood out)
+    for (int y = 13; y < 19; ++y)
+        for (int x = 13; x < 19; ++x)
+            fill(x, y, 246); // enclosed same-tone region, a THIRD value
+    const SilhouetteMask m = BinarizeImage(img.data(), W, W);
+    CHECK(m.pixels[(size_t)15 * W + 15] != 0); // enclosed region stays figure
+    CHECK(m.pixels[(size_t)9 * W + 9] != 0);   // ring is figure
+    CHECK(m.pixels[(size_t)2 * W + 2] == 0);   // ground is ground
+    CHECK(MaskArea(m) == 16 * 16);             // whole object solid, no punch
+}
+
+// The area floor (#142 review): a figure peppered with pinholes (grainy Otsu
+// output) traces to 257 loops by default — the exactness contract — while
+// minArea 4.0 drops every 1-px hole before the quadratic parent pass.
+static void TracePinholeFloor()
+{
+    SilhouetteMask m = SolidRect(64, 64, 0, 0, 64, 64);
+    for (int gy = 0; gy < 16; ++gy)
+        for (int gx = 0; gx < 16; ++gx)
+            m.pixels[(size_t)(4 * gy + 2) * 64 + (4 * gx + 2)] = 0; // 256 pinholes
+    CHECK(TraceContours(m).size() == 257); // default: exact, everything kept
+    const std::vector<SilhouetteContour> floored = TraceContours(m, 4.0);
+    CHECK(floored.size() == 1);
+    if (!floored.empty()) {
+        CHECK(!floored[0].hole);
+        CHECK(floored[0].parent == -1);
+    }
+}
+
+// A 1-px hole's 4-point loop must survive simplification as a real polygon
+// (#142 review): its corner deviation (~0.707 px) sits under tolerance 1.0,
+// and the early-out used to fire with only the two anchors kept — a 2-point
+// "polygon" the rasterizer silently skips, welding the hole shut.
+static void SimplifyTinyHoleStaysPolygon()
+{
+    SilhouetteMask m = SolidRect(12, 12, 2, 2, 8, 8);
+    m.pixels[(size_t)6 * 12 + 6] = 0; // 1-px hole
+    std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 2);
+    int hole = -1;
+    for (int i = 0; i < (int)cs.size(); ++i)
+        if (cs[i].hole)
+            hole = i;
+    CHECK(hole >= 0);
+    if (hole < 0)
+        return;
+    CHECK(cs[hole].points.size() == 4);
+    for (SilhouetteContour& c : cs)
+        c.points = SimplifyContour(c.points, 32, 1.0f);
+    CHECK(cs[hole].points.size() >= 3);
+    // IoU on a 1-px hole is brittle; the pin is the hole pixel itself: a
+    // 3-point simplification of the unit square still leaves its center
+    // outside the covered set under even-odd fill.
+    const SilhouetteMask rt = RasterizePolygons(cs, 12, 12);
+    CHECK(rt.pixels[(size_t)6 * 12 + 6] == 0); // hole pixel stays uncovered
+    CHECK(rt.pixels[(size_t)6 * 12 + 5] != 0); // its neighbor stays figure
+}
+
+// Parent CHAIN through three levels (#142 review): a blob with a hole with an
+// island inside the hole. The island is an OUTER contour whose parent is the
+// HOLE — emission must not lose it, and the trace stays round-trip exact.
+static void TraceIslandParentChain()
+{
+    SilhouetteMask m = SolidRect(30, 30, 2, 2, 26, 26);
+    for (int y = 6; y < 24; ++y)
+        for (int x = 6; x < 24; ++x)
+            m.pixels[(size_t)y * 30 + x] = 0; // hole
+    for (int y = 10; y < 20; ++y)
+        for (int x = 10; x < 20; ++x)
+            m.pixels[(size_t)y * 30 + x] = 255; // island inside the hole
+    const std::vector<SilhouetteContour> cs = TraceContours(m);
+    CHECK(cs.size() == 3);
+    int outer = -1, hole = -1, island = -1;
+    for (int i = 0; i < (int)cs.size(); ++i) {
+        if (cs[i].hole)
+            hole = i;
+        else if (cs[i].parent == -1)
+            outer = i;
+        else
+            island = i;
+    }
+    CHECK(outer >= 0 && hole >= 0 && island >= 0);
+    if (outer < 0 || hole < 0 || island < 0)
+        return;
+    CHECK(cs[hole].parent == outer);
+    CHECK(cs[island].parent == hole);
+    CHECK(!cs[island].hole && cs[island].area > 0.0);
+    CHECK(RasterizePolygons(cs, 30, 30).pixels == m.pixels);
+}
+
 void RunSilhouetteTests()
 {
     RasterTriangleCoverage();
@@ -592,6 +1003,21 @@ void RunSilhouetteTests()
     NormalizeInvariances();
     CompareAndDiffValues();
     LatheCupAcceptance();
+    TraceRectExact();
+    TraceDonut();
+    TraceSaddleCheckerboard();
+    TraceMultiComponent();
+    RoundTripNotchCrescentDonut();
+    SimplifyBudgetRespected();
+    SimplifyCollinear();
+    LandmarksRect();
+    RowSpansTable();
+    FoldVaseProfile();
+    BinaryImageFastPath();
+    BinaryFastPathNotTakenOnPhotoLikeInput();
+    TracePinholeFloor();
+    SimplifyTinyHoleStaysPolygon();
+    TraceIslandParentChain();
     std::printf("[ok] silhouette kernel tests done\n");
 }
 

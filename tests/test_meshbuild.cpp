@@ -237,8 +237,9 @@ void TestSweepStraightPathIsPrism()
     const std::vector<vec3> path = {{0, 0, 0}, {0, 2, 0}};
     MeshData m;
     CHECK(BuildSweep(SquareSection(0.1f), path, m));
-    // 2 wall rings of k+1, plus 2 caps of center + k+1.
-    CHECK(m.vertices.size() == 2 * 5 + 2 * 6);
+    // 2 wall rings of k+1, plus 2 ear-clipped caps of k (#135: no centroid
+    // vertex and no seam duplicate anymore).
+    CHECK(m.vertices.size() == 2 * 5 + 2 * 4);
     MeshStats s = Stats(m);
     CHECK(s.watertight);
     CHECK(s.boundaryEdges == 0);
@@ -405,6 +406,49 @@ void TestSweepRejectsOversizedInput()
     CHECK(!BuildSweep(bigSec, longPath, m)); // 16000 * 201 > 2M projected verts
 }
 
+// Ear-clipped caps on a concave, non-star section (#135): a 4x2 rectangle with
+// a 1x1 notch cut into the top edge. Its vertex centroid (0, 0.25) sits INSIDE
+// the notch — outside the polygon — so the section is not star-shaped about
+// the centroid and the old fan caps overfilled the notch: their unsigned
+// triangle areas summed to 8.25, not the true 7. The area-sum assertion below
+// is the discriminator (verified to fail against the fan code).
+void TestSweepConcaveSectionCaps()
+{
+    const std::vector<vec2> sec = {{-2, -1},    {2, -1},    {2, 1},     {0.5f, 1},
+                                   {0.5f, 0},   {-0.5f, 0}, {-0.5f, 1}, {-2, 1}};
+    const std::vector<vec3> path = {{0, 0, 0}, {0, 0, 2}}; // +Z: section (x,y) -> world (x,y)
+    MeshData m;
+    CHECK(BuildSweep(sec, path, m));
+    const size_t k = sec.size();
+    // Walls: 2 rings of k+1. Caps: k verts each, k-2 ear triangles each.
+    CHECK(m.vertices.size() == 2 * (k + 1) + 2 * k);
+    const size_t wallIndices = k * 6;
+    CHECK(m.indices.size() == wallIndices + 2 * 3 * (k - 2));
+    // Per cap: no zero-area triangles, and the UNSIGNED triangle areas sum to
+    // the section's shoelace area (7) — overlapping fan triangles sum to MORE.
+    for (int cap = 0; cap < 2; ++cap) {
+        const size_t begin = wallIndices + (size_t)cap * 3 * (k - 2);
+        double sum = 0.0;
+        for (size_t t = 0; t < 3 * (k - 2); t += 3) {
+            const vec3& a = m.vertices[m.indices[begin + t]].position;
+            const vec3& b = m.vertices[m.indices[begin + t + 1]].position;
+            const vec3& c = m.vertices[m.indices[begin + t + 2]].position;
+            const double area = 0.5 * glm::length(glm::cross(b - a, c - a));
+            CHECK(area > 1e-6);
+            sum += area;
+        }
+        CHECK(std::fabs(sum - 7.0) <= 7.0 * 1e-4);
+    }
+    // Cap ring verts weld bit-exactly onto wall ring verts: watertight solid
+    // with the exact prism volume (cap winding wrong would flip the sign).
+    MeshStats s = Stats(m);
+    CHECK(s.watertight);
+    CHECK(s.boundaryEdges == 0);
+    CHECK(s.nonManifoldEdges == 0);
+    CHECK(s.degenerateTriangles == 0);
+    CHECK(ApproxEq(SignedVolume(m), 7.0f * 2.0f, 1e-4f));
+}
+
 void TestSweepRejectsDegenerates()
 {
     MeshData m;
@@ -443,6 +487,7 @@ void RunMeshBuildTests()
     TestSweepSeamIsBitExact();
     TestSweepClosedInputPolygonTolerated();
     TestSweepSwitchbackPathStaysFinite();
+    TestSweepConcaveSectionCaps();
     TestSweepRejectsOversizedInput();
     TestSweepRejectsDegenerates();
 }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <queue>
 
 namespace forge {
 
@@ -578,6 +579,57 @@ SilhouetteMask BinarizeImage(const uint8_t* rgba, int width, int height)
         return m;
     }
 
+    // Two-valued gray fast path (#135): a silhouette PNG round-tripped as a
+    // reference is opaque, r==g==b, and holds exactly the figure/background
+    // pair. Segment it by border majority instead of flooding — the dark-ground
+    // flood below would weld the axe's enclosed cutouts shut (PunchEnclosedHoles
+    // bails on a dark median). JPEG chroma noise alone spreads r,g,b past this
+    // test, so no photograph reaches it; a same-tone enclosed region needs a
+    // third tone (the outline) to survive the flood, so that case is >= 3-valued
+    // and untouched here.
+    {
+        bool twoValued = true;
+        int v0 = -1, v1 = -1; // the (at most) two distinct gray levels seen
+        for (size_t i = 0; i < n && twoValued; ++i) {
+            const uint8_t* p = &rgba[i * 4];
+            if (p[0] != p[1] || p[1] != p[2]) { // any chroma disqualifies
+                twoValued = false;
+                break;
+            }
+            const int g = p[0];
+            if (v0 < 0 || g == v0)
+                v0 = g;
+            else if (v1 < 0 || g == v1)
+                v1 = g;
+            else
+                twoValued = false; // a third distinct value: not a silhouette PNG
+        }
+        if (twoValued && (v1 < 0 || std::abs(v1 - v0) >= 128)) {
+            if (v1 < 0)
+                return m; // single flat color: nothing to segment
+            // Border majority is the ground; the other value is the figure.
+            int64_t borderV0 = 0, borderTotal = 0;
+            auto tally = [&](size_t i) {
+                ++borderTotal;
+                if ((int)rgba[i * 4] == v0)
+                    ++borderV0;
+            };
+            for (int x = 0; x < width; ++x) {
+                tally((size_t)x);
+                tally((size_t)(height - 1) * width + x);
+            }
+            for (int y = 1; y + 1 < height; ++y) {
+                tally((size_t)y * width);
+                tally((size_t)y * width + width - 1);
+            }
+            const int fgValue = borderV0 * 2 >= borderTotal ? v1 : v0;
+            for (size_t i = 0; i < n; ++i)
+                m.pixels[i] = (int)rgba[i * 4] == fgValue ? 255 : 0;
+            DropSpecks(m); // shared tail: orphan specks still poison the crop box
+            return m;
+        }
+    }
+
     std::vector<uint8_t> lum(n);
     uint32_t hist[256] = {};
     for (size_t i = 0; i < n; ++i) {
@@ -729,6 +781,593 @@ std::vector<uint8_t> DiffImageRGBA(const SilhouetteMask& a, const SilhouetteMask
         img[i * 4 + 3] = 255;
     }
     return img;
+}
+
+// --- outline extraction (#135) ------------------------------------------------
+
+double PolygonSignedArea(const std::vector<vec2>& points)
+{
+    const size_t n = points.size();
+    if (n < 3)
+        return 0.0;
+    double a2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const vec2& p = points[i];
+        const vec2& q = points[(i + 1) % n];
+        a2 += (double)p.x * (double)q.y - (double)q.x * (double)p.y;
+    }
+    return 0.5 * a2;
+}
+
+vec2 PolygonCentroid(const std::vector<vec2>& points)
+{
+    const size_t n = points.size();
+    if (n == 0)
+        return vec2(0.0f);
+    double a2 = 0.0, cx = 0.0, cy = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const vec2& p = points[i];
+        const vec2& q = points[(i + 1) % n];
+        const double cross = (double)p.x * (double)q.y - (double)q.x * (double)p.y;
+        a2 += cross;
+        cx += ((double)p.x + (double)q.x) * cross;
+        cy += ((double)p.y + (double)q.y) * cross;
+    }
+    // The shoelace centroid divides by area; a collinear sliver (area ~ 0) would
+    // explode, so fall back to the vertex mean there.
+    if (std::abs(a2) < 1e-9) {
+        double mx = 0.0, my = 0.0;
+        for (const vec2& p : points) {
+            mx += p.x;
+            my += p.y;
+        }
+        return vec2((float)(mx / (double)n), (float)(my / (double)n));
+    }
+    return vec2((float)(cx / (3.0 * a2)), (float)(cy / (3.0 * a2)));
+}
+
+// Even-odd point-in-polygon (PNPOLY). Callers pass pixel CENTERS (half-integer)
+// against integer contour vertices, so the horizontal ray never grazes a vertex
+// — there is no on-edge degeneracy to special-case, and a saddle's self-touching
+// loop still tests correctly (even-odd counts net crossings).
+static bool PointInPolygon(const vec2& pt, const std::vector<vec2>& poly)
+{
+    const size_t n = poly.size();
+    if (n < 3)
+        return false;
+    bool inside = false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const vec2& a = poly[i];
+        const vec2& b = poly[j];
+        if ((a.y > pt.y) != (b.y > pt.y)) {
+            const double xCross =
+                (double)a.x + (double)(pt.y - a.y) / (double)(b.y - a.y) *
+                                  ((double)b.x - (double)a.x);
+            if ((double)pt.x < xCross)
+                inside = !inside;
+        }
+    }
+    return inside;
+}
+
+std::vector<SilhouetteContour> TraceContours(const SilhouetteMask& mask, double minArea)
+{
+    std::vector<SilhouetteContour> contours;
+    const int w = mask.width, h = mask.height;
+    if (w <= 0 || h <= 0 || (size_t)w * h != mask.pixels.size())
+        return contours;
+
+    auto covered = [&](int x, int y) -> bool {
+        return x >= 0 && y >= 0 && x < w && y < h && mask.pixels[(size_t)y * w + x] != 0;
+    };
+    const int cw = w + 1; // corner-lattice width
+    auto corner = [&](int cx, int cy) { return cy * cw + cx; };
+
+    // Directed boundary edges on the corner lattice. Per covered pixel, an edge
+    // is emitted along each side facing an uncovered neighbor, oriented so the
+    // covered region stays on a consistent side: outer loops then come out with
+    // POSITIVE shoelace area in the y-down frame and holes NEGATIVE, by
+    // construction rather than a post-hoc sign flip.
+    struct Edge {
+        int start, end;  // corner indices
+        int emitPix;     // the covered pixel that emitted this edge (always valid)
+        int uncovPix;    // the uncovered neighbor across the edge, -1 if off-image
+    };
+    std::vector<Edge> edges;
+    // A corner has two outgoing edges only at a saddle; a fixed 2-slot table
+    // per corner avoids a per-corner heap allocation on megapixel masks.
+    std::vector<std::array<int, 2>> outSlot((size_t)cw * (h + 1), {-1, -1});
+    auto addEdge = [&](int s, int e, int emit, int uncov) {
+        const int idx = (int)edges.size();
+        edges.push_back({s, e, emit, uncov});
+        std::array<int, 2>& slot = outSlot[(size_t)s];
+        slot[slot[0] < 0 ? 0 : 1] = idx;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            if (!covered(x, y))
+                continue;
+            const int pix = y * w + x;
+            if (!covered(x, y - 1)) // N: top edge, left -> right
+                addEdge(corner(x, y), corner(x + 1, y), pix, y > 0 ? (y - 1) * w + x : -1);
+            if (!covered(x + 1, y)) // E: right edge, top -> bottom
+                addEdge(corner(x + 1, y), corner(x + 1, y + 1), pix,
+                        x + 1 < w ? y * w + x + 1 : -1);
+            if (!covered(x, y + 1)) // S: bottom edge, right -> left
+                addEdge(corner(x + 1, y + 1), corner(x, y + 1), pix,
+                        y + 1 < h ? (y + 1) * w + x : -1);
+            if (!covered(x - 1, y)) // W: left edge, bottom -> top
+                addEdge(corner(x, y + 1), corner(x, y), pix, x > 0 ? y * w + x - 1 : -1);
+        }
+
+    std::vector<int> reps; // representative interior pixel per contour, -1 = none
+    std::vector<char> used(edges.size(), 0);
+    for (int startEdge = 0; startEdge < (int)edges.size(); ++startEdge) {
+        if (used[(size_t)startEdge])
+            continue;
+        std::vector<int> loopCorners; // start corners in walk order
+        int coveredPix = -1, uncovPix = -1;
+        int e = startEdge;
+        while (e >= 0 && !used[(size_t)e]) {
+            used[(size_t)e] = 1;
+            loopCorners.push_back(edges[(size_t)e].start);
+            if (coveredPix < 0)
+                coveredPix = edges[(size_t)e].emitPix;
+            if (uncovPix < 0 && edges[(size_t)e].uncovPix >= 0)
+                uncovPix = edges[(size_t)e].uncovPix;
+            const int c = edges[(size_t)e].end;
+            const std::array<int, 2>& slot = outSlot[(size_t)c];
+            int next = -1;
+            if (slot[1] < 0) {
+                next = (slot[0] >= 0 && !used[(size_t)slot[0]]) ? slot[0] : -1;
+            } else {
+                // Saddle (two diagonal covered squares meet at c): cross to the
+                // OTHER square so the two stay on ONE 8-connected loop. Round-trip
+                // is exact either way; the checkerboard test pins this choice.
+                for (int k = 0; k < 2; ++k) {
+                    const int cand = slot[k];
+                    if (cand >= 0 && !used[(size_t)cand] &&
+                        edges[(size_t)cand].emitPix != edges[(size_t)e].emitPix)
+                        next = cand;
+                }
+                if (next < 0) // second visit: only the same-square edge remains
+                    for (int k = 0; k < 2; ++k)
+                        if (slot[k] >= 0 && !used[(size_t)slot[k]])
+                            next = slot[k];
+            }
+            e = next;
+        }
+
+        // Corner indices -> lattice coords, then merge collinear runs. Crack
+        // following emits a vertex every unit step; dropping the middle of a
+        // collinear triple makes a rect 4 points and cuts memory ~10x on big
+        // masks, with no effect on the traced segment (or on exactness).
+        const size_t rn = loopCorners.size();
+        std::vector<vec2> pts;
+        for (size_t i = 0; i < rn; ++i) {
+            const int cPrev = loopCorners[(i + rn - 1) % rn];
+            const int cCur = loopCorners[i];
+            const int cNext = loopCorners[(i + 1) % rn];
+            const vec2 prev((float)(cPrev % cw), (float)(cPrev / cw));
+            const vec2 cur((float)(cCur % cw), (float)(cCur / cw));
+            const vec2 next((float)(cNext % cw), (float)(cNext / cw));
+            const double cross = (double)(cur.x - prev.x) * (double)(next.y - prev.y) -
+                                 (double)(cur.y - prev.y) * (double)(next.x - prev.x);
+            if (cross != 0.0)
+                pts.push_back(cur);
+        }
+        if (pts.size() < 3)
+            continue; // degenerate stub
+
+        SilhouetteContour contour;
+        contour.area = PolygonSignedArea(pts);
+        contour.hole = contour.area < 0.0;
+        contour.points = std::move(pts);
+        // Representative interior pixel for the parent test: a covered pixel for
+        // an outer loop (inside the blob), the uncovered neighbor for a hole
+        // (inside the hole). Its center is half-integer -> exact even-odd test.
+        reps.push_back(contour.hole ? uncovPix : coveredPix);
+        contours.push_back(std::move(contour));
+    }
+
+    // Area floor: drop sub-minArea loops (and their parallel reps) BEFORE the
+    // quadratic parent pass — the caller opted into losing pinholes it cannot
+    // use in exchange for bounded work here.
+    if (minArea > 0.0) {
+        size_t keep = 0;
+        for (size_t i = 0; i < contours.size(); ++i)
+            if (std::abs(contours[i].area) >= minArea) {
+                if (keep != i) {
+                    contours[keep] = std::move(contours[i]);
+                    reps[keep] = reps[i];
+                }
+                ++keep;
+            }
+        contours.resize(keep);
+        reps.resize(keep);
+    }
+
+    // Immediate parent = the smallest-|area| OTHER contour whose polygon
+    // contains this contour's representative center. DropSpecks removes only
+    // COVERED specks — uncovered pinholes survive it and can number in the
+    // thousands on a grainy mask — so this quadratic pass is bounded by the
+    // caller's minArea floor plus the bbox prefilter below, not by any
+    // "loops are few" assumption.
+    std::vector<vec2> bbLo(contours.size()), bbHi(contours.size());
+    for (size_t i = 0; i < contours.size(); ++i) {
+        vec2 lo = contours[i].points[0], hi = lo;
+        for (const vec2& p : contours[i].points) {
+            lo = glm::min(lo, p);
+            hi = glm::max(hi, p);
+        }
+        bbLo[i] = lo;
+        bbHi[i] = hi;
+    }
+    for (size_t i = 0; i < contours.size(); ++i) {
+        const int rp = reps[i];
+        if (rp < 0)
+            continue;
+        const vec2 center((float)(rp % w) + 0.5f, (float)(rp / w) + 0.5f);
+        double bestArea = 0.0;
+        int best = -1;
+        for (size_t j = 0; j < contours.size(); ++j) {
+            if (j == i)
+                continue;
+            // Bbox reject first: a point inside a polygon is inside its bbox,
+            // so this is pure pruning — PNPOLY only runs on real candidates.
+            if (center.x < bbLo[j].x || center.x > bbHi[j].x || center.y < bbLo[j].y ||
+                center.y > bbHi[j].y)
+                continue;
+            if (!PointInPolygon(center, contours[j].points))
+                continue;
+            const double aj = std::abs(contours[j].area);
+            if (best < 0 || aj < bestArea) {
+                bestArea = aj;
+                best = (int)j;
+            }
+        }
+        contours[i].parent = best;
+    }
+    return contours;
+}
+
+std::vector<vec2> SimplifyContour(const std::vector<vec2>& points, int maxPoints, float tolerance)
+{
+    const int n = (int)points.size();
+    if (n < 3)
+        return points;
+    maxPoints = std::max(3, maxPoints);
+
+    // Closed-loop anchors: bottom-most vertex, then the vertex farthest from it.
+    // Two chains between them seed the priority split.
+    int a0 = 0;
+    for (int i = 1; i < n; ++i)
+        if (points[i].y > points[a0].y ||
+            (points[i].y == points[a0].y && points[i].x > points[a0].x))
+            a0 = i;
+    int a1 = a0;
+    double bestD = -1.0;
+    for (int i = 0; i < n; ++i) {
+        const double dx = (double)points[i].x - points[a0].x;
+        const double dy = (double)points[i].y - points[a0].y;
+        const double d = dx * dx + dy * dy;
+        if (d > bestD) {
+            bestD = d;
+            a1 = i;
+        }
+    }
+    if (a1 == a0)
+        return points; // all vertices coincide
+
+    // Point-to-SEGMENT distance (t clamped): the endpoints of a near-degenerate
+    // chord must not pull the deviation off to infinity like an infinite line.
+    auto segDist = [&](const vec2& p, const vec2& a, const vec2& b) -> double {
+        const double vx = (double)b.x - a.x, vy = (double)b.y - a.y;
+        const double wx = (double)p.x - a.x, wy = (double)p.y - a.y;
+        const double len2 = vx * vx + vy * vy;
+        double t = len2 > 0.0 ? (wx * vx + wy * vy) / len2 : 0.0;
+        t = std::clamp(t, 0.0, 1.0);
+        const double dx = wx - t * vx, dy = wy - t * vy;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+    // Farthest interior ring position strictly between i and j (walking forward
+    // mod n) and its distance to the chord. Lowest step wins ties (strict >).
+    auto farthest = [&](int i, int j, int& outPos, double& outDist) {
+        outPos = -1;
+        outDist = -1.0;
+        const int steps = (j - i + n) % n;
+        for (int s = 1; s < steps; ++s) {
+            const int pos = (i + s) % n;
+            const double d = segDist(points[pos], points[i], points[j]);
+            if (d > outDist) {
+                outDist = d;
+                outPos = pos;
+            }
+        }
+    };
+
+    // Top-down priority DP: always split the interval with the largest deviation
+    // next, so the point budget is spent where it matters. This hits an exact
+    // budget (classic tolerance-only DP cannot), while the tolerance early-out
+    // collapses pixel staircases (deviation <= ~0.71 px) instead of eating the
+    // budget on a diagonal edge.
+    struct Interval {
+        int i, j, pos;
+        double dist;
+    };
+    struct Cmp {
+        bool operator()(const Interval& a, const Interval& b) const
+        {
+            if (a.dist != b.dist)
+                return a.dist < b.dist; // max-heap on deviation
+            return a.pos > b.pos;       // deterministic tie-break: lower pos first
+        }
+    };
+    std::priority_queue<Interval, std::vector<Interval>, Cmp> pq;
+    std::vector<char> kept((size_t)n, 0);
+    kept[(size_t)a0] = 1;
+    kept[(size_t)a1] = 1;
+    int keptCount = 2;
+    auto pushInterval = [&](int i, int j) {
+        int pos;
+        double dist;
+        farthest(i, j, pos, dist);
+        if (pos >= 0)
+            pq.push({i, j, pos, dist});
+    };
+    pushInterval(a0, a1);
+    pushInterval(a1, a0);
+    while (!pq.empty() && keptCount < maxPoints) {
+        const Interval top = pq.top();
+        // Tolerance early-out only once a real polygon exists: a 1-px hole's
+        // corner deviation (~0.707) sits under a 1.0 tolerance, and breaking
+        // at the two anchors alone returned a 2-point "polygon" that the
+        // rasterizer silently skips — welding tiny holes shut (#142 review).
+        if (top.dist <= (double)tolerance && keptCount >= 3)
+            break; // every remaining deviation is within tolerance
+        pq.pop();
+        kept[(size_t)top.pos] = 1; // intervals only split, never move -> never stale
+        ++keptCount;
+        pushInterval(top.i, top.pos);
+        pushInterval(top.pos, top.j);
+    }
+
+    std::vector<vec2> out;
+    out.reserve((size_t)keptCount);
+    for (int i = 0; i < n; ++i)
+        if (kept[(size_t)i])
+            out.push_back(points[i]); // ring order preserved -> ordered subset
+    return out;
+}
+
+SilhouetteMask RasterizePolygons(const std::vector<SilhouetteContour>& contours, int width,
+                                 int height)
+{
+    SilhouetteMask m = MakeMask(width, height);
+    if (width <= 0 || height <= 0)
+        return m;
+    std::vector<double> xs;
+    for (int y = 0; y < height; ++y) {
+        const double yc = (double)y + 0.5;
+        xs.clear();
+        for (const SilhouetteContour& c : contours) {
+            const std::vector<vec2>& p = c.points;
+            const size_t np = p.size();
+            if (np < 3)
+                continue;
+            for (size_t i = 0, j = np - 1; i < np; j = i++) {
+                const double ay = p[i].y, by = p[j].y;
+                // Half-open in y so a shared vertex counts once; a horizontal
+                // edge (ay==by) never satisfies it and is skipped for free.
+                // Vertices are integers and yc is half-integer, so the scanline
+                // never passes through a vertex — no epsilon anywhere.
+                if ((ay <= yc && yc < by) || (by <= yc && yc < ay)) {
+                    const double t = (yc - ay) / (by - ay);
+                    xs.push_back((double)p[i].x + t * ((double)p[j].x - (double)p[i].x));
+                }
+            }
+        }
+        if (xs.size() < 2)
+            continue;
+        std::sort(xs.begin(), xs.end());
+        uint8_t* row = &m.pixels[(size_t)y * width];
+        for (size_t k = 0; k + 1 < xs.size(); k += 2) {
+            // Pixel centers strictly inside (xL, xR): first x with x+0.5 > xL,
+            // last with x+0.5 < xR. Double math, then clamp to the frame.
+            int xStart = (int)std::floor(xs[k] - 0.5) + 1;
+            int xEnd = (int)std::ceil(xs[k + 1] - 0.5) - 1;
+            xStart = std::max(xStart, 0);
+            xEnd = std::min(xEnd, width - 1);
+            for (int x = xStart; x <= xEnd; ++x)
+                row[x] = 255;
+        }
+    }
+    return m;
+}
+
+SilhouetteLandmarks MaskLandmarks(const SilhouetteMask& mask)
+{
+    SilhouetteLandmarks lm;
+    const int w = mask.width, h = mask.height;
+    if (w <= 0 || h <= 0 || (size_t)w * h != mask.pixels.size())
+        return lm;
+    auto cov = [&](int x, int y) { return mask.pixels[(size_t)y * w + x] != 0; };
+
+    int minX = w, minY = h, maxX = -1, maxY = -1;
+    int64_t area = 0;
+    double sumX = 0.0, sumY = 0.0;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            if (cov(x, y)) {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+                ++area;
+                sumX += (double)x + 0.5;
+                sumY += (double)y + 0.5;
+            }
+    if (maxX < 0)
+        return lm; // empty mask -> all -1 / 0
+
+    lm.minX = minX;
+    lm.minY = minY;
+    lm.maxX = maxX;
+    lm.maxY = maxY;
+    lm.bboxWidth = maxX - minX + 1;
+    lm.bboxHeight = maxY - minY + 1;
+    lm.aspect = (float)lm.bboxWidth / (float)lm.bboxHeight;
+    lm.area = (int)area;
+    // int64 image area (#114 lesson): a 22.6 MP reference overflows int * 100.
+    lm.areaFractionImage = (float)((double)area / ((double)w * (double)h));
+    lm.fillFactor = (float)((double)area / ((double)lm.bboxWidth * (double)lm.bboxHeight));
+    lm.centroid = vec2((float)(sumX / (double)area), (float)(sumY / (double)area));
+
+    // Widest row / tallest column by covered SPAN (last - first + 1, gaps
+    // included) — the extent, not the pixel count. First extreme wins ties.
+    for (int y = minY; y <= maxY; ++y) {
+        int l = -1, r = -1;
+        for (int x = minX; x <= maxX; ++x)
+            if (cov(x, y)) {
+                if (l < 0)
+                    l = x;
+                r = x;
+            }
+        if (l >= 0 && r - l + 1 > lm.widestRowSpan) {
+            lm.widestRowSpan = r - l + 1;
+            lm.widestRowY = y;
+            lm.widestRowLeft = l;
+            lm.widestRowRight = r;
+        }
+    }
+    for (int x = minX; x <= maxX; ++x) {
+        int t = -1, b = -1;
+        for (int y = minY; y <= maxY; ++y)
+            if (cov(x, y)) {
+                if (t < 0)
+                    t = y;
+                b = y;
+            }
+        if (t >= 0 && b - t + 1 > lm.tallestColSpan) {
+            lm.tallestColSpan = b - t + 1;
+            lm.tallestColX = x;
+            lm.tallestColTop = t;
+            lm.tallestColBottom = b;
+        }
+    }
+
+    // Extremities: midpoint of the covered extent on each extreme row/column,
+    // in center coords ((left+right+1)/2, y+0.5) and mirror for columns.
+    auto rowMid = [&](int y) {
+        int l = -1, r = -1;
+        for (int x = 0; x < w; ++x)
+            if (cov(x, y)) {
+                if (l < 0)
+                    l = x;
+                r = x;
+            }
+        return vec2(((float)l + (float)r + 1.0f) * 0.5f, (float)y + 0.5f);
+    };
+    auto colMid = [&](int x) {
+        int t = -1, b = -1;
+        for (int y = 0; y < h; ++y)
+            if (cov(x, y)) {
+                if (t < 0)
+                    t = y;
+                b = y;
+            }
+        return vec2((float)x + 0.5f, ((float)t + (float)b + 1.0f) * 0.5f);
+    };
+    lm.top = rowMid(minY);
+    lm.bottom = rowMid(maxY);
+    lm.left = colMid(minX);
+    lm.right = colMid(maxX);
+    return lm;
+}
+
+std::vector<SilhouetteRowSpan> MaskRowSpans(const SilhouetteMask& mask, int rows)
+{
+    std::vector<SilhouetteRowSpan> spans;
+    const int w = mask.width, h = mask.height;
+    if (rows <= 0 || w <= 0 || h <= 0 || (size_t)w * h != mask.pixels.size())
+        return spans;
+    const SilhouetteLandmarks lm = MaskLandmarks(mask);
+    if (lm.area == 0)
+        return spans;
+    const int bboxH = lm.bboxHeight;
+    rows = std::min(rows, bboxH); // clamp so every sampled row is distinct
+
+    auto cov = [&](int x, int y) { return mask.pixels[(size_t)y * w + x] != 0; };
+    auto measure = [&](int y) {
+        SilhouetteRowSpan s;
+        s.y = y;
+        for (int x = 0; x < w; ++x)
+            if (cov(x, y)) {
+                if (s.left < 0)
+                    s.left = x;
+                s.right = x;
+                ++s.covered;
+            }
+        return s;
+    };
+    if (rows == 1) {
+        spans.push_back(measure(lm.minY + (bboxH - 1) / 2)); // bbox middle row
+        return spans;
+    }
+    // First row = minY, last = maxY, evenly spaced between (round to pixels).
+    for (int i = 0; i < rows; ++i) {
+        const int y =
+            lm.minY + (int)std::lround((double)i * (double)(bboxH - 1) / (double)(rows - 1));
+        spans.push_back(measure(y));
+    }
+    return spans;
+}
+
+std::vector<vec2> FoldOutline(const std::vector<vec2>& outline, float axisX)
+{
+    std::vector<vec2> out;
+    const int n = (int)outline.size();
+    if (n < 2)
+        return out;
+    // bottom = max y (tie max x); top = min y (tie max x).
+    int bottom = 0, top = 0;
+    for (int i = 1; i < n; ++i) {
+        if (outline[i].y > outline[bottom].y ||
+            (outline[i].y == outline[bottom].y && outline[i].x > outline[bottom].x))
+            bottom = i;
+        if (outline[i].y < outline[top].y ||
+            (outline[i].y == outline[top].y && outline[i].x > outline[top].x))
+            top = i;
+    }
+    if (bottom == top)
+        return out; // no vertical extent to fold
+
+    // Two walks bottom -> top around the ring; keep the side with the larger
+    // mean x (the right half). Following the contour, not a row scan, preserves
+    // a lip overhang's multi-valued r(y).
+    auto walk = [&](int dir) {
+        std::vector<vec2> path;
+        int i = bottom;
+        path.push_back(outline[(size_t)i]);
+        while (i != top) {
+            i = (i + dir + n) % n;
+            path.push_back(outline[(size_t)i]);
+        }
+        return path;
+    };
+    const std::vector<vec2> fwd = walk(+1);
+    const std::vector<vec2> bwd = walk(-1);
+    auto meanX = [](const std::vector<vec2>& p) {
+        double s = 0.0;
+        for (const vec2& v : p)
+            s += v.x;
+        return p.empty() ? 0.0 : s / (double)p.size();
+    };
+    const std::vector<vec2>& side = meanX(fwd) >= meanX(bwd) ? fwd : bwd;
+    out.reserve(side.size());
+    for (const vec2& v : side)
+        out.push_back(vec2(std::max(0.0f, v.x - axisX), v.y)); // r >= 0, bottom -> top
+    return out;
 }
 
 } // namespace forge

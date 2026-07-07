@@ -167,6 +167,7 @@ private:
     // --- measurement & critique (#114) ---------------------------------------
     ToolResult ToolMeasure(const nlohmann::json& args);           // distances / landmarks / extents
     ToolResult ToolCompareSilhouette(const nlohmann::json& args); // IoU vs reference image
+    ToolResult ToolAnalyzeReference(const nlohmann::json& args);  // #135: reference -> outline + landmarks
     // One measure endpoint: [x,y,z] literal, or {entity/id/name, feature}.
     bool ResolveMeasurePoint(const nlohmann::json& endpoint, vec3& out, std::string& error);
     // --- Poly Haven asset library (#84) — bodies in mcp/McpPolyHaven.cpp ----
