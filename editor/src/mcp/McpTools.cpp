@@ -352,7 +352,12 @@ void EditorApp::RegisterMcpTools()
         "'missing' = the reference has material there: grow or move something "
         "toward centroidWorld; 'excess' = the model overshoots: shrink/trim there. "
         "centroidWorld/bboxWorld are in the target's world frame on the view's "
-        "depth plane, so fixes are computable without reading any image. "
+        "depth plane, so fixes are computable without reading any image. Frame "
+        "caveat: both masks are normalized (crop+center+scale), so a defect that "
+        "changes the silhouette's OUTER BBOX re-centers the frame and smears a "
+        "one-sided error into a symmetric half-magnitude pair — prefer fixes "
+        "anchored to bbox-preserving datums, or iterate (the loop still "
+        "converges; see docs/mcp/examples/closed-loop-fix.lua). "
         "symmetry.render/.reference score each silhouette against its own "
         "left-right mirror (1.0 = perfectly bilateral): reference high + render "
         "low = the build broke a symmetry the subject has.",
