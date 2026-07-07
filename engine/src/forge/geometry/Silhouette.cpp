@@ -220,29 +220,50 @@ static std::vector<uint8_t> BlurredChromaSpread(const uint8_t* rgba, int width, 
         const uint8_t lo = std::min({p[0], p[1], p[2]});
         spread[i] = (uint8_t)(hi - lo);
     }
+    // Separable sliding-window box sums (edge-replicated) — bit-identical to
+    // the naive (2R+1)^2 gather but O(n): this runs on the GL main thread for
+    // every opaque reference load, and 81 taps per pixel measured a 7x
+    // binarize slowdown. Row sums cap at 9*255 = 2295 (uint16); column sums
+    // of those cap well inside int.
+    std::vector<uint16_t> rowSum(n);
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* row = &spread[(size_t)y * width];
+        uint16_t* out = &rowSum[(size_t)y * width];
+        int sum = 0;
+        for (int dx = -kR; dx <= kR; ++dx)
+            sum += row[std::clamp(dx, 0, width - 1)];
+        out[0] = (uint16_t)sum;
+        for (int x = 1; x < width; ++x) {
+            sum += row[std::clamp(x + kR, 0, width - 1)] - row[std::clamp(x - kR - 1, 0, width - 1)];
+            out[x] = (uint16_t)sum;
+        }
+    }
     std::vector<uint8_t> blur(n);
-    for (int y = 0; y < height; ++y)
-        for (int x = 0; x < width; ++x) {
-            int sum = 0;
-            for (int dy = -kR; dy <= kR; ++dy) {
-                const int sy = std::clamp(y + dy, 0, height - 1);
-                for (int dx = -kR; dx <= kR; ++dx)
-                    sum += spread[(size_t)sy * width + std::clamp(x + dx, 0, width - 1)];
-            }
+    for (int x = 0; x < width; ++x) {
+        int sum = 0;
+        for (int dy = -kR; dy <= kR; ++dy)
+            sum += rowSum[(size_t)std::clamp(dy, 0, height - 1) * width + x];
+        blur[x] = (uint8_t)((sum + kTaps / 2) / kTaps);
+        for (int y = 1; y < height; ++y) {
+            sum += rowSum[(size_t)std::clamp(y + kR, 0, height - 1) * width + x] -
+                   rowSum[(size_t)std::clamp(y - kR - 1, 0, height - 1) * width + x];
             blur[(size_t)y * width + x] = (uint8_t)((sum + kTaps / 2) / kTaps);
         }
+    }
     return blur;
 }
 
 // Enclosed through-hole recovery (#134): the border flood cannot reach
 // backdrop seen THROUGH the object (an axe head's cutouts), so those pixels
 // land in the figure. Re-run the flood's physics from the inside: seed at
-// figure pixels that read as SHADOWED BACKDROP — backdrop-neutral chroma and
-// between half and four fifths of the border's brightness (a through-hole
-// shows the ground occluded and shadowed: meaningfully darker, never brighter,
-// and never near-black — β≈0.5..0.8 in shadow-detection terms). Grow with the
-// flood's gradient+chroma gates, then punch the region back to background
-// only when it
+// figure pixels with backdrop-neutral chroma anywhere above half the border's
+// brightness (the wide top is load-bearing — a sheen region must swallow its
+// whole bright ramp so it dies open or over-cap), grow with the flood's
+// gradient+chroma gates, then apply the SHADOW test to the region's median in
+// verdict (c): a through-hole shows the ground occluded and shadowed, between
+// half and four fifths of the border's brightness — meaningfully darker,
+// never brighter, never near-black (β≈0.5..0.8 in shadow-detection terms).
+// Punch the region back to background only when it
 //   (a) is fully enclosed — touches neither the image border nor the outer
 //       background (a region the flood merely failed to seed is not a hole);
 //   (b) sits between minArea (JPEG salt would pepper the mask with pinhole
@@ -262,7 +283,9 @@ static std::vector<uint8_t> BlurredChromaSpread(const uint8_t* rgba, int width, 
 // object, so its region leaks across the whole figure and dies open or over
 // the area cap; bright steel pockets fail (c). The whole pass is skipped on
 // dark grounds (median < 128): "shadowed backdrop" is unreadable there and
-// the window would select object shadow instead.
+// the window would select object shadow instead. The CALLER additionally
+// skips it on non-neutral grounds, where punchCap sits at 255 and the chroma
+// guard — the only thing keeping tinted recesses safe — would be inert.
 static void PunchEnclosedHoles(const std::vector<uint8_t>& lum, const std::vector<uint8_t>& sblur,
                                int width, int height, int median, int seedDelta, int punchCap,
                                std::vector<uint8_t>& bg)
@@ -281,15 +304,17 @@ static void PunchEnclosedHoles(const std::vector<uint8_t>& lum, const std::vecto
     const int64_t minArea = std::max<int64_t>(9, fgArea / 1000);
     const int64_t maxArea = fgArea * 2 / 5;
 
-    // Pass 1: gradient+chroma-limited regions grown from shadowed-backdrop
-    // seeds — the outer flood's growth rules, run from the inside. Per-region
-    // luminance histograms feed the median test in the verdict loop.
+    // Pass 1: gradient+chroma-limited regions grown from backdrop-toned
+    // seeds — the outer flood's growth rules, run from the inside. Candidates
+    // must stay a few flags each: the seed window accepts most mid-to-bright
+    // figure pixels, so a grainy grayscale figure can fragment into a
+    // candidate per pixel (a 4 MP reference measured 2 GB with a 1 KB
+    // histogram embedded per candidate).
     struct Candidate {
         int64_t area = 0;
         bool open = false;     // touches the image border or the outer background
         bool anchored = false; // a contained figure island leans on it (pass 3)
         bool punch = false;    // final verdict
-        std::array<uint32_t, 256> hist{};
     };
     std::vector<int32_t> region((size_t)n, -1); // -1 = not a hole candidate
     std::vector<Candidate> cands;
@@ -306,7 +331,6 @@ static void PunchEnclosedHoles(const std::vector<uint8_t>& lum, const std::vecto
             const int p = stack.back();
             stack.pop_back();
             ++cands[id].area;
-            ++cands[id].hist[lum[p]];
             const int x = p % width, y = p / width;
             if (x == 0 || y == 0 || x == width - 1 || y == height - 1)
                 cands[id].open = true;
@@ -381,19 +405,35 @@ static void PunchEnclosedHoles(const std::vector<uint8_t>& lum, const std::vecto
             c.area >= std::max<int64_t>(9, cands[c.cand].area / 20))
             cands[c.cand].anchored = true;
 
-    for (Candidate& c : cands) {
-        if (c.open || c.anchored || c.area < minArea || c.area > maxArea)
+    // Verdict: cheap gates first; region medians only for the few candidates
+    // that survive them, with the 256-bin histograms accumulated in one extra
+    // sweep over just those regions.
+    std::vector<int32_t> shortIdx(cands.size(), -1);
+    int32_t shortCount = 0;
+    for (size_t c = 0; c < cands.size(); ++c)
+        if (!cands[c].open && !cands[c].anchored && cands[c].area >= minArea &&
+            cands[c].area <= maxArea)
+            shortIdx[c] = shortCount++;
+    if (shortCount == 0)
+        return;
+    std::vector<std::array<uint32_t, 256>> hists((size_t)shortCount); // zeroed
+    for (int i = 0; i < n; ++i)
+        if (region[i] >= 0 && shortIdx[region[i]] >= 0)
+            ++hists[shortIdx[region[i]]][lum[i]];
+    for (size_t c = 0; c < cands.size(); ++c) {
+        if (shortIdx[c] < 0)
             continue;
+        const std::array<uint32_t, 256>& h = hists[shortIdx[c]];
         int64_t seen = 0;
         int regionMedian = 0;
         for (int v = 0; v < 256; ++v) {
-            seen += c.hist[v];
-            if (seen * 2 >= c.area) {
+            seen += h[v];
+            if (seen * 2 >= cands[c].area) {
                 regionMedian = v;
                 break;
             }
         }
-        c.punch = regionMedian >= shadowLo && regionMedian <= shadowHi; // test (c)
+        cands[c].punch = regionMedian >= shadowLo && regionMedian <= shadowHi; // test (c)
     }
     for (int i = 0; i < n; ++i)
         if (region[i] >= 0 && cands[region[i]].punch)
@@ -503,8 +543,12 @@ static bool BinarizeByBorderFlood(const std::vector<uint8_t>& lum, const std::ve
 
     // After the degeneracy verdict, not before: recovery only ever shrinks the
     // figure, and a mask that needed the Otsu fallback should not be rescued
-    // into a different segmentation by hole-punching.
-    PunchEnclosedHoles(lum, sblur, width, height, median, seedDelta, punchCap, bg);
+    // into a different segmentation by hole-punching. Neutral grounds only:
+    // with punchCap at 255 the punch would run on luminance alone and eat
+    // tinted recesses — colored grounds keep pre-#134 behavior exactly, and
+    // holes there remain the documented alpha-matte case.
+    if (neutralGround)
+        PunchEnclosedHoles(lum, sblur, width, height, median, seedDelta, punchCap, bg);
 
     out = MakeMask(width, height);
     for (int i = 0; i < n; ++i)

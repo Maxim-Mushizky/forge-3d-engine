@@ -49,15 +49,18 @@ void RasterizeSilhouette(const std::vector<Vertex>& vertices,
 // 128 is foreground. Opaque images segment by background flood from the
 // border (tolerance from the border's median/MAD): enclosed regions the same
 // color as the ground — white porcelain on a white product-shot ground — stay
-// with the object, where a global threshold would split them wrong. The flood
-// is chroma-gated (#134): it never enters pixels tinted beyond the border's
-// own spread, so bright warm material (edge-lit steel ramping seamlessly into
-// a white sweep) doesn't get eaten; on colored grounds the gate goes wide and
-// today's behavior holds. Enclosed through-holes (backdrop seen through an
-// axe head's cutouts, unreachable by the flood) are then recovered on bright
-// grounds: fully enclosed, backdrop-neutral regions whose median luminance
-// reads as SHADOWED GROUND (between half and four fifths of the border's)
-// punch back to background unless doing so would orphan real figure. Falls
+// with the object, where a global threshold would split them wrong. On a
+// NEUTRAL ground (border chroma spread near zero) the flood is additionally
+// chroma-gated (#134): it never enters pixels tinted beyond the border's own
+// spread, so bright warm material (edge-lit steel ramping seamlessly into a
+// white sweep) doesn't get eaten. Enclosed through-holes (backdrop seen
+// through an axe head's cutouts, unreachable by the flood) are then recovered
+// on bright neutral grounds: fully enclosed, backdrop-neutral regions whose
+// median luminance reads as SHADOWED GROUND (between half and four fifths of
+// the border's) punch back to background unless doing so would orphan real
+// figure. Colored grounds keep the pre-#134 flood exactly, with no recovery —
+// the chroma guard that keeps tinted recesses safe has nothing to say there,
+// so holes on colored grounds remain the alpha-matte case. Falls
 // back to Otsu + border-majority polarity when the border is cluttered or the
 // flood degenerates. Tiny connected components (compression specks, soft
 // shadows) that would poison the crop box are dropped — under 1/20 of the

@@ -328,6 +328,36 @@ static void BinarizeTintedRecessKept()
     CHECK(m.pixels[15 * w + 15] != 0);
 }
 
+// On a COLORED ground the chroma guard has nothing to say, so hole recovery
+// must not run at all — with the caps wide open it would punch this tinted
+// recess on luminance alone (its lum 120 sits mid shadow-window of the warm
+// ground's 226). Colored grounds keep pre-#134 behavior exactly.
+static void BinarizeColoredGroundNoRecovery()
+{
+    const int w = 32, h = 32;
+    std::vector<uint8_t> img((size_t)w * h * 4);
+    auto fill = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        uint8_t* p = &img[((size_t)y * w + x) * 4];
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = 255;
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            fill(x, y, 240, 225, 200); // warm studio paper, spread 40
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            fill(x, y, 60, 60, 60);
+    for (int y = 12; y < 20; ++y)
+        for (int x = 12; x < 20; ++x)
+            fill(x, y, 160, 110, 70); // enclosed tinted recess, sharp-rimmed
+
+    const SilhouetteMask m = BinarizeImage(img.data(), w, h);
+    CHECK(MaskArea(m) == 16 * 16); // solid object, recess kept
+    CHECK(m.pixels[15 * w + 15] != 0);
+}
+
 // The chroma gate on the flood itself (#134's blade-leak case): a warm-tinted
 // bright object whose rim ramps into a white ground at under kEdgeStep per
 // pixel. The gradient gate alone would roll straight through; the border's
@@ -350,6 +380,13 @@ static void BinarizeTintedObjectOnWhiteKept()
         for (int x = 10; x < 22; ++x)
             fill(x, y, 252, 244, 236); // lum 245: one gradient step from the
                                        // ground, but visibly warm (spread 16)
+    for (int y = 13; y < 19; ++y)
+        for (int x = 13; x < 19; ++x)
+            fill(x, y, 60, 60, 60); // dark core: with the gate broken the
+                                    // flood eats the warm rim and SUCCEEDS
+                                    // with just this core (36 px), instead of
+                                    // degenerating into an Otsu rescue that
+                                    // would pass the assertions anyway
 
     const SilhouetteMask m = BinarizeImage(img.data(), w, h);
     // The object survives, plus a thin blur-halo of ground pixels whose 9x9
@@ -359,6 +396,7 @@ static void BinarizeTintedObjectOnWhiteKept()
     CHECK(area >= 12 * 12);
     CHECK(area <= 20 * 20);
     CHECK(m.pixels[16 * w + 16] != 0); // object center is figure
+    CHECK(m.pixels[11 * w + 11] != 0); // warm rim is figure
     CHECK(m.pixels[4 * w + 4] == 0);   // ground is ground
 }
 
@@ -547,6 +585,7 @@ void RunSilhouetteTests()
     BinarizeDonutHoleRecovered();
     BinarizeDarkRecessKept();
     BinarizeTintedRecessKept();
+    BinarizeColoredGroundNoRecovery();
     BinarizeTintedObjectOnWhiteKept();
     BinarizeHighlightNotPunched();
     BinarizePocketAnchoringIslandKept();
