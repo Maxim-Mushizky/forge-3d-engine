@@ -982,6 +982,305 @@ static void TraceIslandParentChain()
     CHECK(RasterizePolygons(cs, 30, 30).pixels == m.pixels);
 }
 
+// --- structured diff (#136) -----------------------------------------------------
+
+// ORs a rect into an existing mask (SolidRect makes a fresh one).
+static void FillRect(SilhouetteMask& m, int x0, int y0, int w, int h)
+{
+    for (int y = y0; y < y0 + h; ++y)
+        for (int x = x0; x < x0 + w; ++x)
+            m.pixels[(size_t)y * m.width + x] = 255;
+}
+
+// Two known B-only blobs: exact areas, fractions, centroids, bboxes, ordering;
+// swapping the operands flips the class and nothing else.
+static void DiffRegionsKnownBlobs()
+{
+    const SilhouetteMask a = SolidRect(32, 32, 2, 2, 10, 10);
+    SilhouetteMask b = SolidRect(32, 32, 2, 2, 10, 10);
+    FillRect(b, 20, 10, 6, 4); // 24 px
+    FillRect(b, 24, 24, 3, 3); // 9 px; union(A,B) = 100 + 24 + 9 = 133
+
+    const DiffRegionList list = DiffRegions(a, b);
+    CHECK(list.totalRegions == 2);
+    CHECK(list.droppedRegions == 0);
+    CHECK(list.droppedArea == 0);
+    CHECK(list.regions.size() == 2);
+    if (list.regions.size() == 2) {
+        const DiffRegion& r0 = list.regions[0]; // larger first
+        CHECK(!r0.excess); // B-only = missing
+        CHECK(r0.area == 24);
+        CHECK(r0.areaFraction == 24.0f / 133.0f);
+        CHECK(r0.centroid.x == 23.0f && r0.centroid.y == 12.0f);
+        CHECK(r0.minX == 20 && r0.minY == 10 && r0.maxX == 25 && r0.maxY == 13);
+        const DiffRegion& r1 = list.regions[1];
+        CHECK(!r1.excess);
+        CHECK(r1.area == 9);
+        CHECK(r1.areaFraction == 9.0f / 133.0f);
+        CHECK(r1.centroid.x == 25.5f && r1.centroid.y == 25.5f);
+        CHECK(r1.minX == 24 && r1.minY == 24 && r1.maxX == 26 && r1.maxY == 26);
+    }
+
+    // Swapped operands: identical geometry, typed excess (A-only) now.
+    const DiffRegionList sw = DiffRegions(b, a);
+    CHECK(sw.totalRegions == 2);
+    CHECK(sw.regions.size() == 2);
+    if (sw.regions.size() == 2) {
+        CHECK(sw.regions[0].excess && sw.regions[1].excess);
+        CHECK(sw.regions[0].area == 24 && sw.regions[1].area == 9);
+        CHECK(sw.regions[0].centroid.x == 23.0f && sw.regions[0].centroid.y == 12.0f);
+        CHECK(sw.regions[1].centroid.x == 25.5f && sw.regions[1].centroid.y == 25.5f);
+        CHECK(sw.regions[0].minX == 20 && sw.regions[0].minY == 10 &&
+              sw.regions[0].maxX == 25 && sw.regions[0].maxY == 13);
+        CHECK(sw.regions[1].minX == 24 && sw.regions[1].minY == 24 &&
+              sw.regions[1].maxX == 26 && sw.regions[1].maxY == 26);
+    }
+}
+
+// An A-only strip ADJACENT to a B-only blob: one region per class (touching
+// pixels of different classes never join), and kept + dropped areas equal
+// CompareMasks' onlyA + onlyB — the accounting invariant.
+static void DiffRegionsMixedClasses()
+{
+    SilhouetteMask a = SolidRect(32, 32, 2, 2, 10, 10);
+    SilhouetteMask b = SolidRect(32, 32, 2, 2, 10, 10);
+    FillRect(a, 2, 20, 8, 2);  // A-only strip, 16 px, x in [2,10)
+    FillRect(b, 10, 20, 5, 5); // B-only blob, 25 px, shares the x=9|10 border
+
+    const SilhouetteDiff d = CompareMasks(a, b);
+    CHECK(d.onlyA == 16 && d.onlyB == 25);
+
+    const DiffRegionList list = DiffRegions(a, b);
+    CHECK(list.totalRegions == 2);
+    CHECK(list.regions.size() == 2);
+    int excess = 0, missing = 0, keptArea = 0;
+    for (const DiffRegion& r : list.regions) {
+        ++(r.excess ? excess : missing);
+        keptArea += r.area;
+    }
+    CHECK(excess == 1 && missing == 1);
+    CHECK(keptArea + list.droppedArea == d.onlyA + d.onlyB);
+}
+
+// Two 2x2 blobs touching only at a corner are TWO regions under 4-connectivity.
+static void DiffRegionsFourConnectivity()
+{
+    const SilhouetteMask a = MakeMask(16, 16);
+    SilhouetteMask b = MakeMask(16, 16);
+    FillRect(b, 4, 4, 2, 2);
+    FillRect(b, 6, 6, 2, 2); // diagonal neighbor of the first at (5,5)/(6,6)
+
+    const DiffRegionList list = DiffRegions(a, b);
+    CHECK(list.totalRegions == 2); // NOT one 8-connected blob
+    CHECK(list.regions.size() == 2);
+    if (list.regions.size() == 2) {
+        // Equal areas: minY breaks the tie, top-left blob first.
+        CHECK(list.regions[0].area == 4 && list.regions[1].area == 4);
+        CHECK(list.regions[0].minX == 4 && list.regions[0].minY == 4 &&
+              list.regions[0].maxX == 5 && list.regions[0].maxY == 5);
+        CHECK(list.regions[1].minX == 6 && list.regions[1].minY == 6 &&
+              list.regions[1].maxX == 7 && list.regions[1].maxY == 7);
+    }
+}
+
+// A 1-px mismatch on a big-union pair sits under the 0.2% default floor: it is
+// dropped but stays on the books in the counters.
+static void DiffRegionsSpeckSuppression()
+{
+    const SilhouetteMask a = SolidRect(64, 64, 2, 2, 30, 30); // 900 px shared
+    SilhouetteMask b = SolidRect(64, 64, 2, 2, 30, 30);
+    FillRect(b, 40, 40, 10, 10);           // 100 px real region
+    b.pixels[(size_t)2 * 64 + 60] = 255;   // 1 px speck: 1/1001 < 0.002
+
+    const DiffRegionList list = DiffRegions(a, b);
+    CHECK(list.totalRegions == 2);
+    CHECK(list.regions.size() == 1);
+    if (!list.regions.empty()) {
+        CHECK(list.regions[0].area == 100);
+        CHECK(!list.regions[0].excess);
+    }
+    CHECK(list.droppedRegions == 1);
+    CHECK(list.droppedArea == 1);
+}
+
+// The cap keeps the maxRegions largest (still sorted) and summarizes the rest.
+static void DiffRegionsCapAndSummarize()
+{
+    const SilhouetteMask a = MakeMask(64, 64);
+    SilhouetteMask b = MakeMask(64, 64);
+    // Six disjoint blobs, strictly descending areas: 49 36 25 16 9 4.
+    FillRect(b, 1, 1, 7, 7);
+    FillRect(b, 10, 1, 6, 6);
+    FillRect(b, 20, 1, 5, 5);
+    FillRect(b, 30, 1, 4, 4);
+    FillRect(b, 40, 1, 3, 3);
+    FillRect(b, 50, 1, 2, 2);
+
+    const DiffRegionList list = DiffRegions(a, b, 4, 0.0f);
+    CHECK(list.totalRegions == 6);
+    CHECK(list.regions.size() == 4);
+    if (list.regions.size() == 4) {
+        CHECK(list.regions[0].area == 49);
+        CHECK(list.regions[1].area == 36);
+        CHECK(list.regions[2].area == 25);
+        CHECK(list.regions[3].area == 16);
+    }
+    CHECK(list.droppedRegions == 2);
+    CHECK(list.droppedArea == 9 + 4);
+}
+
+// Mismatched or degenerate sizes: empty result, mirroring CompareMasks.
+static void DiffRegionsSizeMismatchEmpty()
+{
+    const DiffRegionList list = DiffRegions(MakeMask(16, 16), MakeMask(32, 32));
+    CHECK(list.regions.empty());
+    CHECK(list.totalRegions == 0);
+    CHECK(list.droppedRegions == 0 && list.droppedArea == 0);
+    CHECK(DiffRegions(MakeMask(0, 0), MakeMask(0, 0)).totalRegions == 0);
+}
+
+// Bilateral symmetry scoring about the covered bbox's center line.
+static void MirrorSymmetryScores()
+{
+    // Cross pentomino centered at (8,8): pixel-perfect about its bbox center.
+    SilhouetteMask m = MakeMask(16, 16);
+    auto set = [](SilhouetteMask& mask, int x, int y) {
+        mask.pixels[(size_t)y * mask.width + x] = 255;
+    };
+    set(m, 8, 7);
+    set(m, 7, 8);
+    set(m, 8, 8);
+    set(m, 9, 8);
+    set(m, 8, 9);
+    CHECK(MaskMirrorSymmetryX(m) == 1.0f);
+
+    // One extra off-axis pixel (bbox unchanged): |M|=6, mirror hits 5 of them
+    // -> IoU = 5 / (2*6 - 5) = 5/7 by hand.
+    set(m, 9, 9);
+    CHECK(MaskMirrorSymmetryX(m) == 5.0f / 7.0f);
+
+    // No shape is not a symmetric shape.
+    CHECK(MaskMirrorSymmetryX(MakeMask(8, 8)) == 0.0f);
+
+    // Off-center placement still scores 1.0: the mirror axis is the bbox
+    // center, not the frame center.
+    SilhouetteMask off = MakeMask(32, 32);
+    set(off, 21, 3);
+    set(off, 20, 4);
+    set(off, 21, 4);
+    set(off, 22, 4);
+    set(off, 21, 5);
+    CHECK(MaskMirrorSymmetryX(off) == 1.0f);
+}
+
+// NormalizeMask's transform-out overload reports the exact crop/scale/pad, and
+// NormalizedToSourcePx inverts it back to source pixels.
+static void NormalizeTransformRoundTrip()
+{
+    const SilhouetteMask src = SolidRect(64, 64, 40, 10, 8, 6); // off-center 8x6
+    NormalizeTransform xform;
+    const SilhouetteMask norm = NormalizeMask(src, 32, xform);
+    CHECK(xform.valid);
+    CHECK(xform.srcMinX == 40 && xform.srcMinY == 10);
+    CHECK(xform.srcW == 8 && xform.srcH == 6);
+    CHECK(xform.scaledW == 32 && xform.scaledH == 24); // 6 * 32/8, x fills
+    CHECK(xform.padX == 0 && xform.padY == 4);         // (32 - 24) / 2
+
+    // Normalized content center -> source rect center (44, 13).
+    const vec2 srcC = NormalizedToSourcePx(
+        xform, vec2((float)xform.padX + 0.5f * (float)xform.scaledW,
+                    (float)xform.padY + 0.5f * (float)xform.scaledH));
+    CHECK(std::fabs(srcC.x - 44.0f) <= 0.75f);
+    CHECK(std::fabs(srcC.y - 13.0f) <= 0.75f);
+
+    // The two-arg overload delegates: byte-identical output.
+    CHECK(NormalizeMask(src, 32).pixels == norm.pixels);
+
+    // No coverage -> invalid transform (stale caller state overwritten) and
+    // NormalizedToSourcePx passes coordinates through unchanged.
+    NormalizeTransform none;
+    none.valid = true;
+    (void)NormalizeMask(MakeMask(16, 16), 32, none);
+    CHECK(!none.valid);
+    const vec2 same = NormalizedToSourcePx(none, vec2(5.0f, 7.0f));
+    CHECK(same.x == 5.0f && same.y == 7.0f);
+}
+
+// Viewport inversion on the front view: mask center at the bounds-center depth
+// comes back as the bounds center, the frame's left edge as center minus the
+// ortho half-extent — both derived from SilhouetteViewProj's own constants.
+static void MaskPxToWorldFrontView()
+{
+    AABB box;
+    box.Expand({-1.0f, -2.0f, -0.5f});
+    box.Expand({3.0f, 2.0f, 0.5f});
+    const std::optional<mat4> vp = SilhouetteViewProj("front", box);
+    CHECK(vp.has_value());
+    if (!vp)
+        return;
+    const vec3 c = (box.min + box.max) * 0.5f; // (1, 0, 0)
+    const vec4 clip = *vp * vec4(c, 1.0f);
+    const float ndcZ = clip.z / clip.w;
+
+    const vec3 center = MaskPxToWorld(*vp, 256, 256, vec2(128.0f, 128.0f), ndcZ);
+    CHECK(ApproxEq(center.x, c.x, 1e-3f));
+    CHECK(ApproxEq(center.y, c.y, 1e-3f));
+
+    // Same margin constant as SilhouetteViewProj: half = larger in-plane
+    // half-extent * 1.02 (= 2.04 here) — no magic floats.
+    const vec3 he = glm::max((box.max - box.min) * 0.5f, vec3(1e-4f));
+    const float half = std::max(he.x, he.y) * 1.02f;
+    const vec3 leftEdge = MaskPxToWorld(*vp, 256, 256, vec2(0.0f, 128.0f), ndcZ);
+    CHECK(ApproxEq(leftEdge.x, c.x - half, 1e-3f));
+    CHECK(ApproxEq(leftEdge.y, c.y, 1e-3f));
+
+    // Off the centerline, where the y flip has a sign: row 0 is the TOP of the
+    // image, so it must map to +y world (an inverted ndcY = 2*py/h - 1 also
+    // passes every centerline probe above — this assertion is the one that
+    // pins the convention).
+    const vec3 topEdge = MaskPxToWorld(*vp, 256, 256, vec2(128.0f, 0.0f), ndcZ);
+    CHECK(ApproxEq(topEdge.y, c.y + half, 1e-3f));
+    const vec3 quarter = MaskPxToWorld(*vp, 256, 256, vec2(128.0f, 64.0f), ndcZ);
+    CHECK(ApproxEq(quarter.y, c.y + half * 0.5f, 1e-3f));
+}
+
+// The composed chain the compare handler actually runs — normalized px ->
+// NormalizedToSourcePx -> MaskPxToWorld — against hand-computed world values,
+// off-center on both axes so a y-flip or pad/crop mix-up cannot cancel out.
+static void NormalizedToWorldChain()
+{
+    // Source frame 64x64, content rect x [8..39], y [16..31] (bw 32, bh 16).
+    SilhouetteMask src = MakeMask(64, 64);
+    for (int y = 16; y <= 31; ++y)
+        for (int x = 8; x <= 39; ++x)
+            src.pixels[(size_t)y * 64 + x] = 255;
+    NormalizeTransform xform;
+    (void)NormalizeMask(src, 32, xform);
+    CHECK(xform.valid);
+    CHECK(xform.padX == 0 && xform.padY == 8); // ow 32, oh 16, centered
+
+    AABB box;
+    box.Expand({-2.0f, -2.0f, -1.0f});
+    box.Expand({2.0f, 2.0f, 1.0f});
+    const std::optional<mat4> vp = SilhouetteViewProj("front", box);
+    CHECK(vp.has_value());
+    if (!vp)
+        return;
+    const vec4 clip = *vp * vec4(0.0f, 0.0f, 0.0f, 1.0f); // bounds center
+    const float ndcZ = clip.z / clip.w;
+
+    // Normalized content top-left corner (0, 8) -> source px (8, 16) -> world:
+    // the 64px frame spans +-half about the origin, so
+    // x = -half + 8/64 * 2*half, y = +half - 16/64 * 2*half.
+    const float half = 2.0f * 1.02f; // SilhouetteViewProj's own margin
+    const vec2 srcPx = NormalizedToSourcePx(xform, vec2(0.0f, 8.0f));
+    CHECK(ApproxEq(srcPx.x, 8.0f, 1e-4f));
+    CHECK(ApproxEq(srcPx.y, 16.0f, 1e-4f));
+    const vec3 world = MaskPxToWorld(*vp, 64, 64, srcPx, ndcZ);
+    CHECK(ApproxEq(world.x, -half + (8.0f / 64.0f) * 2.0f * half, 1e-3f)); // -1.53
+    CHECK(ApproxEq(world.y, half - (16.0f / 64.0f) * 2.0f * half, 1e-3f)); // +1.02
+}
+
 void RunSilhouetteTests()
 {
     RasterTriangleCoverage();
@@ -1018,6 +1317,16 @@ void RunSilhouetteTests()
     TracePinholeFloor();
     SimplifyTinyHoleStaysPolygon();
     TraceIslandParentChain();
+    DiffRegionsKnownBlobs();
+    DiffRegionsMixedClasses();
+    DiffRegionsFourConnectivity();
+    DiffRegionsSpeckSuppression();
+    DiffRegionsCapAndSummarize();
+    DiffRegionsSizeMismatchEmpty();
+    MirrorSymmetryScores();
+    NormalizeTransformRoundTrip();
+    MaskPxToWorldFrontView();
+    NormalizedToWorldChain();
     std::printf("[ok] silhouette kernel tests done\n");
 }
 

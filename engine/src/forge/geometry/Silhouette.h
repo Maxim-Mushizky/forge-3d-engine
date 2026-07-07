@@ -101,6 +101,74 @@ SilhouetteDiff CompareMasks(const SilhouetteMask& a, const SilhouetteMask& b);
 // size mismatch.
 std::vector<uint8_t> DiffImageRGBA(const SilhouetteMask& a, const SilhouetteMask& b);
 
+// --- structured diff (#136): mismatch regions as data ------------------------
+
+// One 4-connected component of mismatch between two same-size masks: pixels
+// covered in exactly one of them. 'excess' = covered in A (the render) only —
+// the model overshoots there (shrink/trim); !excess = covered in B (the
+// reference) only, 'missing' — the reference has material there (grow/move
+// something toward the centroid).
+struct DiffRegion {
+    bool excess = false;        // true = A-only ("excess"), false = B-only ("missing")
+    int area = 0;               // covered pixel count
+    float areaFraction = 0.0f;  // area / union(A, B) — same denominator as IoU
+    vec2 centroid{0.0f};        // mean of covered pixel CENTERS (x+0.5, y+0.5)
+    int minX = 0, minY = 0, maxX = 0, maxY = 0; // inclusive pixel bbox
+};
+
+// DiffRegions result: kept regions sorted by area desc (ties: minY, then minX,
+// ascending — deterministic for tests), plus an explicit account of what was
+// dropped so a capped list never silently reads as "covered everything".
+struct DiffRegionList {
+    std::vector<DiffRegion> regions;
+    int totalRegions = 0;   // all components found, before speck-drop and cap
+    int droppedRegions = 0; // speck-dropped + beyond-cap
+    int droppedArea = 0;    // their covered pixel sum
+};
+
+// 4-connected components over the mismatch classes of two same-size masks
+// (renderOnly and referenceOnly pixels never join across classes). Regions with
+// areaFraction < minAreaFraction are dropped as specks, then the list is capped
+// to the maxRegions largest; both drops are summarized in the counters.
+// Mismatched or empty sizes -> empty list (mirrors CompareMasks).
+DiffRegionList DiffRegions(const SilhouetteMask& a, const SilhouetteMask& b,
+                           int maxRegions = 16, float minAreaFraction = 0.002f);
+
+// IoU of a mask with its own left-right mirror about its covered bbox's
+// vertical center line (x -> minX+maxX-x, an exact pixel involution): 1.0 =
+// pixel-perfect bilateral symmetry, lower = deviation. 0 when empty. On a
+// NormalizeMask'd silhouette the bbox center IS the content center, so this
+// scores the shape irrespective of framing.
+float MaskMirrorSymmetryX(const SilhouetteMask& mask);
+
+// How NormalizeMask framed its output: source-mask crop bbox -> scaled content
+// extent + centering pad inside the outSize frame. Enough to map normalized
+// pixels back to source pixels (see NormalizedToSourcePx).
+struct NormalizeTransform {
+    int srcMinX = 0, srcMinY = 0; // crop origin in the source mask, px
+    int srcW = 0, srcH = 0;       // crop extent (covered bbox), px
+    int scaledW = 0, scaledH = 0; // content extent inside the normalized frame
+    int padX = 0, padY = 0;       // content offset inside the normalized frame
+    bool valid = false;           // false when the source had no coverage
+};
+SilhouetteMask NormalizeMask(const SilhouetteMask& in, int outSize,
+                             NormalizeTransform& xform);
+
+// Continuous normalized-frame pixel coords -> continuous source-mask pixel
+// coords (the inverse of NormalizeMask's crop+scale+pad, ignoring its nearest
+// sampling — exact enough for region centroids/bboxes). Invalid xform -> input
+// unchanged. Coordinates may fall outside the source frame when a region lies
+// outside the render's crop box (a reference-only region can) — that linear
+// extrapolation is the correct answer there.
+vec2 NormalizedToSourcePx(const NormalizeTransform& xform, vec2 normPx);
+
+// Invert the silhouette viewport: continuous source-mask pixel -> the world
+// point that rasterizes there, on the ndcZ plane (pass the projected NDC z of
+// a reference point — the compare uses its target's bounds center, making the
+// in-plane world axes exact for the orthographic views and the depth axis a
+// documented convention, not information).
+vec3 MaskPxToWorld(const mat4& viewProj, int width, int height, vec2 px, float ndcZ);
+
 // --- outline extraction (#135): mask -> simplified polygon + landmarks --------
 // The ingest half of the shape loop (compare_silhouette is the iterate half):
 // turn a reference mask into vector geometry the modeling tools can consume —

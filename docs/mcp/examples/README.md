@@ -11,6 +11,7 @@ atomically on error.
 | `layout-and-export.lua` | `group`, `ungroup`, `drop_to_ground`, `select`, `toggle_select`, `get_selection`, `clear_selection`, `box_select`, `snap_settings`, `export_stl` |
 | `sculpt-pear.lua` | `sculpt` (grab/inflate/smooth, `strokes`, negative-strength dent), `move_verts` (falloff), `subdivide`, `mesh_stats` |
 | `lathe-tableware.lua` | `spawn` with `primitive='lathe'` (walled cup profile, vase, turned table legs) and `primitive='sweep'` (cup handle along an arc), `mesh_stats` watertight checks |
+| `closed-loop-fix.lua` | `compare_silhouette` structured diff (#136): a mis-built axe head repaired by looping regions[] → nearest-part parameter fix — monotone IoU, no image reads (fixture: `axe-head-ref.png`) |
 
 Element-id cheatsheet (edit-mode ops):
 
