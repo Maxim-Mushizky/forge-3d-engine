@@ -646,7 +646,8 @@ void EditorApp::RegisterMcpTools()
               "the inside; sweep {profile:[[x,y],...] closed cross-section, path:[[x,y,z],"
               "...]} extruded along the path without twist — the section reads as drawn "
               "looking back along the start tangent, world +Y up: a +z path maps section "
-              "(x,y) to world (x,y), a vertical path to world (x,-z) (#138); "
+              "(x,y) to world (x,y); vertical paths map to world (x,-z) going up, "
+              "(x,z) going down (#138); "
               "text {text,depth,fontPath}"}}}}},
          {"required", {"action"}}},
         [this](const json& args) { return ToolManageEntity(args); });

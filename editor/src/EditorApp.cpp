@@ -1704,6 +1704,11 @@ void EditorApp::BooleanSelected(BooleanOp op)
 
     m_Commands.Push(std::move(composite));
     SelectOnly(resultId);
+    // With the id reused, a gizmo drag spanning this boolean would pair its
+    // pre-boolean m_BeforeEdit snapshot with a post-boolean after-state and
+    // undo the cut out of order; forcing a re-snapshot next frame keeps the
+    // eventual command result-before/result-after (#139 review).
+    m_GizmoWasUsing = false;
 }
 
 void EditorApp::StartTurntableDialog()
