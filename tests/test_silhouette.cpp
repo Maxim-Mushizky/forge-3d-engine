@@ -1233,6 +1233,52 @@ static void MaskPxToWorldFrontView()
     const vec3 leftEdge = MaskPxToWorld(*vp, 256, 256, vec2(0.0f, 128.0f), ndcZ);
     CHECK(ApproxEq(leftEdge.x, c.x - half, 1e-3f));
     CHECK(ApproxEq(leftEdge.y, c.y, 1e-3f));
+
+    // Off the centerline, where the y flip has a sign: row 0 is the TOP of the
+    // image, so it must map to +y world (an inverted ndcY = 2*py/h - 1 also
+    // passes every centerline probe above — this assertion is the one that
+    // pins the convention).
+    const vec3 topEdge = MaskPxToWorld(*vp, 256, 256, vec2(128.0f, 0.0f), ndcZ);
+    CHECK(ApproxEq(topEdge.y, c.y + half, 1e-3f));
+    const vec3 quarter = MaskPxToWorld(*vp, 256, 256, vec2(128.0f, 64.0f), ndcZ);
+    CHECK(ApproxEq(quarter.y, c.y + half * 0.5f, 1e-3f));
+}
+
+// The composed chain the compare handler actually runs — normalized px ->
+// NormalizedToSourcePx -> MaskPxToWorld — against hand-computed world values,
+// off-center on both axes so a y-flip or pad/crop mix-up cannot cancel out.
+static void NormalizedToWorldChain()
+{
+    // Source frame 64x64, content rect x [8..39], y [16..31] (bw 32, bh 16).
+    SilhouetteMask src = MakeMask(64, 64);
+    for (int y = 16; y <= 31; ++y)
+        for (int x = 8; x <= 39; ++x)
+            src.pixels[(size_t)y * 64 + x] = 255;
+    NormalizeTransform xform;
+    (void)NormalizeMask(src, 32, xform);
+    CHECK(xform.valid);
+    CHECK(xform.padX == 0 && xform.padY == 8); // ow 32, oh 16, centered
+
+    AABB box;
+    box.Expand({-2.0f, -2.0f, -1.0f});
+    box.Expand({2.0f, 2.0f, 1.0f});
+    const std::optional<mat4> vp = SilhouetteViewProj("front", box);
+    CHECK(vp.has_value());
+    if (!vp)
+        return;
+    const vec4 clip = *vp * vec4(0.0f, 0.0f, 0.0f, 1.0f); // bounds center
+    const float ndcZ = clip.z / clip.w;
+
+    // Normalized content top-left corner (0, 8) -> source px (8, 16) -> world:
+    // the 64px frame spans +-half about the origin, so
+    // x = -half + 8/64 * 2*half, y = +half - 16/64 * 2*half.
+    const float half = 2.0f * 1.02f; // SilhouetteViewProj's own margin
+    const vec2 srcPx = NormalizedToSourcePx(xform, vec2(0.0f, 8.0f));
+    CHECK(ApproxEq(srcPx.x, 8.0f, 1e-4f));
+    CHECK(ApproxEq(srcPx.y, 16.0f, 1e-4f));
+    const vec3 world = MaskPxToWorld(*vp, 64, 64, srcPx, ndcZ);
+    CHECK(ApproxEq(world.x, -half + (8.0f / 64.0f) * 2.0f * half, 1e-3f)); // -1.53
+    CHECK(ApproxEq(world.y, half - (16.0f / 64.0f) * 2.0f * half, 1e-3f)); // +1.02
 }
 
 void RunSilhouetteTests()
@@ -1280,6 +1326,7 @@ void RunSilhouetteTests()
     MirrorSymmetryScores();
     NormalizeTransformRoundTrip();
     MaskPxToWorldFrontView();
+    NormalizedToWorldChain();
     std::printf("[ok] silhouette kernel tests done\n");
 }
 
