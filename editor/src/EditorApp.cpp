@@ -3,6 +3,7 @@
 #include "FileDialog.h"
 #include "Theme.h"
 
+#include <forge/anim/SkinApply.h>
 #include <forge/assets/AssetManager.h>
 #include <forge/assets/MeshFactory.h>
 #include <forge/assets/SceneSerializer.h>
@@ -295,6 +296,10 @@ uint64_t EditorApp::SceneHash() const
             uint64_t v = e.mesh->Version(); // sculpt edits change content, not the pointer
             mix(&v, sizeof(v));
         }
+        // Skeleton identity only (#146): pose changes are #147's problem, and
+        // skinned vertex deforms already ride Mesh::Version() above.
+        const Skeleton* skel = e.skeleton.get();
+        mix(&skel, sizeof(skel));
     }
     return h;
 }
@@ -1433,6 +1438,20 @@ bool EditorApp::ImportModel(const std::string& path)
         e.mesh = p.mesh;
         e.material = p.material;
         e.extraMaterials = p.extraMaterials; // slots 1+ for multi-material meshes (#80)
+        if (p.skeleton) {
+            // Skinned parts always get a private mesh clone (#146): AssetManager
+            // hands out the same cached shared_ptr on every import of this path,
+            // and skinning deforms vertices in place — posing the shared original
+            // would leak into every other entity spawned from this asset. The
+            // cached original never deforms, so its vertices are valid bind data
+            // for the clone's skin snapshot on re-imports too.
+            auto clone = std::make_shared<Mesh>(p.mesh->Vertices(), p.mesh->Indices(),
+                                                p.mesh->Submeshes());
+            clone->SetSkin(p.mesh->Skin()); // before any deform: snapshot = imported bind data
+            e.mesh = std::move(clone);
+            e.skeleton = p.skeleton;
+            ApplyBindPose(*e.mesh, *p.skeleton); // bind-pose render; bumps Mesh::Version for RT
+        }
         if (rootId) {
             e.parent = rootId; // local identity: mesh data already shares the model's space
         } else {

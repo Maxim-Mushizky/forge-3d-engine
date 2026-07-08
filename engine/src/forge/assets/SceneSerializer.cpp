@@ -172,6 +172,16 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
 bool SaveSceneFile(const std::string& path, const Scene& scene, const std::string& extrasJson,
                    const MeshToRecipe& toRecipe)
 {
+    // Skeletons aren't in the file format until #147: the deformed bind-pose
+    // vertices save fine, but the rig itself is lost on reload — say so once
+    // per save rather than losing it silently.
+    for (const Entity& e : scene.Entities()) {
+        if (e.skeleton) {
+            FORGE_WARN("Scene save: skeleton not persisted — re-import to re-rig (R2 #147)");
+            break;
+        }
+    }
+
     std::vector<uint8_t> bytes = EncodeScene(SnapshotScene(scene, extrasJson, toRecipe));
 
     std::ofstream out(path, std::ios::binary | std::ios::trunc);

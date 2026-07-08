@@ -29,6 +29,7 @@ add_executable(forge_tests
     test_polyhaven.cpp
     test_silhouette.cpp
     test_sss.cpp
+    test_skeleton.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/DropRouter.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/polyhaven/PolyHaven.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/Settings.cpp
@@ -37,6 +38,9 @@ add_executable(forge_tests
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpViews.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpElements.cpp
     ${CMAKE_SOURCE_DIR}/editor/src/mcp/McpSculpt.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/anim/Skeleton.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/anim/Skinning.cpp
+    ${CMAKE_SOURCE_DIR}/engine/src/forge/anim/SkinImport.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/EditMesh.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/MeshStats.cpp
     ${CMAKE_SOURCE_DIR}/engine/src/forge/geometry/UvUnwrap.cpp
