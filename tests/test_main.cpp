@@ -28,6 +28,7 @@ void RunPolyHavenTests();
 void RunSilhouetteTests();
 void RunSssTests();
 void RunSkeletonTests();
+void RunPoseTests();
 } // namespace forge::test
 
 int main()
@@ -59,6 +60,7 @@ int main()
     RunSilhouetteTests();
     RunSssTests();
     RunSkeletonTests();
+    RunPoseTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

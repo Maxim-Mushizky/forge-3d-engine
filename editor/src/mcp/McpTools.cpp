@@ -5,6 +5,10 @@
 #include "mcp/McpSculpt.h"
 #include "mcp/McpViews.h"
 
+#include <forge/anim/Pose.h>
+#include <forge/anim/PosePresets.h>
+#include <forge/anim/Skeleton.h>
+#include <forge/anim/SkinApply.h>
 #include <forge/assets/MeshFactory.h>
 #include <forge/assets/StlExporter.h>
 #include <forge/geometry/EditMesh.h>
@@ -77,6 +81,25 @@ static bool Vec3FromJson(const json& a, vec3& out)
 static bool GetVec3(const json& args, const char* key, vec3& out)
 {
     return args.contains(key) && Vec3FromJson(args[key], out);
+}
+
+// Reads [x,y,z,w] into out (glm order is w,x,y,z); true when present + well-formed.
+// Finiteness is already guaranteed by the front-door NaN/Inf guard, but the array
+// shape and a non-degenerate magnitude still need checking here.
+static bool GetQuat(const json& args, const char* key, glm::quat& out)
+{
+    if (!args.contains(key))
+        return false;
+    const json& a = args[key];
+    if (!a.is_array() || a.size() != 4 || !a[0].is_number() || !a[1].is_number() ||
+        !a[2].is_number() || !a[3].is_number())
+        return false;
+    glm::quat q((float)a[3].get<double>(), (float)a[0].get<double>(),
+                (float)a[1].get<double>(), (float)a[2].get<double>()); // (w, x, y, z)
+    if (glm::length(q) < 1e-6f)
+        return false;
+    out = glm::normalize(q);
+    return true;
 }
 
 // Applies optional orbit-pose args (focalPoint/distance/pitchDeg/yawDeg/
@@ -1007,7 +1030,13 @@ void EditorApp::RegisterMcpTools()
         "field flags folded regions whose normals oppose the brush), "
         "move_verts{id, point, radius, offset, "
         "falloff='smooth'|'linear'|'constant', mirror, snap, relax} "
-        "(falloff-weighted vertex translation, weld-seam safe), export_stl{}. "
+        "(falloff-weighted vertex translation, weld-seam safe), "
+        "set_pose{id, joint='LeftForeArm', euler=[x,y,z] deg | quat=[x,y,z,w]} bends one "
+        "joint (delta from bind, identity=rest; needs a skinned/imported model), or "
+        "set_pose{id, preset='rest'|'t-pose'|'a-pose'|'sit'} applies a canned pose to "
+        "matching joints; undo stores only the pose, and the path tracer re-skins after "
+        "the settle. "
+        "export_stl{}. "
         "Entity writes return the affected entity as a table (use .id); camera/"
         "selection/element/export calls return their own shapes. "
         "print() lines and the script's return value come back in the result. "
@@ -2917,6 +2946,72 @@ ToolResult EditorApp::ToolSculpt(const json& args)
     return JsonResult(out);
 }
 
+// #147: FK posing. forge.set_pose bends one named joint (euler degrees or quat) or
+// applies a canned preset, re-skinning from bind. One SetPoseCommand per call stores
+// only the before/after Pose — undo never snapshots the mesh.
+ToolResult EditorApp::ToolSetPose(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->skeleton)
+        return Err("Entity has no skeleton (import a skinned model first)");
+    if (!e->mesh || !e->mesh->HasSkin())
+        return Err("Entity mesh carries no skin data");
+    const Skeleton& sk = *e->skeleton;
+
+    // --- validate everything before touching the mesh (validate-then-mutate) ---
+    // Build the target Pose in a local, then commit on success.
+    Pose before = e->pose;
+    Pose next = e->pose;
+    if (next.deltas.size() != sk.JointCount())
+        next.deltas.assign(sk.JointCount(), glm::quat(1, 0, 0, 0)); // lazily materialize to identity
+
+    const std::string preset = args.value("preset", "");
+    if (!preset.empty()) {
+        std::optional<Pose> p = MakePresetPose(sk, preset); // nullopt = unknown preset name
+        if (!p)
+            return Err("Unknown preset \"" + preset + "\" (rest, t-pose, a-pose, sit)");
+        next = std::move(*p);
+    } else {
+        const std::string joint = args.value("joint", "");
+        if (joint.empty())
+            return Err("Provide \"joint\" (name) with euler/quat, or a \"preset\"");
+        const int j = JointIndex(sk, joint);
+        if (j < 0)
+            return Err("No joint named \"" + joint + "\" in this skeleton");
+        glm::quat delta;
+        glm::vec3 euler;
+        if (GetQuat(args, "quat", delta)) {
+            // ok
+        } else if (GetVec3(args, "euler", euler)) {
+            delta = glm::quat(glm::radians(euler)); // intrinsic XYZ; bends in the bone's local frame
+        } else {
+            return Err("Provide \"euler\" [x,y,z] degrees or \"quat\" [x,y,z,w]");
+        }
+        next.deltas[(size_t)j] = delta;
+    }
+
+    // --- mutate: COW the mesh if it is shared (sibling entity or undo snapshot), then
+    // re-skin from bind. CloneSkinnedMesh rebuilds from BindVertices so we never pose
+    // on top of posed geometry.
+    if (e->mesh.use_count() > 1) {
+        std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh);
+        if (priv)
+            e->mesh = std::move(priv);
+    }
+    e->pose = std::move(next);
+    ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, std::move(before), e->pose));
+
+    json out = EntityJson(m_Scene, *e);
+    out["joint"] = preset.empty() ? args.value("joint", "") : std::string();
+    out["preset"] = preset;
+    out["jointCount"] = (uint64_t)sk.JointCount();
+    return JsonResult(out);
+}
+
 ToolResult EditorApp::ToolExportStl(const json& args)
 {
     const std::string path = args.value("path", "");
@@ -3845,6 +3940,7 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("mesh_elements", call(&EditorApp::ToolMeshElements, nullptr));
         add("sculpt", call(&EditorApp::ToolSculpt, "sculpt"));
         add("move_verts", call(&EditorApp::ToolSculpt, "move_verts"));
+        add("set_pose", call(&EditorApp::ToolSetPose, nullptr));
         add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces"));
         add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges"));
         add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces"));

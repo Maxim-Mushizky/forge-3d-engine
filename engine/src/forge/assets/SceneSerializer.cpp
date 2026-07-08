@@ -1,10 +1,14 @@
 #include "SceneSerializer.h"
 
+#include "forge/anim/Skeleton.h"
+#include "forge/anim/SkinApply.h"
 #include "forge/core/Log.h"
 #include "forge/renderer/TextureSource.h"
 
+#include <cmath>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace forge {
 
@@ -62,7 +66,15 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
                 SavedMesh sm;
                 sm.recipe = toRecipe ? toRecipe(e.mesh.get()) : std::string();
                 if (sm.recipe.empty()) {
-                    sm.vertices = e.mesh->Vertices();
+                    if (e.mesh->HasSkin()) {
+                        // Store BIND, not the posed live verts: on load SetSkin
+                        // snapshots them and ApplyPose re-deforms — storing the
+                        // deformed data would double-deform (#147).
+                        sm.vertices = e.mesh->BindVertices();
+                        sm.skin = e.mesh->Skin();
+                    } else {
+                        sm.vertices = e.mesh->Vertices();
+                    }
                     sm.indices = e.mesh->Indices();
                     sm.submeshes = e.mesh->Submeshes();
                 }
@@ -70,6 +82,16 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
             }
             se.meshIndex = it->second;
         }
+        if (e.skeleton) { // rig + pose persist since v3 (#147)
+            const Skeleton& s = *e.skeleton;
+            se.skeleton.parents = s.parents;
+            se.skeleton.names = s.names;
+            se.skeleton.bindT = s.bindT;
+            se.skeleton.bindR = s.bindR;
+            se.skeleton.bindS = s.bindS;
+            se.skeleton.inverseBind = s.inverseBind;
+        }
+        se.pose = e.pose.deltas;
         out.entities.push_back(std::move(se));
     }
     return out;
@@ -92,7 +114,10 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
                 FORGE_WARN("Scene load: unknown primitive recipe '%s'", sm.recipe.c_str());
             meshes.push_back(std::move(m));
         } else if (!sm.vertices.empty() && !sm.indices.empty()) {
-            meshes.push_back(std::make_shared<Mesh>(sm.vertices, sm.indices, sm.submeshes));
+            auto m = std::make_shared<Mesh>(sm.vertices, sm.indices, sm.submeshes);
+            if (!sm.skin.empty())
+                m->SetSkin(sm.skin); // vertices are bind data (SnapshotScene stored bind for skinned)
+            meshes.push_back(std::move(m));
         } else {
             meshes.push_back(nullptr);
         }
@@ -115,6 +140,10 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         }
     };
 
+    // Two entities pointing at one skinned mesh (only reachable via a hand-edited
+    // file — the editor COW-splits them) must not share one deformed Mesh, or the
+    // second entity's ApplyPose clobbers the first. Track posed meshes and clone.
+    std::unordered_set<const Mesh*> posedMeshes;
     for (const SavedEntity& se : saved.entities) {
         Entity e;
         e.id = se.id ? se.id : GenerateUUID(); // tolerate hand-edited files without ids
@@ -164,6 +193,52 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
             if (!e.mesh)
                 ++missing;
         }
+        // Rebuild the rig (#147). Import guarantees the SoA vectors stay in
+        // lockstep and finite; a file does not — a ragged or non-finite skeleton
+        // would let downstream loops (PoseLocalRotations, the joint panel) index
+        // out of bounds or NaN the palette, so drop it here and degrade to an
+        // unskinned bind-pose mesh instead. bindR/inverseBind are already made
+        // finite by JsonToQuat/JsonToMat4; bindT/bindS come through JsonToVec3, so
+        // check those here (the last unguarded numeric path into the palette).
+        if (!se.skeleton.Empty()) {
+            const SavedSkeleton& s = se.skeleton;
+            const size_t joints = s.parents.size();
+            auto finite3 = [](const std::vector<vec3>& vs) {
+                for (const vec3& v : vs)
+                    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+                        return false;
+                return true;
+            };
+            if (s.names.size() == joints && s.bindT.size() == joints &&
+                s.bindR.size() == joints && s.bindS.size() == joints &&
+                s.inverseBind.size() == joints && finite3(s.bindT) && finite3(s.bindS)) {
+                auto sk = std::make_shared<Skeleton>();
+                sk->parents = s.parents;
+                sk->names = s.names;
+                sk->bindT = s.bindT;
+                sk->bindR = s.bindR;
+                sk->bindS = s.bindS;
+                sk->inverseBind = s.inverseBind;
+                e.skeleton = std::move(sk);
+            } else {
+                FORGE_WARN("Scene load: malformed skeleton on \"%s\" dropped (corrupt file?)",
+                           se.name.c_str());
+            }
+        }
+        e.pose.deltas = se.pose;
+        // The mesh was rebuilt from bind vertices above; reproduce the saved
+        // deformation (empty pose == bind). Clone a shared skinned mesh first so
+        // divergent per-entity poses in a hand-edited file don't clobber each
+        // other (CloneSkinnedMesh rebuilds from the untouched bind snapshot).
+        if (e.mesh && e.mesh->HasSkin() && e.skeleton) {
+            if (!posedMeshes.insert(e.mesh.get()).second) {
+                if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e.mesh)) {
+                    e.mesh = std::move(priv);
+                    posedMeshes.insert(e.mesh.get());
+                }
+            }
+            ApplyPose(*e.mesh, *e.skeleton, e.pose);
+        }
         outScene.Insert(e);
     }
     return missing;
@@ -172,16 +247,6 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
 bool SaveSceneFile(const std::string& path, const Scene& scene, const std::string& extrasJson,
                    const MeshToRecipe& toRecipe)
 {
-    // Skeletons aren't in the file format until #147: the deformed bind-pose
-    // vertices save fine, but the rig itself is lost on reload — say so once
-    // per save rather than losing it silently.
-    for (const Entity& e : scene.Entities()) {
-        if (e.skeleton) {
-            FORGE_WARN("Scene save: skeleton not persisted — re-import to re-rig (R2 #147)");
-            break;
-        }
-    }
-
     std::vector<uint8_t> bytes = EncodeScene(SnapshotScene(scene, extrasJson, toRecipe));
 
     std::ofstream out(path, std::ios::binary | std::ios::trunc);

@@ -2,6 +2,8 @@
 
 #include <json.hpp> // nlohmann, bundled with tinygltf
 
+#include <cfloat>
+#include <cmath>
 #include <cstring>
 
 namespace forge {
@@ -9,6 +11,7 @@ namespace forge {
 using nlohmann::json;
 
 static_assert(sizeof(Vertex) == 8 * sizeof(float), "Vertex layout changed - bump kSceneFormatVersion");
+static_assert(sizeof(VertexSkin) == 8 * sizeof(float), "VertexSkin layout changed - bump kSceneFormatVersion");
 
 namespace {
 
@@ -21,6 +24,45 @@ vec3 JsonToVec3(const json& j, const vec3& fallback)
     if (!j.is_array() || j.size() != 3 || !j[0].is_number() || !j[1].is_number() || !j[2].is_number())
         return fallback;
     return {j[0].get<float>(), j[1].get<float>(), j[2].get<float>()};
+}
+
+json QuatToJson(const quat& q) { return json::array({q.x, q.y, q.z, q.w}); } // xyzw
+
+// A file number is "safe" only if it survives the narrowing to float finite: a
+// finite-but-huge literal like 1e40 becomes +Inf on the cast, and glm::normalize
+// does NOT guard Inf/NaN (its length is Inf, not <= 0), so the NaN cascades through
+// the joint palette and NaNs the whole skinned mesh. Reject to a benign default.
+bool SafeFloat(const json& j) { return j.is_number() && std::isfinite(j.get<double>()) && std::fabs(j.get<double>()) <= (double)FLT_MAX; }
+
+quat JsonToQuat(const json& j)
+{
+    if (!j.is_array() || j.size() != 4 || !SafeFloat(j[0]) || !SafeFloat(j[1]) ||
+        !SafeFloat(j[2]) || !SafeFloat(j[3]))
+        return quat(1, 0, 0, 0);
+    return quat(j[3].get<float>(), j[0].get<float>(), j[1].get<float>(), j[2].get<float>()); // (w,x,y,z)
+}
+
+json Mat4ToJson(const mat4& m)
+{
+    json a = json::array();
+    const float* p = &m[0][0];
+    for (int i = 0; i < 16; ++i)
+        a.push_back(p[i]); // column-major, glm's native order
+    return a;
+}
+
+mat4 JsonToMat4(const json& j)
+{
+    mat4 m(1.0f);
+    if (!j.is_array() || j.size() != 16)
+        return m;
+    float* p = &m[0][0];
+    for (int i = 0; i < 16; ++i) {
+        if (!SafeFloat(j[i]))
+            return mat4(1.0f); // hostile/non-finite element: fall back to identity IBM
+        p[i] = j[i].get<float>();
+    }
+    return m;
 }
 
 template <typename T>
@@ -63,6 +105,11 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
             jm["offset"] = (uint64_t)blob.size();
             Append(blob, m.vertices.data(), m.vertices.size() * sizeof(Vertex));
             Append(blob, m.indices.data(), m.indices.size() * sizeof(uint32_t));
+            if (!m.skin.empty()) {
+                jm["skinCount"] = (uint64_t)m.skin.size();
+                jm["skinOffset"] = (uint64_t)blob.size();
+                Append(blob, m.skin.data(), m.skin.size() * sizeof(VertexSkin));
+            }
             if (!m.submeshes.empty()) {
                 json subs = json::array();
                 for (const Submesh& s : m.submeshes)
@@ -124,6 +171,32 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
             je["light"] = {{"color", Vec3ToJson(e.lightColor)},
                            {"intensity", e.lightIntensity},
                            {"range", e.lightRange}};
+        }
+        if (!e.skeleton.Empty()) { // rig persists inline (v3, #147)
+            const SavedSkeleton& s = e.skeleton;
+            json js;
+            js["parents"] = s.parents;
+            js["names"] = s.names;
+            json bt = json::array(), br = json::array(), bs = json::array(), ib = json::array();
+            for (const vec3& v : s.bindT)
+                bt.push_back(Vec3ToJson(v));
+            for (const quat& q : s.bindR)
+                br.push_back(QuatToJson(q));
+            for (const vec3& v : s.bindS)
+                bs.push_back(Vec3ToJson(v));
+            for (const mat4& m : s.inverseBind)
+                ib.push_back(Mat4ToJson(m));
+            js["bindT"] = std::move(bt);
+            js["bindR"] = std::move(br);
+            js["bindS"] = std::move(bs);
+            js["inverseBind"] = std::move(ib);
+            je["skeleton"] = std::move(js);
+        }
+        if (!e.pose.empty()) {
+            json jp = json::array();
+            for (const quat& q : e.pose)
+                jp.push_back(QuatToJson(q));
+            je["pose"] = std::move(jp); // per-joint deltas (v3, #147)
         }
         entities.push_back(std::move(je));
     }
@@ -200,6 +273,22 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                 if (iCount)
                     std::memcpy(m.indices.data(), blob + offset + vCount * sizeof(Vertex),
                                 iCount * sizeof(uint32_t));
+                uint64_t skinCount = GetOr<uint64_t>(jm, "skinCount", 0); // v3 skin (#147)
+                if (skinCount) {
+                    uint64_t skinOffset = GetOr<uint64_t>(jm, "skinOffset", 0);
+                    // Per-count check first (overflow-safe), then range; mirror the vertex guard.
+                    if (skinCount > blobSize / sizeof(VertexSkin))
+                        return std::nullopt;
+                    uint64_t skinBytes = skinCount * sizeof(VertexSkin);
+                    if (skinOffset > blobSize || skinBytes > blobSize - skinOffset)
+                        return std::nullopt;
+                    // Skin must be parallel to vertices; a mismatch is a corrupt file —
+                    // drop the skin (renders unskinned) rather than risk an OOB in SkinVertices.
+                    if (skinCount == vCount) {
+                        m.skin.resize(skinCount);
+                        std::memcpy(m.skin.data(), blob + skinOffset, skinBytes);
+                    }
+                }
                 if (auto st = jm.find("submeshes"); st != jm.end() && st->is_array()) {
                     std::vector<Submesh> subs;
                     for (const json& js : *st) {
@@ -274,6 +363,32 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                 e.lightIntensity = GetOr<float>(*lt, "intensity", 0.0f);
                 e.lightRange = GetOr<float>(*lt, "range", 0.0f);
             }
+            if (auto st = je.find("skeleton"); st != je.end() && st->is_object()) { // v3 (#147)
+                SavedSkeleton s;
+                if (auto p = st->find("parents"); p != st->end() && p->is_array())
+                    for (const json& v : *p)
+                        if (v.is_number_integer())
+                            s.parents.push_back(v.get<int>());
+                if (auto n = st->find("names"); n != st->end() && n->is_array())
+                    for (const json& v : *n)
+                        s.names.push_back(v.is_string() ? v.get<std::string>() : "");
+                if (auto t = st->find("bindT"); t != st->end() && t->is_array())
+                    for (const json& v : *t)
+                        s.bindT.push_back(JsonToVec3(v, vec3(0.0f)));
+                if (auto r = st->find("bindR"); r != st->end() && r->is_array())
+                    for (const json& v : *r)
+                        s.bindR.push_back(JsonToQuat(v));
+                if (auto c = st->find("bindS"); c != st->end() && c->is_array())
+                    for (const json& v : *c)
+                        s.bindS.push_back(JsonToVec3(v, vec3(1.0f)));
+                if (auto ib = st->find("inverseBind"); ib != st->end() && ib->is_array())
+                    for (const json& v : *ib)
+                        s.inverseBind.push_back(JsonToMat4(v));
+                e.skeleton = std::move(s);
+            }
+            if (auto pt = je.find("pose"); pt != je.end() && pt->is_array())
+                for (const json& v : *pt)
+                    e.pose.push_back(JsonToQuat(v));
             scene.entities.push_back(std::move(e));
         }
     }

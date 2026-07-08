@@ -46,4 +46,12 @@ std::vector<mat4> ComputePalette(const std::vector<mat4>& globals,
     return palette;
 }
 
+int JointIndex(const Skeleton& skeleton, const std::string& name)
+{
+    for (size_t i = 0; i < skeleton.names.size(); ++i)
+        if (skeleton.names[i] == name)
+            return (int)i;
+    return -1;
+}
+
 } // namespace forge
