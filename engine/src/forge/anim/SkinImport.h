@@ -61,8 +61,8 @@ vec4 DecodeWeights(const uint8_t* data, int componentType);
 
 // Zeroes NaN/Inf/negative components (external data — a poisoned component
 // would scale skinned positions by the partial weight sum), then w /= sum when
-// sum > epsilon; near-zero sums stay as-is (the skinning kernel passes those
-// vertices through at bind pose).
+// sum > epsilon; a near-zero sum returns all-zero so the skinning kernel passes
+// that vertex through at bind pose (a tiny nonzero sum would spike it instead).
 vec4 RenormalizeWeights(const vec4& weights);
 
 } // namespace forge

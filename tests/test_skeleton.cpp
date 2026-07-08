@@ -293,8 +293,11 @@ void TestWeightDecode()
     // sum != 1 renormalizes; a near-zero sum is left alone (kernel passthrough).
     vec4 renorm = RenormalizeWeights(vec4(0.5f, 0.25f, 0, 0));
     CHECK(ApproxEq(renorm.x, 2.0f / 3.0f) && ApproxEq(renorm.y, 1.0f / 3.0f));
+    // A sub-epsilon sum returns literal zero (not the tiny original): the
+    // kernel's passthrough guard is weightSum <= 0, so a surviving 1e-8 would
+    // spike the vertex to the origin instead of leaving it at bind.
     vec4 zero = RenormalizeWeights(vec4(1e-8f, 0, 0, 0));
-    CHECK(ApproxEq(zero.x, 1e-8f, 1e-10f) && ApproxEq(zero.y, 0.0f));
+    CHECK(ApproxEq(zero.x, 0.0f) && ApproxEq(zero.y, 0.0f));
 
     // NaN/Inf/negative components are zeroed BEFORE normalizing — a poisoned
     // component that survived would scale skinned positions by the partial

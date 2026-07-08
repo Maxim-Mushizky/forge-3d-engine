@@ -121,7 +121,10 @@ vec4 RenormalizeWeights(const vec4& weights)
         if (!(w[c] >= 0.0f) || !std::isfinite(w[c]))
             w[c] = 0.0f;
     const float sum = w.x + w.y + w.z + w.w;
-    return sum > 1e-6f ? w / sum : w;
+    // Sub-epsilon sums collapse to a literal zero, not the tiny original: the
+    // skinning kernel treats weightSum > 0 as skinnable and would scale the
+    // vertex by ~1e-8 (a spike to the origin) instead of leaving it at bind.
+    return sum > 1e-6f ? w / sum : vec4(0.0f);
 }
 
 } // namespace forge
