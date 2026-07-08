@@ -1404,11 +1404,35 @@ bool EditorApp::ImportModel(const std::string& path)
         return false;
     }
 
+    // Materialize each part's FINAL mesh first. Skinned parts always get a
+    // private mesh clone (#146): AssetManager hands out the same cached
+    // shared_ptr on every import of this path, and skinning deforms vertices
+    // in place — posing the shared original would leak into every other entity
+    // spawned from this asset. The cached original never deforms, so its
+    // vertices are valid bind data for the clone's skin snapshot on re-imports
+    // too. Baking the bind pose BEFORE the placement math below matters: IBMs
+    // may encode a bind pose different from the node-default TRS, so the
+    // normalize/ground-snap must measure the deformed geometry actually
+    // rendered, not the raw cached vertices.
+    std::vector<std::shared_ptr<Mesh>> finalMeshes;
+    finalMeshes.reserve(parts->size());
+    for (const ImportedPart& p : *parts) {
+        if (p.skeleton) {
+            auto clone = std::make_shared<Mesh>(p.mesh->Vertices(), p.mesh->Indices(),
+                                                p.mesh->Submeshes());
+            clone->SetSkin(p.mesh->Skin()); // before any deform: snapshot = imported bind data
+            ApplyBindPose(*clone, *p.skeleton); // bind-pose render; bumps Mesh::Version for RT
+            finalMeshes.push_back(std::move(clone));
+        } else {
+            finalMeshes.push_back(p.mesh);
+        }
+    }
+
     // Combined bounds of all parts (vertices already share the model's space).
     AABB bounds;
-    for (const ImportedPart& p : *parts) {
-        bounds.Expand(p.mesh->Bounds().min);
-        bounds.Expand(p.mesh->Bounds().max);
+    for (const std::shared_ptr<Mesh>& m : finalMeshes) {
+        bounds.Expand(m->Bounds().min);
+        bounds.Expand(m->Bounds().max);
     }
     vec3 extent = bounds.max - bounds.min;
     float maxExtent = std::max({extent.x, extent.y, extent.z});
@@ -1433,25 +1457,13 @@ bool EditorApp::ImportModel(const std::string& path)
         composite->Add(std::make_unique<AddEntityCommand>(root));
     }
 
-    for (const ImportedPart& p : *parts) {
+    for (size_t i = 0; i < parts->size(); ++i) {
+        const ImportedPart& p = (*parts)[i];
         Entity& e = m_Scene.CreateEntity(p.name);
-        e.mesh = p.mesh;
+        e.mesh = finalMeshes[i];
+        e.skeleton = p.skeleton; // null for rigid parts
         e.material = p.material;
         e.extraMaterials = p.extraMaterials; // slots 1+ for multi-material meshes (#80)
-        if (p.skeleton) {
-            // Skinned parts always get a private mesh clone (#146): AssetManager
-            // hands out the same cached shared_ptr on every import of this path,
-            // and skinning deforms vertices in place — posing the shared original
-            // would leak into every other entity spawned from this asset. The
-            // cached original never deforms, so its vertices are valid bind data
-            // for the clone's skin snapshot on re-imports too.
-            auto clone = std::make_shared<Mesh>(p.mesh->Vertices(), p.mesh->Indices(),
-                                                p.mesh->Submeshes());
-            clone->SetSkin(p.mesh->Skin()); // before any deform: snapshot = imported bind data
-            e.mesh = std::move(clone);
-            e.skeleton = p.skeleton;
-            ApplyBindPose(*e.mesh, *p.skeleton); // bind-pose render; bumps Mesh::Version for RT
-        }
         if (rootId) {
             e.parent = rootId; // local identity: mesh data already shares the model's space
         } else {

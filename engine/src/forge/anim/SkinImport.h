@@ -59,8 +59,10 @@ void RemapVertexJoints(std::vector<VertexSkin>& skin, const std::vector<int>& re
 glm::uvec4 DecodeJointIndices(const uint8_t* data, int componentType);
 vec4 DecodeWeights(const uint8_t* data, int componentType);
 
-// w /= sum when sum > epsilon; near-zero sums stay as-is (the skinning kernel
-// passes those vertices through at bind pose).
+// Zeroes NaN/Inf/negative components (external data — a poisoned component
+// would scale skinned positions by the partial weight sum), then w /= sum when
+// sum > epsilon; near-zero sums stay as-is (the skinning kernel passes those
+// vertices through at bind pose).
 vec4 RenormalizeWeights(const vec4& weights);
 
 } // namespace forge

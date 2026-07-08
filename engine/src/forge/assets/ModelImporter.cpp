@@ -15,6 +15,7 @@
 #include <tiny_obj_loader.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <unordered_map>
 
@@ -49,7 +50,15 @@ static void ComputeNormals(std::vector<Vertex>& vertices, const std::vector<uint
 
 static const uint8_t* AccessorData(const tinygltf::Model& model, const tinygltf::Accessor& accessor, size_t& strideOut)
 {
+    strideOut = 0;
+    // Spec-legal accessors may omit bufferView entirely (sparse / zero-filled
+    // forms): there is nothing to read — callers skip the attribute instead of
+    // indexing bufferViews[-1] on external data.
+    if (accessor.bufferView < 0 || accessor.bufferView >= (int)model.bufferViews.size())
+        return nullptr;
     const tinygltf::BufferView& view = model.bufferViews[accessor.bufferView];
+    if (view.buffer < 0 || view.buffer >= (int)model.buffers.size())
+        return nullptr;
     const tinygltf::Buffer& buffer = model.buffers[view.buffer];
     int stride = accessor.ByteStride(view);
     strideOut = stride > 0 ? (size_t)stride : 0;
@@ -102,8 +111,14 @@ static void DecomposeTRS(const mat4& m, vec3& t, quat& r, vec3& s)
 {
     vec3 skew;
     vec4 perspective;
-    if (glm::decompose(m, s, r, t, skew, perspective))
+    if (glm::decompose(m, s, r, t, skew, perspective)) {
+        // Folded chains (non-uniform parent scale over a rotated joint) can
+        // shear, which TRS-only joint storage cannot represent — approximate,
+        // but never silently.
+        if (glm::length(skew) > 1e-4f)
+            FORGE_WARN("glTF: sheared joint chain — shear is unrepresentable in TRS, bind approximated");
         return;
+    }
     FORGE_WARN("glTF: joint matrix decompose failed (shear/degenerate) — best-effort TRS");
     t = vec3(m[3]);
     s = vec3(glm::length(vec3(m[0])), glm::length(vec3(m[1])), glm::length(vec3(m[2])));
@@ -178,27 +193,30 @@ static std::shared_ptr<Skeleton> BuildSkeleton(const tinygltf::Model& model, int
         names[j] = node.name;
         NodeLocalTRS(node, bindT[j], bindR[j], bindS[j]);
 
-        // Nearest ancestor that is also a joint. The walk is capped so a
-        // hostile node-parent cycle can't spin forever.
+        // Nearest ancestor that is also a joint. Non-joint nodes on the way up
+        // (helper/constraint nodes, joints pruned from skin.joints by
+        // optimizers — all spec-legal) are collected so their transforms fold
+        // into this joint's local bind: per glTF a joint's global is its NODE
+        // global, so dropping the in-between locals would misplace every
+        // vertex weighted below them. The walk is capped so a hostile
+        // node-parent cycle can't spin forever.
+        std::vector<int> skipped; // bottom-up, multiplied top-down below
         int ancestor = nodeParent[nodeIdx];
         for (int guard = 0; ancestor >= 0 && guard < nodeCount; ++guard) {
             if (auto it = jointOfNode.find(ancestor); it != jointOfNode.end()) {
                 parents[j] = it->second;
                 break;
             }
+            skipped.push_back(ancestor);
             ancestor = nodeParent[ancestor];
         }
 
-        if (parents[j] < 0) {
-            // Root joint: fold the accumulated non-joint ancestor transforms
-            // into its local bind so joint globals place the rig exactly where
-            // the file's node hierarchy does.
+        // Fold the skipped chain (root joints: everything up to the scene
+        // root) so joint globals place the rig exactly where the file's node
+        // hierarchy does.
+        if (!skipped.empty()) {
             mat4 chain(1.0f);
-            std::vector<int> chainNodes; // bottom-up, multiplied top-down below
-            for (int a = nodeParent[nodeIdx], guard = 0; a >= 0 && guard < nodeCount;
-                 a = nodeParent[a], ++guard)
-                chainNodes.push_back(a);
-            for (auto it = chainNodes.rbegin(); it != chainNodes.rend(); ++it)
+            for (auto it = skipped.rbegin(); it != skipped.rend(); ++it)
                 chain = chain * NodeLocalMatrix(model.nodes[*it]);
             if (chain != mat4(1.0f)) { // identity chain: keep the authored TRS bit-exact
                 mat4 local = glm::translate(mat4(1.0f), bindT[j]) * glm::mat4_cast(bindR[j]) *
@@ -212,9 +230,10 @@ static std::shared_ptr<Skeleton> BuildSkeleton(const tinygltf::Model& model, int
     // spec-legal and means identity.
     if (skin.inverseBindMatrices >= 0 && skin.inverseBindMatrices < (int)model.accessors.size()) {
         const tinygltf::Accessor& acc = model.accessors[skin.inverseBindMatrices];
-        if (acc.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT && acc.type == TINYGLTF_TYPE_MAT4) {
-            size_t stride;
-            const uint8_t* data = AccessorData(model, acc, stride);
+        size_t stride;
+        const uint8_t* data = AccessorData(model, acc, stride);
+        if (acc.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT && acc.type == TINYGLTF_TYPE_MAT4 &&
+            data) {
             for (int j = 0; j < jointCount && j < (int)acc.count; ++j) {
                 const float* f = (const float*)(data + (size_t)j * stride);
                 for (int c = 0; c < 4; ++c)
@@ -225,7 +244,8 @@ static std::shared_ptr<Skeleton> BuildSkeleton(const tinygltf::Model& model, int
                 FORGE_WARN("glTF: skin %d has %d inverse-bind matrices for %d joints — rest identity",
                            skinIdx, (int)acc.count, jointCount);
         } else {
-            FORGE_WARN("glTF: skin %d inverseBindMatrices is not a float mat4 accessor — identity",
+            FORGE_WARN("glTF: skin %d inverseBindMatrices is not a readable float mat4 accessor "
+                       "— identity",
                        skinIdx);
         }
     }
@@ -301,6 +321,7 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
     };
     std::unordered_map<int, BuiltSkin> skinCache;
     bool warnedBadJointIndex = false;
+    bool warnedBadWeight = false;
 
     std::vector<ImportedPart> parts;
     for (const MeshInstance& inst : instances) {
@@ -344,6 +365,11 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
 
             size_t stride;
             const uint8_t* data = AccessorData(model, posAcc, stride);
+            if (!data) {
+                FORGE_WARN("glTF: POSITION accessor has no buffer view in %s — primitive skipped",
+                           path.c_str());
+                continue;
+            }
             for (size_t i = 0; i < posAcc.count; ++i) {
                 vec3 pos = *(const vec3*)(data + i * stride);
                 vertices[i].position = vec3(world * vec4(pos, 1.0f));
@@ -353,16 +379,16 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             if (auto it = prim.attributes.find("NORMAL"); it != prim.attributes.end()) {
                 const tinygltf::Accessor& acc = model.accessors[it->second];
                 data = AccessorData(model, acc, stride);
-                for (size_t i = 0; i < acc.count && i < vertices.size(); ++i)
+                for (size_t i = 0; data && i < acc.count && i < vertices.size(); ++i)
                     vertices[i].normal = glm::normalize(normalMat * *(const vec3*)(data + i * stride));
-                hasNormals = true;
+                hasNormals = data != nullptr;
             }
 
             if (auto it = prim.attributes.find("TEXCOORD_0"); it != prim.attributes.end()) {
                 const tinygltf::Accessor& acc = model.accessors[it->second];
                 if (acc.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
                     data = AccessorData(model, acc, stride);
-                    for (size_t i = 0; i < acc.count && i < vertices.size(); ++i)
+                    for (size_t i = 0; data && i < acc.count && i < vertices.size(); ++i)
                         vertices[i].uv = *(const vec2*)(data + i * stride);
                 }
             }
@@ -379,18 +405,40 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
                 if (jIt != prim.attributes.end() && wIt != prim.attributes.end()) {
                     const tinygltf::Accessor& jAcc = model.accessors[jIt->second];
                     const tinygltf::Accessor& wAcc = model.accessors[wIt->second];
+                    const bool knownTypes =
+                        (jAcc.componentType == kGltfUnsignedByte ||
+                         jAcc.componentType == kGltfUnsignedShort ||
+                         jAcc.componentType == kGltfUnsignedInt) &&
+                        (wAcc.componentType == kGltfFloat ||
+                         wAcc.componentType == kGltfUnsignedByte ||
+                         wAcc.componentType == kGltfUnsignedShort);
+                    if (!knownTypes)
+                        FORGE_WARN("glTF: unsupported JOINTS_0/WEIGHTS_0 component type in %s — "
+                                   "primitive imports unweighted",
+                                   path.c_str());
                     size_t jStride, wStride;
                     const uint8_t* jData = AccessorData(model, jAcc, jStride);
                     const uint8_t* wData = AccessorData(model, wAcc, wStride);
                     const size_t jointsInSkin = model.skins[skinIdx].joints.size();
-                    for (size_t i = 0; i < vertices.size() && i < jAcc.count && i < wAcc.count; ++i) {
+                    for (size_t i = 0; knownTypes && jData && wData &&
+                                       i < vertices.size() && i < jAcc.count && i < wAcc.count;
+                         ++i) {
                         VertexSkin vs;
                         vs.joints = DecodeJointIndices(jData + i * jStride, jAcc.componentType);
                         vs.weights = DecodeWeights(wData + i * wStride, wAcc.componentType);
                         for (int c = 0; c < 4; ++c) {
+                            // External data: both recoverable — drop the influence
+                            // (remaining weights renormalize below), keep going.
+                            if (!(vs.weights[c] >= 0.0f) || !std::isfinite(vs.weights[c])) {
+                                // !(w >= 0) is deliberate: it also catches NaN.
+                                if (!warnedBadWeight) {
+                                    FORGE_WARN("glTF: NaN/negative skin weight in %s — dropped",
+                                               path.c_str());
+                                    warnedBadWeight = true;
+                                }
+                                vs.weights[c] = 0.0f;
+                            }
                             if (vs.joints[c] >= jointsInSkin) {
-                                // External data: recoverable — drop the influence
-                                // (remaining weights renormalize below), keep going.
                                 if (vs.weights[c] != 0.0f && !warnedBadJointIndex) {
                                     FORGE_WARN("glTF: joint index out of range in %s — influence dropped",
                                                path.c_str());
@@ -410,8 +458,8 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             if (prim.indices >= 0) {
                 const tinygltf::Accessor& acc = model.accessors[prim.indices];
                 data = AccessorData(model, acc, stride);
-                indices.resize(acc.count);
-                for (size_t i = 0; i < acc.count; ++i) {
+                indices.resize(data ? acc.count : 0);
+                for (size_t i = 0; i < indices.size(); ++i) {
                     switch (acc.componentType) {
                     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: indices[i] = *(const uint8_t*)(data + i * stride); break;
                     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: indices[i] = *(const uint16_t*)(data + i * stride); break;

@@ -2,6 +2,9 @@
 
 #include "forge/core/Log.h"
 
+#include <cmath>
+#include <queue>
+
 namespace forge {
 
 JointOrder TopoSortJoints(const std::vector<int>& parents)
@@ -12,41 +15,51 @@ JointOrder TopoSortJoints(const std::vector<int>& parents)
     result.remap.assign(count, -1);
     result.sortedParents.reserve(count);
 
-    // Emit-when-parent-emitted, rescanning in input order: already parent-first
-    // input therefore emits as the identity permutation (stability). O(n²)
-    // worst case is fine — rigs are tens of joints, not thousands.
+    // Smallest-ready-index-first (min-heap Kahn): already parent-first input
+    // emits as the identity permutation (stability — the smallest unemitted
+    // index always has its parent emitted, so it is always the heap top), and
+    // the joint count is file-supplied, so O(n log n) matters: a rescan-per-
+    // emission O(n²) sort was a freeze vector on hostile 100k-joint files.
+    std::vector<std::vector<int>> children(count);
     std::vector<bool> emitted(count, false);
-    int done = 0;
+    std::priority_queue<int, std::vector<int>, std::greater<int>> ready;
+    for (int i = 0; i < count; ++i) {
+        const int parent = parents[i];
+        // Out-of-range or self parent = root.
+        if (parent >= 0 && parent < count && parent != i)
+            children[parent].push_back(i);
+        else
+            ready.push(i);
+    }
+
+    auto emit = [&](int old, bool forcedRoot) {
+        result.remap[old] = (int)result.order.size();
+        const int parent = parents[old];
+        const bool root = forcedRoot || parent < 0 || parent >= count || parent == old;
+        result.sortedParents.push_back(root ? -1 : result.remap[parent]);
+        result.order.push_back(old);
+        emitted[old] = true;
+        for (int child : children[old])
+            ready.push(child);
+    };
+
+    int done = 0, cycleScan = 0;
     while (done < count) {
-        bool progress = false;
-        for (int old = 0; old < count; ++old) {
+        if (!ready.empty()) {
+            const int old = ready.top();
+            ready.pop();
             if (emitted[old])
-                continue;
-            const int parent = parents[old];
-            const bool root = parent < 0 || parent >= count; // out-of-range parent = root
-            if (!root && !emitted[parent])
-                continue;
-            result.remap[old] = (int)result.order.size();
-            result.sortedParents.push_back(root ? -1 : result.remap[parent]);
-            result.order.push_back(old);
-            emitted[old] = true;
+                continue; // stale re-push: a broken cycle's parent emitted after its child
+            emit(old, false);
             ++done;
-            progress = true;
-        }
-        if (!progress) {
+        } else {
             // Parent cycle (hostile or corrupt file): force the first stuck
             // joint to be a root and keep going — never hang on asset data.
-            for (int old = 0; old < count; ++old) {
-                if (emitted[old])
-                    continue;
-                FORGE_WARN("Skin import: joint parent cycle at joint %d — broken to root", old);
-                result.remap[old] = (int)result.order.size();
-                result.sortedParents.push_back(-1);
-                result.order.push_back(old);
-                emitted[old] = true;
-                ++done;
-                break;
-            }
+            while (cycleScan < count && emitted[cycleScan])
+                ++cycleScan;
+            FORGE_WARN("Skin import: joint parent cycle at joint %d — broken to root", cycleScan);
+            emit(cycleScan, true);
+            ++done;
         }
     }
     return result;
@@ -99,8 +112,16 @@ vec4 DecodeWeights(const uint8_t* data, int componentType)
 
 vec4 RenormalizeWeights(const vec4& weights)
 {
-    const float sum = weights.x + weights.y + weights.z + weights.w;
-    return sum > 1e-6f ? weights / sum : weights;
+    // NaN/Inf/negative components would poison the LBS sum — the kernel drops
+    // them via !(w > 0) and then scales positions by the PARTIAL weight sum,
+    // a spike artifact instead of a clean passthrough. Zero them first.
+    // !(w >= 0) is deliberate: it also catches NaN.
+    vec4 w = weights;
+    for (int c = 0; c < 4; ++c)
+        if (!(w[c] >= 0.0f) || !std::isfinite(w[c]))
+            w[c] = 0.0f;
+    const float sum = w.x + w.y + w.z + w.w;
+    return sum > 1e-6f ? w / sum : w;
 }
 
 } // namespace forge

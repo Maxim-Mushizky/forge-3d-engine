@@ -11,7 +11,9 @@ namespace forge {
 // global transforms and the skinning palette are one forward pass. SoA because
 // consumers walk one attribute at a time (the palette wants TRS+IBM, the UI
 // wants names). Shared between entities the same way Mesh is: entities hold
-// shared_ptr copies and never mutate the asset.
+// shared_ptr copies and never mutate the asset. TRS-only locals: shear (from
+// folding non-uniform-scale ancestor chains at import) is unrepresentable and
+// gets approximated with a warn — poseable joints need TRS, not matrices.
 struct Skeleton {
     std::vector<int> parents;      // -1 = root; guaranteed parents[i] < i
     std::vector<std::string> names;

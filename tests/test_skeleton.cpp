@@ -4,6 +4,7 @@
 #include <forge/anim/SkinImport.h>
 #include <forge/anim/Skinning.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -237,6 +238,31 @@ void TestTopoSortRemap()
     CHECK(cyc.order.size() == 2);
     for (size_t i = 0; i < cyc.sortedParents.size(); ++i)
         CHECK(cyc.sortedParents[i] < (int)i);
+
+    // Cycle plus downstream chain: the stale re-push from the break must not
+    // emit a joint twice (permutation stays exact-size and valid).
+    JointOrder cycChain = TopoSortJoints({1, 0, 0, 1});
+    CHECK(cycChain.order.size() == 4 && cycChain.sortedParents.size() == 4);
+    std::vector<bool> seen(4, false);
+    for (int old : cycChain.order) {
+        CHECK(old >= 0 && old < 4 && !seen[old]);
+        seen[old] = true;
+    }
+    for (size_t i = 0; i < cycChain.sortedParents.size(); ++i)
+        CHECK(cycChain.sortedParents[i] < (int)i);
+
+    // Worst-case-ordered big chain (every joint's parent comes later in the
+    // array): the joint count is file-supplied, so the sort must stay
+    // near-linear — the old rescan-per-emission O(n²) froze on files like this.
+    const int big = 50000;
+    std::vector<int> reversed(big);
+    for (int i = 0; i < big; ++i)
+        reversed[i] = i + 1 < big ? i + 1 : -1;
+    JointOrder rev = TopoSortJoints(reversed);
+    CHECK(rev.order.size() == (size_t)big);
+    for (size_t i = 0; i < rev.sortedParents.size(); ++i)
+        CHECK(rev.sortedParents[i] < (int)i);
+    CHECK(rev.order.front() == big - 1 && rev.order.back() == 0);
 }
 
 // --- 7. weight decode + renormalize -----------------------------------------
@@ -269,6 +295,20 @@ void TestWeightDecode()
     CHECK(ApproxEq(renorm.x, 2.0f / 3.0f) && ApproxEq(renorm.y, 1.0f / 3.0f));
     vec4 zero = RenormalizeWeights(vec4(1e-8f, 0, 0, 0));
     CHECK(ApproxEq(zero.x, 1e-8f, 1e-10f) && ApproxEq(zero.y, 0.0f));
+
+    // NaN/Inf/negative components are zeroed BEFORE normalizing — a poisoned
+    // component that survived would scale skinned positions by the partial
+    // weight sum (spike toward the origin at bind).
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    vec4 poisoned = RenormalizeWeights(vec4(0.5f, nan, -0.3f, 0.5f));
+    CHECK(ApproxEq(poisoned.x, 0.5f) && ApproxEq(poisoned.y, 0.0f));
+    CHECK(ApproxEq(poisoned.z, 0.0f) && ApproxEq(poisoned.w, 0.5f));
+    vec4 infinite = RenormalizeWeights(vec4(inf, 1.0f, 0, 0));
+    CHECK(ApproxEq(infinite.x, 0.0f) && ApproxEq(infinite.y, 1.0f));
+    vec4 allBad = RenormalizeWeights(vec4(nan, -1.0f, -inf, 0));
+    CHECK(ApproxEq(allBad.x, 0.0f) && ApproxEq(allBad.y, 0.0f));
+    CHECK(ApproxEq(allBad.z, 0.0f) && ApproxEq(allBad.w, 0.0f));
 }
 
 // --- 8. out-of-range joint index --------------------------------------------
