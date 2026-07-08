@@ -6,6 +6,7 @@
 #include <forge/anim/Skinning.h>
 #include <forge/assets/SceneFormat.h>
 
+#include <cmath>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -373,6 +374,50 @@ void TestPresetPoses()
     }
 }
 
+// --- 7. hostile non-finite skeleton/pose values -------------------------------
+// A finite-but-huge file number (1e40) narrows to +Inf on the float cast, and
+// glm::normalize does not guard Inf/NaN — it would cascade through the joint
+// palette and NaN the whole skinned mesh. The loader must clamp such values to a
+// benign default (JsonToQuat / JsonToMat4), matching the ragged-skeleton / skin-
+// blob hostile-file posture.
+void TestPoseHostileValues()
+{
+    // A pose delta with an out-of-float-range component decodes to identity and
+    // stays finite (would otherwise Inf -> NaN the palette on load).
+    {
+        std::string header =
+            R"({"version":3,"entities":[{"id":1,"name":"h","pose":[[1e40,0,0,1]]}],"meshes":[]})";
+        std::vector<uint8_t> bytes = BuildFile(header, 0);
+        auto back = DecodeScene(bytes.data(), bytes.size());
+        CHECK(back.has_value());
+        if (back && back->entities.size() == 1 && back->entities[0].pose.size() == 1) {
+            const quat q = back->entities[0].pose[0];
+            CHECK(std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) &&
+                  std::isfinite(q.w));
+            CHECK(IsIdentity(q));
+        }
+    }
+    // A skeleton bindR with a huge component -> identity quat; a huge inverseBind
+    // element -> identity matrix (both feed the palette directly).
+    {
+        std::string header =
+            R"({"version":3,"entities":[{"id":1,"name":"h","skeleton":{)"
+            R"("parents":[-1],"names":["r"],"bindT":[[0,0,0]],"bindR":[[1e40,0,0,1]],)"
+            R"("bindS":[[1,1,1]],"inverseBind":[[9e40,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]]}}],"meshes":[]})";
+        std::vector<uint8_t> bytes = BuildFile(header, 0);
+        auto back = DecodeScene(bytes.data(), bytes.size());
+        CHECK(back.has_value());
+        if (back && back->entities.size() == 1) {
+            const SavedSkeleton& s = back->entities[0].skeleton;
+            CHECK(!s.Empty());
+            if (s.bindR.size() == 1)
+                CHECK(IsIdentity(s.bindR[0]));
+            if (s.inverseBind.size() == 1)
+                CHECK(ApproxMat4(s.inverseBind[0], mat4(1.0f)));
+        }
+    }
+}
+
 } // namespace
 
 void RunPoseTests()
@@ -383,6 +428,7 @@ void RunPoseTests()
     TestPoseSerializationRoundTrip();
     TestSkinBlobGuards();
     TestPresetPoses();
+    TestPoseHostileValues();
 }
 
 } // namespace forge::test

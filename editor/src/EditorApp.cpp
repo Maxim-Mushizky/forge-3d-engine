@@ -2729,15 +2729,21 @@ void EditorApp::DrawInspector()
     if (e->skeleton && e->mesh && e->mesh->HasSkin()) {
         sepText("Skeleton");
         const Skeleton& sk = *e->skeleton;
-        // (Re)build the euler edit buffer for this entity. Converting the stored quat
-        // deltas to euler once (here) keeps the sliders stable; converting every frame
-        // would jitter across gimbal boundaries.
-        if (m_JointEulerFor != e->id || m_JointEulerUI.size() != sk.JointCount()) {
+        // (Re)build the euler edit buffer. Converting the stored quat deltas to
+        // euler once (here) keeps the sliders stable; converting every frame would
+        // jitter across gimbal boundaries. Rebuild on entity change, joint-count
+        // change, OR any command since the last build: undo/redo and a script/MCP
+        // set_pose mutate this same entity's pose without changing its id, and a
+        // stale buffer would show wrong angles AND, on the next drag, write the
+        // stale value back over the joint's real rotation (#160).
+        if (m_JointEulerFor != e->id || m_JointEulerUI.size() != sk.JointCount() ||
+            m_JointEulerRevision != m_Commands.Revision()) {
             m_JointEulerUI.assign(sk.JointCount(), vec3(0.0f));
             if (e->pose.deltas.size() == sk.JointCount())
                 for (size_t i = 0; i < sk.JointCount(); ++i)
                     m_JointEulerUI[i] = glm::degrees(glm::eulerAngles(e->pose.deltas[i]));
             m_JointEulerFor = e->id;
+            m_JointEulerRevision = m_Commands.Revision();
         }
 
         auto applyEuler = [&](size_t j) {

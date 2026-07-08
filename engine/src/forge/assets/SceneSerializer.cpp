@@ -5,8 +5,10 @@
 #include "forge/core/Log.h"
 #include "forge/renderer/TextureSource.h"
 
+#include <cmath>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace forge {
 
@@ -138,6 +140,10 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
         }
     };
 
+    // Two entities pointing at one skinned mesh (only reachable via a hand-edited
+    // file — the editor COW-splits them) must not share one deformed Mesh, or the
+    // second entity's ApplyPose clobbers the first. Track posed meshes and clone.
+    std::unordered_set<const Mesh*> posedMeshes;
     for (const SavedEntity& se : saved.entities) {
         Entity e;
         e.id = se.id ? se.id : GenerateUUID(); // tolerate hand-edited files without ids
@@ -188,15 +194,24 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
                 ++missing;
         }
         // Rebuild the rig (#147). Import guarantees the SoA vectors stay in
-        // lockstep; a file does not — a ragged skeleton would let downstream
-        // loops (PoseLocalRotations, the joint panel) index out of bounds, so
-        // drop it here and degrade to an unskinned bind-pose mesh instead.
+        // lockstep and finite; a file does not — a ragged or non-finite skeleton
+        // would let downstream loops (PoseLocalRotations, the joint panel) index
+        // out of bounds or NaN the palette, so drop it here and degrade to an
+        // unskinned bind-pose mesh instead. bindR/inverseBind are already made
+        // finite by JsonToQuat/JsonToMat4; bindT/bindS come through JsonToVec3, so
+        // check those here (the last unguarded numeric path into the palette).
         if (!se.skeleton.Empty()) {
             const SavedSkeleton& s = se.skeleton;
             const size_t joints = s.parents.size();
+            auto finite3 = [](const std::vector<vec3>& vs) {
+                for (const vec3& v : vs)
+                    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+                        return false;
+                return true;
+            };
             if (s.names.size() == joints && s.bindT.size() == joints &&
                 s.bindR.size() == joints && s.bindS.size() == joints &&
-                s.inverseBind.size() == joints) {
+                s.inverseBind.size() == joints && finite3(s.bindT) && finite3(s.bindS)) {
                 auto sk = std::make_shared<Skeleton>();
                 sk->parents = s.parents;
                 sk->names = s.names;
@@ -206,15 +221,24 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
                 sk->inverseBind = s.inverseBind;
                 e.skeleton = std::move(sk);
             } else {
-                FORGE_WARN("Scene load: ragged skeleton on \"%s\" dropped (corrupt file?)",
+                FORGE_WARN("Scene load: malformed skeleton on \"%s\" dropped (corrupt file?)",
                            se.name.c_str());
             }
         }
         e.pose.deltas = se.pose;
         // The mesh was rebuilt from bind vertices above; reproduce the saved
-        // deformation (empty pose == bind).
-        if (e.mesh && e.mesh->HasSkin() && e.skeleton)
+        // deformation (empty pose == bind). Clone a shared skinned mesh first so
+        // divergent per-entity poses in a hand-edited file don't clobber each
+        // other (CloneSkinnedMesh rebuilds from the untouched bind snapshot).
+        if (e.mesh && e.mesh->HasSkin() && e.skeleton) {
+            if (!posedMeshes.insert(e.mesh.get()).second) {
+                if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e.mesh)) {
+                    e.mesh = std::move(priv);
+                    posedMeshes.insert(e.mesh.get());
+                }
+            }
             ApplyPose(*e.mesh, *e.skeleton, e.pose);
+        }
         outScene.Insert(e);
     }
     return missing;

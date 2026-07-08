@@ -2,6 +2,8 @@
 
 #include <json.hpp> // nlohmann, bundled with tinygltf
 
+#include <cfloat>
+#include <cmath>
 #include <cstring>
 
 namespace forge {
@@ -26,10 +28,16 @@ vec3 JsonToVec3(const json& j, const vec3& fallback)
 
 json QuatToJson(const quat& q) { return json::array({q.x, q.y, q.z, q.w}); } // xyzw
 
+// A file number is "safe" only if it survives the narrowing to float finite: a
+// finite-but-huge literal like 1e40 becomes +Inf on the cast, and glm::normalize
+// does NOT guard Inf/NaN (its length is Inf, not <= 0), so the NaN cascades through
+// the joint palette and NaNs the whole skinned mesh. Reject to a benign default.
+bool SafeFloat(const json& j) { return j.is_number() && std::isfinite(j.get<double>()) && std::fabs(j.get<double>()) <= (double)FLT_MAX; }
+
 quat JsonToQuat(const json& j)
 {
-    if (!j.is_array() || j.size() != 4 || !j[0].is_number() || !j[1].is_number() ||
-        !j[2].is_number() || !j[3].is_number())
+    if (!j.is_array() || j.size() != 4 || !SafeFloat(j[0]) || !SafeFloat(j[1]) ||
+        !SafeFloat(j[2]) || !SafeFloat(j[3]))
         return quat(1, 0, 0, 0);
     return quat(j[3].get<float>(), j[0].get<float>(), j[1].get<float>(), j[2].get<float>()); // (w,x,y,z)
 }
@@ -49,8 +57,11 @@ mat4 JsonToMat4(const json& j)
     if (!j.is_array() || j.size() != 16)
         return m;
     float* p = &m[0][0];
-    for (int i = 0; i < 16; ++i)
-        p[i] = j[i].is_number() ? j[i].get<float>() : p[i];
+    for (int i = 0; i < 16; ++i) {
+        if (!SafeFloat(j[i]))
+            return mat4(1.0f); // hostile/non-finite element: fall back to identity IBM
+        p[i] = j[i].get<float>();
+    }
     return m;
 }
 

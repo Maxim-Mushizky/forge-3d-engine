@@ -224,9 +224,10 @@ private:
     int m_InspectorSlot = 0; // material slot shown in the inspector (#80), clamped per entity
     // Joint-tree pose panel (#147). Euler edit buffer per joint: quats convert
     // to euler once per selection change, not every frame (gimbal jitter).
-    std::vector<vec3> m_JointEulerUI; // per-joint euler-degree edit buffer for the pose panel
-    UUID m_JointEulerFor = 0;         // entity the buffer was built for (rebuild on change)
-    Pose m_PoseBeforeEdit;            // pose snapshot at widget-activate, for one undo step
+    std::vector<vec3> m_JointEulerUI;  // per-joint euler-degree edit buffer for the pose panel
+    UUID m_JointEulerFor = 0;          // entity the buffer was built for (rebuild on change)
+    uint64_t m_JointEulerRevision = 0; // command revision at last build (rebuild after undo/redo/script pose)
+    Pose m_PoseBeforeEdit;             // pose snapshot at widget-activate, for one undo step
     bool m_FirstDockLayout = false;
 
     DirectionalLight m_Sun;
