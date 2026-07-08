@@ -3,6 +3,7 @@
 #include "FileDialog.h"
 #include "Theme.h"
 
+#include <forge/anim/PosePresets.h>
 #include <forge/anim/SkinApply.h>
 #include <forge/assets/AssetManager.h>
 #include <forge/assets/MeshFactory.h>
@@ -296,10 +297,13 @@ uint64_t EditorApp::SceneHash() const
             uint64_t v = e.mesh->Version(); // sculpt edits change content, not the pointer
             mix(&v, sizeof(v));
         }
-        // Skeleton identity only (#146): pose changes are #147's problem, and
-        // skinned vertex deforms already ride Mesh::Version() above.
         const Skeleton* skel = e.skeleton.get();
         mix(&skel, sizeof(skel));
+        // Pose deltas deform the mesh via CPU skinning. The re-skin already bumped
+        // Mesh::Version() (mixed above), but hash the pose too (#147): an explicit
+        // change signal that survives any future path that poses without re-uploading.
+        for (const quat& q : e.pose.deltas)
+            mix(&q, sizeof(q));
     }
     return h;
 }
@@ -2718,6 +2722,81 @@ void EditorApp::DrawInspector()
         ImGui::SliderFloat("Range", &e->light.range, 0.5f, 100.0f);
         track();
     }
+
+    // Joint-tree pose panel (#147), skinned entities only. Edits drive the same
+    // pose path as forge.set_pose and undo through SetPoseCommand — track()'s
+    // EditEntityCommand would share the mesh pointer and never re-deform.
+    if (e->skeleton && e->mesh && e->mesh->HasSkin()) {
+        sepText("Skeleton");
+        const Skeleton& sk = *e->skeleton;
+        // (Re)build the euler edit buffer for this entity. Converting the stored quat
+        // deltas to euler once (here) keeps the sliders stable; converting every frame
+        // would jitter across gimbal boundaries.
+        if (m_JointEulerFor != e->id || m_JointEulerUI.size() != sk.JointCount()) {
+            m_JointEulerUI.assign(sk.JointCount(), vec3(0.0f));
+            if (e->pose.deltas.size() == sk.JointCount())
+                for (size_t i = 0; i < sk.JointCount(); ++i)
+                    m_JointEulerUI[i] = glm::degrees(glm::eulerAngles(e->pose.deltas[i]));
+            m_JointEulerFor = e->id;
+        }
+
+        auto applyEuler = [&](size_t j) {
+            if (e->pose.deltas.size() != sk.JointCount())
+                e->pose.deltas.assign(sk.JointCount(), quat(1, 0, 0, 0));
+            e->pose.deltas[j] = quat(glm::radians(m_JointEulerUI[j]));
+            if (e->mesh.use_count() > 1) { // COW like the script path
+                if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh))
+                    e->mesh = std::move(priv);
+            }
+            ApplyPose(*e->mesh, sk, e->pose);
+        };
+
+        // Preset buttons (canned poses as data).
+        auto presetButton = [&](const char* label, const char* presetName) {
+            if (ImGui::Button(label)) {
+                m_PoseBeforeEdit = e->pose;
+                if (std::optional<Pose> p = MakePresetPose(sk, presetName)) {
+                    e->pose = std::move(*p);
+                    if (e->mesh.use_count() > 1)
+                        if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh))
+                            e->mesh = std::move(priv);
+                    ApplyPose(*e->mesh, sk, e->pose);
+                    m_Commands.Push(
+                        std::make_unique<SetPoseCommand>(e->id, m_PoseBeforeEdit, e->pose));
+                    m_JointEulerFor = 0; // force buffer rebuild next frame
+                }
+            }
+        };
+        presetButton("Rest", "rest"); ImGui::SameLine();
+        presetButton("T-Pose", "t-pose"); ImGui::SameLine();
+        presetButton("A-Pose", "a-pose"); ImGui::SameLine();
+        presetButton("Sit", "sit");
+
+        // Per-joint euler editors, indented by hierarchy depth for readability.
+        for (size_t j = 0; j < sk.JointCount(); ++j) {
+            // Depth walk leans on the parents[i] < i invariant; the shrinking
+            // bound also terminates on a hostile (cyclic) rig from a scene file.
+            int depth = 0;
+            for (int p = sk.parents[j], bound = (int)j; p >= 0 && p < bound; ++depth) {
+                bound = p;
+                p = sk.parents[p];
+            }
+            if (depth) ImGui::Indent(depth * 10.0f);
+            ImGui::PushID((int)j);
+            const bool edited = ImGui::DragFloat3(sk.names[j].c_str(), &m_JointEulerUI[j].x, 0.5f);
+            // Snapshot on activate BEFORE this frame's applyEuler runs, so the
+            // gesture's first drag step lands in the undo command too.
+            if (ImGui::IsItemActivated())
+                m_PoseBeforeEdit = e->pose;
+            if (edited)
+                applyEuler(j);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, m_PoseBeforeEdit, e->pose));
+            ImGui::PopID();
+            if (depth) ImGui::Unindent(depth * 10.0f);
+        }
+    }
+
     if (mat.albedoMap) {
         ImGui::Text("Albedo map: %ux%u", mat.albedoMap->Width(), mat.albedoMap->Height());
         if (ImGui::Button("Remove texture")) {

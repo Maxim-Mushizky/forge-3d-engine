@@ -152,6 +152,7 @@ private:
     ToolResult ToolMeshElements(const nlohmann::json& args);    // face/edge id queries
     ToolResult ToolEditElements(const nlohmann::json& args);    // extrude/subdivide/shade
     ToolResult ToolSculpt(const nlohmann::json& args);          // #105: sculpt / move_verts
+    ToolResult ToolSetPose(const nlohmann::json& args);         // #147: FK posing (joint delta / preset)
     ToolResult ToolExportStl(const nlohmann::json& args);
     // Combined world AABB of an entity and its descendants; optionally
     // collects the subtree's ids (for excluding it from collision queries).
@@ -221,6 +222,11 @@ private:
     float m_EditSmoothStrength = 0.5f; // edit-mode Laplacian smooth strength (#65)
     Entity m_BeforeEdit; // snapshot taken when a gizmo drag / widget edit begins
     int m_InspectorSlot = 0; // material slot shown in the inspector (#80), clamped per entity
+    // Joint-tree pose panel (#147). Euler edit buffer per joint: quats convert
+    // to euler once per selection change, not every frame (gimbal jitter).
+    std::vector<vec3> m_JointEulerUI; // per-joint euler-degree edit buffer for the pose panel
+    UUID m_JointEulerFor = 0;         // entity the buffer was built for (rebuild on change)
+    Pose m_PoseBeforeEdit;            // pose snapshot at widget-activate, for one undo step
     bool m_FirstDockLayout = false;
 
     DirectionalLight m_Sun;

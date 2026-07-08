@@ -14,13 +14,14 @@ namespace forge {
 // EncodeScene/DecodeScene are pure bytes <-> structs and run headless in unit
 // tests; SceneSerializer adapts live Scene/Mesh objects to and from this.
 //
-// File layout (version 2 — v2 added submesh ranges + extra material slots, #80;
-// v1 files read unchanged, the new keys just default to empty):
+// File layout (version 3 — v3 added per-vertex skin + per-entity skeleton/pose
+// as optional keys, #147; v2 added submesh ranges + extra material slots, #80;
+// v1/v2 files read unchanged, the new keys just default to empty = non-skinned):
 //   8 bytes  magic "FORGESCN"
 //   u32      version
 //   u32      json length
 //   ...      json header (entities, mesh table, extras)
-//   ...      blob section (raw vertex/index data, offsets relative to its start)
+//   ...      blob section (raw vertex/index/skin data, offsets relative to its start)
 // Unknown json keys are ignored on read (forward compatible).
 
 struct SavedMesh {
@@ -28,9 +29,10 @@ struct SavedMesh {
     // stay empty and the editor resolves the shared mesh on load. Empty recipe
     // = unique geometry (sculpted/imported/generated) stored as a raw blob.
     std::string recipe;
-    std::vector<Vertex> vertices;
+    std::vector<Vertex> vertices; // BIND-pose data for skinned meshes (#147)
     std::vector<uint32_t> indices;
     std::vector<Submesh> submeshes; // empty = single-material (whole buffer, slot 0)
+    std::vector<VertexSkin> skin;   // empty = not skinned; parallel to vertices (#147)
 };
 
 // One material slot's factors plus rebuildable texture sources (#113,
@@ -48,6 +50,19 @@ struct SavedMaterial {
     vec3 subsurfaceRadius{0.1f, 0.05f, 0.03f};
     std::string albedoSource;
     std::string mrSource;
+};
+
+// Persisted rig (#147). Mirrors forge::Skeleton (SoA). Stored inline per entity in
+// JSON (rigs are small); the mesh's per-vertex joint indices reference this ordering.
+struct SavedSkeleton {
+    std::vector<int> parents;
+    std::vector<std::string> names;
+    std::vector<vec3> bindT;
+    std::vector<quat> bindR;
+    std::vector<vec3> bindS;
+    std::vector<mat4> inverseBind;
+
+    bool Empty() const { return parents.empty(); }
 };
 
 struct SavedEntity {
@@ -77,6 +92,9 @@ struct SavedEntity {
     vec3 lightColor{1.0f};
     float lightIntensity = 0.0f;
     float lightRange = 0.0f;
+
+    SavedSkeleton skeleton;      // empty = not skinned (#147)
+    std::vector<quat> pose;      // per-joint local-rotation deltas; empty = bind (#147)
 };
 
 struct SavedScene {
@@ -92,6 +110,6 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene);
 // the current scene untouched.
 std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size);
 
-inline constexpr uint32_t kSceneFormatVersion = 2; // v2: submeshes + material slots (#80)
+inline constexpr uint32_t kSceneFormatVersion = 3; // v3: skin + skeleton + pose (#147)
 
 } // namespace forge

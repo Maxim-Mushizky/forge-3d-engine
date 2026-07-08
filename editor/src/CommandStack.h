@@ -1,9 +1,12 @@
 #pragma once
 
+#include <forge/anim/Pose.h>
+#include <forge/anim/SkinApply.h>
 #include <forge/core/Log.h>
 #include <forge/scene/Scene.h>
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace forge {
@@ -88,6 +91,35 @@ private:
     UUID m_Entity;
     std::vector<uint32_t> m_Indices;
     std::vector<Vertex> m_Before, m_After;
+};
+
+// One set_pose edit: stores just the before/after Pose (a few hundred bytes), never
+// a mesh clone — the whole point of the Pose model. Undo/redo re-applies the stored
+// pose and re-skins from bind (ApplyPose never compounds). Entity snapshots can't
+// cover this: they'd share the mesh pointer and wouldn't re-deform.
+class SetPoseCommand : public Command {
+public:
+    SetPoseCommand(UUID entity, Pose before, Pose after)
+        : m_Entity(entity), m_Before(std::move(before)), m_After(std::move(after))
+    {
+    }
+
+    void Undo(Scene& scene) override { Apply(scene, m_Before); }
+    void Redo(Scene& scene) override { Apply(scene, m_After); }
+    const char* Name() const override { return "Pose"; }
+
+private:
+    void Apply(Scene& scene, const Pose& pose)
+    {
+        Entity* e = scene.Find(m_Entity);
+        if (!e || !e->mesh || !e->skeleton)
+            return;
+        e->pose = pose;
+        ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    }
+
+    UUID m_Entity;
+    Pose m_Before, m_After;
 };
 
 // Topology ops (mirror, subdivide, boolean, extrude) replace the whole mesh.

@@ -40,4 +40,8 @@ std::vector<mat4> ComputeBindGlobals(const Skeleton& skeleton);
 std::vector<mat4> ComputePalette(const std::vector<mat4>& globals,
                                  const std::vector<mat4>& inverseBind);
 
+// Index of the joint with this name, or -1 if none. Linear scan (rigs are small;
+// names come from glTF and are unique per skin). First match wins. #147.
+int JointIndex(const Skeleton& skeleton, const std::string& name);
+
 } // namespace forge

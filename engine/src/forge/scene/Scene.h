@@ -1,5 +1,6 @@
 #pragma once
 
+#include "forge/anim/Pose.h"
 #include "forge/anim/Skeleton.h"
 #include "forge/core/Geometry.h"
 #include "forge/core/UUID.h"
@@ -29,7 +30,8 @@ struct Entity {
     std::string name;
     TransformComponent transform;
     std::shared_ptr<Mesh> mesh; // null = empty node (e.g. a group)
-    std::shared_ptr<Skeleton> skeleton; // null = not skinned; bind pose only until R2 (#147)
+    std::shared_ptr<Skeleton> skeleton; // null = not skinned
+    Pose pose; // per-joint FK overrides on top of the skeleton bind; empty = bind (#147)
     MaterialComponent material; // material slot 0 — kept as a direct field so
                                 // every single-material call site stays valid (#80)
     std::vector<MaterialComponent> extraMaterials; // slots 1+ (multi-material meshes)
