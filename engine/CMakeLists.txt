@@ -19,6 +19,10 @@ add_library(forge STATIC
     src/forge/scene/BoxSelect.cpp
     src/forge/scene/DropToGround.cpp
     src/forge/scene/TransformSnap.cpp
+    src/forge/anim/Skeleton.cpp
+    src/forge/anim/Skinning.cpp
+    src/forge/anim/SkinImport.cpp
+    src/forge/anim/SkinApply.cpp
     src/forge/geometry/EditMesh.cpp
     src/forge/geometry/MeshEdit.cpp
     src/forge/geometry/MeshBoolean.cpp

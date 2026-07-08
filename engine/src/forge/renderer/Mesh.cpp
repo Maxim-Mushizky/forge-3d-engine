@@ -1,5 +1,7 @@
 #include "Mesh.h"
 
+#include "forge/core/Log.h"
+
 #include <GL/glew.h>
 
 #include <algorithm>
@@ -49,6 +51,18 @@ void Mesh::UploadVertices()
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(m_Vertices.size() * sizeof(Vertex)), m_Vertices.data());
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     ++m_Version;
+}
+
+void Mesh::SetSkin(std::vector<VertexSkin> skin)
+{
+    if (skin.size() != m_Vertices.size()) {
+        // External asset data can be malformed — degrade to unskinned, never assert.
+        FORGE_WARN("Mesh::SetSkin: %zu skin entries for %zu vertices — mesh stays unskinned",
+                   skin.size(), m_Vertices.size());
+        return;
+    }
+    m_Skin = std::move(skin);
+    m_BindVertices = m_Vertices; // vertices must still be the undeformed bind pose here
 }
 
 void Mesh::RecomputeBounds()

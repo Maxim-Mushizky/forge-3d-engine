@@ -14,6 +14,15 @@ struct Vertex {
     vec2 uv;
 };
 
+// Per-vertex skin binding, parallel to Mesh's vertex array (#146). Kept OUT of
+// struct Vertex so the VBO layout, MeshFactory, sculpt/boolean kernels, and the
+// BVH flatten are all untouched — CPU skinning means the GPU never sees these.
+// (uvec4 rather than a packed u16vec4: CPU-only data, simplicity wins.)
+struct VertexSkin {
+    glm::uvec4 joints{0};
+    vec4 weights{0.0f};
+};
+
 // Index range drawn with one material slot (#80). Slots index the owning
 // entity's materials: 0 = Entity::material, 1+ = Entity::extraMaterials.
 // A mesh with no submeshes is single-material (the whole index buffer, slot 0).
@@ -74,10 +83,23 @@ public:
     void RecomputeBounds();
     uint64_t Version() const { return m_Version; } // mixed into the scene hash so the path tracer sees edits
 
+    // --- skinning support (#146) ---------------------------------------------
+    bool HasSkin() const { return !m_Skin.empty(); }
+    const std::vector<VertexSkin>& Skin() const { return m_Skin; }
+    const std::vector<Vertex>& BindVertices() const { return m_BindVertices; }
+    // Snapshots the CURRENT vertices as the bind reference — call while they
+    // still hold the imported bind-pose data, before any deform. Skinning must
+    // always re-deform from that snapshot: repeated LBS over already-posed
+    // vertices compounds error and loses the rig reference entirely (which is
+    // why the copy exists). Rejects on size mismatch (warn, stays unskinned).
+    void SetSkin(std::vector<VertexSkin> skin);
+
 private:
     std::vector<Vertex> m_Vertices;
     std::vector<uint32_t> m_Indices;
     std::vector<Submesh> m_Submeshes; // sanitized at construction, immutable after
+    std::vector<VertexSkin> m_Skin;   // empty = not skinned
+    std::vector<Vertex> m_BindVertices; // bind-pose snapshot, set with the skin
     AABB m_Bounds;
     uint64_t m_Version = 0;
     uint32_t m_VAO = 0, m_VBO = 0, m_IBO = 0;

@@ -1,6 +1,10 @@
 #include "ModelImporter.h"
 
+#include "forge/anim/SkinImport.h"
 #include "forge/core/Log.h"
+
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/matrix_decompose.hpp>
 
 #define TINYGLTF_IMPLEMENTATION
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -11,6 +15,7 @@
 #include <tiny_obj_loader.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <unordered_map>
 
@@ -45,7 +50,15 @@ static void ComputeNormals(std::vector<Vertex>& vertices, const std::vector<uint
 
 static const uint8_t* AccessorData(const tinygltf::Model& model, const tinygltf::Accessor& accessor, size_t& strideOut)
 {
+    strideOut = 0;
+    // Spec-legal accessors may omit bufferView entirely (sparse / zero-filled
+    // forms): there is nothing to read — callers skip the attribute instead of
+    // indexing bufferViews[-1] on external data.
+    if (accessor.bufferView < 0 || accessor.bufferView >= (int)model.bufferViews.size())
+        return nullptr;
     const tinygltf::BufferView& view = model.bufferViews[accessor.bufferView];
+    if (view.buffer < 0 || view.buffer >= (int)model.buffers.size())
+        return nullptr;
     const tinygltf::Buffer& buffer = model.buffers[view.buffer];
     int stride = accessor.ByteStride(view);
     strideOut = stride > 0 ? (size_t)stride : 0;
@@ -71,15 +84,184 @@ static mat4 NodeLocalMatrix(const tinygltf::Node& node)
     return m;
 }
 
+// A mesh reference found in the node tree. The node index rides along because
+// skinning (#146) is a NODE property (`node.skin`), lost if we only keep the
+// accumulated matrix.
+struct MeshInstance {
+    int mesh = -1;
+    int node = -1; // -1 = no source node (scene-less fallback), always rigid
+    mat4 world{1.0f};
+};
+
 static void CollectMeshInstances(const tinygltf::Model& model, int nodeIdx, const mat4& parent,
-                                 std::vector<std::pair<int, mat4>>& out)
+                                 std::vector<MeshInstance>& out)
 {
     const tinygltf::Node& node = model.nodes[nodeIdx];
     mat4 world = parent * NodeLocalMatrix(node);
     if (node.mesh >= 0)
-        out.push_back({node.mesh, world});
+        out.push_back({node.mesh, nodeIdx, world});
     for (int child : node.children)
         CollectMeshInstances(model, child, world, out);
+}
+
+// Best-effort TRS from an arbitrary matrix: glm::decompose fails on degenerate
+// (singular) matrices; fall back to column extraction so one bad node never
+// aborts an import.
+static void DecomposeTRS(const mat4& m, vec3& t, quat& r, vec3& s)
+{
+    vec3 skew;
+    vec4 perspective;
+    if (glm::decompose(m, s, r, t, skew, perspective)) {
+        // Folded chains (non-uniform parent scale over a rotated joint) can
+        // shear, which TRS-only joint storage cannot represent — approximate,
+        // but never silently.
+        if (glm::length(skew) > 1e-4f)
+            FORGE_WARN("glTF: sheared joint chain — shear is unrepresentable in TRS, bind approximated");
+        return;
+    }
+    FORGE_WARN("glTF: joint matrix decompose failed (shear/degenerate) — best-effort TRS");
+    t = vec3(m[3]);
+    s = vec3(glm::length(vec3(m[0])), glm::length(vec3(m[1])), glm::length(vec3(m[2])));
+    if (s.x > 1e-8f && s.y > 1e-8f && s.z > 1e-8f)
+        r = glm::quat_cast(mat3(vec3(m[0]) / s.x, vec3(m[1]) / s.y, vec3(m[2]) / s.z));
+    else
+        r = quat(1.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// Local bind TRS of a joint node. glTF stores rotation as [x,y,z,w] while
+// glm::quat's ctor is (w,x,y,z) — same reorder as NodeLocalMatrix above.
+// Matrix-form nodes decompose.
+static void NodeLocalTRS(const tinygltf::Node& node, vec3& t, quat& r, vec3& s)
+{
+    t = vec3(0.0f);
+    r = quat(1.0f, 0.0f, 0.0f, 0.0f);
+    s = vec3(1.0f);
+    if (node.matrix.size() == 16) {
+        DecomposeTRS(NodeLocalMatrix(node), t, r, s);
+        return;
+    }
+    if (node.translation.size() == 3)
+        t = vec3((float)node.translation[0], (float)node.translation[1], (float)node.translation[2]);
+    if (node.rotation.size() == 4)
+        r = quat((float)node.rotation[3], (float)node.rotation[0], (float)node.rotation[1],
+                 (float)node.rotation[2]);
+    if (node.scale.size() == 3)
+        s = vec3((float)node.scale[0], (float)node.scale[1], (float)node.scale[2]);
+}
+
+// Builds the shared Skeleton for model.skins[skinIdx]. Joint parents derive
+// from the node tree — nearest ancestor that is itself a joint of this skin;
+// skin.skeleton is only a hint and is not trusted structurally. Transforms of
+// non-joint ancestors fold into root joint locals: without the fold, palettes
+// are wrong whenever the rig sits under a transformed group node (CesiumMan-
+// style assets). Joints come out topo-sorted (parents[i] < i); remapOut is the
+// old->new joint remap the caller must apply to every vertex's joint indices.
+static std::shared_ptr<Skeleton> BuildSkeleton(const tinygltf::Model& model, int skinIdx,
+                                               std::vector<int>& remapOut)
+{
+    const tinygltf::Skin& skin = model.skins[skinIdx];
+    const int jointCount = (int)skin.joints.size();
+    const int nodeCount = (int)model.nodes.size();
+
+    // Node -> parent, from the children lists (glTF stores only downward links).
+    std::vector<int> nodeParent(nodeCount, -1);
+    for (int n = 0; n < nodeCount; ++n)
+        for (int child : model.nodes[n].children)
+            if (child >= 0 && child < nodeCount)
+                nodeParent[child] = n;
+
+    std::unordered_map<int, int> jointOfNode; // node index -> old joint index
+    for (int j = 0; j < jointCount; ++j)
+        if (skin.joints[j] >= 0 && skin.joints[j] < nodeCount)
+            jointOfNode[skin.joints[j]] = j;
+
+    std::vector<int> parents(jointCount, -1);
+    std::vector<std::string> names(jointCount);
+    std::vector<vec3> bindT(jointCount, vec3(0.0f));
+    std::vector<quat> bindR(jointCount, quat(1.0f, 0.0f, 0.0f, 0.0f));
+    std::vector<vec3> bindS(jointCount, vec3(1.0f));
+    std::vector<mat4> ibms(jointCount, mat4(1.0f));
+
+    for (int j = 0; j < jointCount; ++j) {
+        const int nodeIdx = skin.joints[j];
+        if (nodeIdx < 0 || nodeIdx >= nodeCount) {
+            FORGE_WARN("glTF: skin %d joint %d references invalid node %d — identity joint",
+                       skinIdx, j, nodeIdx);
+            continue;
+        }
+        const tinygltf::Node& node = model.nodes[nodeIdx];
+        names[j] = node.name;
+        NodeLocalTRS(node, bindT[j], bindR[j], bindS[j]);
+
+        // Nearest ancestor that is also a joint. Non-joint nodes on the way up
+        // (helper/constraint nodes, joints pruned from skin.joints by
+        // optimizers — all spec-legal) are collected so their transforms fold
+        // into this joint's local bind: per glTF a joint's global is its NODE
+        // global, so dropping the in-between locals would misplace every
+        // vertex weighted below them. The walk is capped so a hostile
+        // node-parent cycle can't spin forever.
+        std::vector<int> skipped; // bottom-up, multiplied top-down below
+        int ancestor = nodeParent[nodeIdx];
+        for (int guard = 0; ancestor >= 0 && guard < nodeCount; ++guard) {
+            if (auto it = jointOfNode.find(ancestor); it != jointOfNode.end()) {
+                parents[j] = it->second;
+                break;
+            }
+            skipped.push_back(ancestor);
+            ancestor = nodeParent[ancestor];
+        }
+
+        // Fold the skipped chain (root joints: everything up to the scene
+        // root) so joint globals place the rig exactly where the file's node
+        // hierarchy does.
+        if (!skipped.empty()) {
+            mat4 chain(1.0f);
+            for (auto it = skipped.rbegin(); it != skipped.rend(); ++it)
+                chain = chain * NodeLocalMatrix(model.nodes[*it]);
+            if (chain != mat4(1.0f)) { // identity chain: keep the authored TRS bit-exact
+                mat4 local = glm::translate(mat4(1.0f), bindT[j]) * glm::mat4_cast(bindR[j]) *
+                             glm::scale(mat4(1.0f), bindS[j]);
+                DecomposeTRS(chain * local, bindT[j], bindR[j], bindS[j]);
+            }
+        }
+    }
+
+    // IBMs: mat4 float accessor, column-major like node.matrix. Absent is
+    // spec-legal and means identity.
+    if (skin.inverseBindMatrices >= 0 && skin.inverseBindMatrices < (int)model.accessors.size()) {
+        const tinygltf::Accessor& acc = model.accessors[skin.inverseBindMatrices];
+        size_t stride;
+        const uint8_t* data = AccessorData(model, acc, stride);
+        if (acc.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT && acc.type == TINYGLTF_TYPE_MAT4 &&
+            data) {
+            for (int j = 0; j < jointCount && j < (int)acc.count; ++j) {
+                const float* f = (const float*)(data + (size_t)j * stride);
+                for (int c = 0; c < 4; ++c)
+                    for (int r = 0; r < 4; ++r)
+                        ibms[j][c][r] = f[c * 4 + r];
+            }
+            if ((int)acc.count < jointCount)
+                FORGE_WARN("glTF: skin %d has %d inverse-bind matrices for %d joints — rest identity",
+                           skinIdx, (int)acc.count, jointCount);
+        } else {
+            FORGE_WARN("glTF: skin %d inverseBindMatrices is not a readable float mat4 accessor "
+                       "— identity",
+                       skinIdx);
+        }
+    }
+
+    // Topo sort + one consistent remap across every per-joint attribute AND
+    // (by the caller) the per-vertex joint indices.
+    JointOrder order = TopoSortJoints(parents);
+    auto skeleton = std::make_shared<Skeleton>();
+    skeleton->parents = order.sortedParents;
+    skeleton->names = ReorderJoints(names, order.order);
+    skeleton->bindT = ReorderJoints(bindT, order.order);
+    skeleton->bindR = ReorderJoints(bindR, order.order);
+    skeleton->bindS = ReorderJoints(bindS, order.order);
+    skeleton->inverseBind = ReorderJoints(ibms, order.order);
+    remapOut = std::move(order.remap);
+    return skeleton;
 }
 
 static std::vector<ImportedPart> LoadGLTF(const std::string& path)
@@ -120,19 +302,43 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
     };
 
     // Which nodes to walk: the default scene, or every node if scenes are absent.
-    std::vector<std::pair<int, mat4>> instances;
+    std::vector<MeshInstance> instances;
     if (!model.scenes.empty()) {
         int sceneIdx = model.defaultScene >= 0 ? model.defaultScene : 0;
         for (int root : model.scenes[sceneIdx].nodes)
             CollectMeshInstances(model, root, mat4(1.0f), instances);
     } else {
         for (int m = 0; m < (int)model.meshes.size(); ++m)
-            instances.push_back({m, mat4(1.0f)});
+            instances.push_back({m, -1, mat4(1.0f)});
     }
 
+    // One Skeleton per glTF skin, shared by every part referencing it. The
+    // topo-sort remap must also hit each part's vertex joint indices, so it is
+    // cached alongside.
+    struct BuiltSkin {
+        std::shared_ptr<Skeleton> skeleton;
+        std::vector<int> remap; // old joint index -> topo-sorted index
+    };
+    std::unordered_map<int, BuiltSkin> skinCache;
+    bool warnedBadJointIndex = false;
+    bool warnedBadWeight = false;
+
     std::vector<ImportedPart> parts;
-    for (auto& [meshIdx, world] : instances) {
+    for (const MeshInstance& inst : instances) {
+        const int meshIdx = inst.mesh;
         const tinygltf::Mesh& gltfMesh = model.meshes[meshIdx];
+
+        // Skinned node (#146): per glTF 2.0 the node's own transform chain is
+        // IGNORED for skinned meshes — joint globals supply all placement — so
+        // baking `world` here would double-transform. Vertices are read raw;
+        // rigid nodes keep the existing bake path untouched.
+        const int skinIdx = inst.node >= 0 ? model.nodes[inst.node].skin : -1;
+        bool skinned = skinIdx >= 0;
+        if (skinned && (skinIdx >= (int)model.skins.size() || model.skins[skinIdx].joints.empty())) {
+            FORGE_WARN("glTF: node references invalid/empty skin %d — imported rigid", skinIdx);
+            skinned = false;
+        }
+        const mat4 world = skinned ? mat4(1.0f) : inst.world;
         mat3 normalMat = mat3(glm::transpose(glm::inverse(world)));
 
         // All primitives of one glTF mesh merge into ONE part (#80): shared
@@ -141,6 +347,7 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
         std::vector<Vertex> meshVertices;
         std::vector<uint32_t> meshIndices;
         std::vector<Submesh> submeshes;
+        std::vector<VertexSkin> meshSkin;                    // parallel to meshVertices when skinned
         std::vector<Material> slotMaterials;                 // slot -> material
         std::unordered_map<int, uint32_t> slotOfGltfMaterial; // glTF material index (-1 = none) -> slot
 
@@ -158,6 +365,11 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
 
             size_t stride;
             const uint8_t* data = AccessorData(model, posAcc, stride);
+            if (!data) {
+                FORGE_WARN("glTF: POSITION accessor has no buffer view in %s — primitive skipped",
+                           path.c_str());
+                continue;
+            }
             for (size_t i = 0; i < posAcc.count; ++i) {
                 vec3 pos = *(const vec3*)(data + i * stride);
                 vertices[i].position = vec3(world * vec4(pos, 1.0f));
@@ -167,17 +379,78 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             if (auto it = prim.attributes.find("NORMAL"); it != prim.attributes.end()) {
                 const tinygltf::Accessor& acc = model.accessors[it->second];
                 data = AccessorData(model, acc, stride);
-                for (size_t i = 0; i < acc.count && i < vertices.size(); ++i)
+                for (size_t i = 0; data && i < acc.count && i < vertices.size(); ++i)
                     vertices[i].normal = glm::normalize(normalMat * *(const vec3*)(data + i * stride));
-                hasNormals = true;
+                hasNormals = data != nullptr;
             }
 
             if (auto it = prim.attributes.find("TEXCOORD_0"); it != prim.attributes.end()) {
                 const tinygltf::Accessor& acc = model.accessors[it->second];
                 if (acc.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
                     data = AccessorData(model, acc, stride);
-                    for (size_t i = 0; i < acc.count && i < vertices.size(); ++i)
+                    for (size_t i = 0; data && i < acc.count && i < vertices.size(); ++i)
                         vertices[i].uv = *(const vec2*)(data + i * stride);
+                }
+            }
+
+            // JOINTS_0/WEIGHTS_0 read like POSITION and merged with the same
+            // vertexBase offsets. A primitive missing them (invalid but seen in
+            // the wild) leaves weight-0 entries the skinning kernel passes
+            // through at bind pose.
+            std::vector<VertexSkin> primSkin;
+            if (skinned) {
+                primSkin.resize(vertices.size());
+                auto jIt = prim.attributes.find("JOINTS_0");
+                auto wIt = prim.attributes.find("WEIGHTS_0");
+                if (jIt != prim.attributes.end() && wIt != prim.attributes.end()) {
+                    const tinygltf::Accessor& jAcc = model.accessors[jIt->second];
+                    const tinygltf::Accessor& wAcc = model.accessors[wIt->second];
+                    const bool knownTypes =
+                        (jAcc.componentType == kGltfUnsignedByte ||
+                         jAcc.componentType == kGltfUnsignedShort ||
+                         jAcc.componentType == kGltfUnsignedInt) &&
+                        (wAcc.componentType == kGltfFloat ||
+                         wAcc.componentType == kGltfUnsignedByte ||
+                         wAcc.componentType == kGltfUnsignedShort);
+                    if (!knownTypes)
+                        FORGE_WARN("glTF: unsupported JOINTS_0/WEIGHTS_0 component type in %s — "
+                                   "primitive imports unweighted",
+                                   path.c_str());
+                    size_t jStride, wStride;
+                    const uint8_t* jData = AccessorData(model, jAcc, jStride);
+                    const uint8_t* wData = AccessorData(model, wAcc, wStride);
+                    const size_t jointsInSkin = model.skins[skinIdx].joints.size();
+                    for (size_t i = 0; knownTypes && jData && wData &&
+                                       i < vertices.size() && i < jAcc.count && i < wAcc.count;
+                         ++i) {
+                        VertexSkin vs;
+                        vs.joints = DecodeJointIndices(jData + i * jStride, jAcc.componentType);
+                        vs.weights = DecodeWeights(wData + i * wStride, wAcc.componentType);
+                        for (int c = 0; c < 4; ++c) {
+                            // External data: both recoverable — drop the influence
+                            // (remaining weights renormalize below), keep going.
+                            if (!(vs.weights[c] >= 0.0f) || !std::isfinite(vs.weights[c])) {
+                                // !(w >= 0) is deliberate: it also catches NaN.
+                                if (!warnedBadWeight) {
+                                    FORGE_WARN("glTF: NaN/negative skin weight in %s — dropped",
+                                               path.c_str());
+                                    warnedBadWeight = true;
+                                }
+                                vs.weights[c] = 0.0f;
+                            }
+                            if (vs.joints[c] >= jointsInSkin) {
+                                if (vs.weights[c] != 0.0f && !warnedBadJointIndex) {
+                                    FORGE_WARN("glTF: joint index out of range in %s — influence dropped",
+                                               path.c_str());
+                                    warnedBadJointIndex = true;
+                                }
+                                vs.joints[c] = 0;
+                                vs.weights[c] = 0.0f;
+                            }
+                        }
+                        vs.weights = RenormalizeWeights(vs.weights);
+                        primSkin[i] = vs;
+                    }
                 }
             }
 
@@ -185,8 +458,8 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             if (prim.indices >= 0) {
                 const tinygltf::Accessor& acc = model.accessors[prim.indices];
                 data = AccessorData(model, acc, stride);
-                indices.resize(acc.count);
-                for (size_t i = 0; i < acc.count; ++i) {
+                indices.resize(data ? acc.count : 0);
+                for (size_t i = 0; i < indices.size(); ++i) {
                     switch (acc.componentType) {
                     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: indices[i] = *(const uint8_t*)(data + i * stride); break;
                     case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: indices[i] = *(const uint16_t*)(data + i * stride); break;
@@ -234,6 +507,8 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             const uint32_t vertexBase = (uint32_t)meshVertices.size();
             const uint32_t firstIndex = (uint32_t)meshIndices.size();
             meshVertices.insert(meshVertices.end(), vertices.begin(), vertices.end());
+            if (skinned)
+                meshSkin.insert(meshSkin.end(), primSkin.begin(), primSkin.end());
             meshIndices.reserve(meshIndices.size() + indices.size());
             for (uint32_t i : indices)
                 meshIndices.push_back(vertexBase + i);
@@ -253,6 +528,20 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
         if (slotMaterials.size() <= 1)
             submeshes.clear();
         part.mesh = std::make_shared<Mesh>(std::move(meshVertices), std::move(meshIndices), std::move(submeshes));
+        if (skinned) {
+            auto it = skinCache.find(skinIdx);
+            if (it == skinCache.end()) {
+                BuiltSkin built;
+                built.skeleton = BuildSkeleton(model, skinIdx, built.remap);
+                it = skinCache.emplace(skinIdx, std::move(built)).first;
+            }
+            part.skeleton = it->second.skeleton;
+            RemapVertexJoints(meshSkin, it->second.remap);
+            // The importer attaches skin data to the cached mesh: that original
+            // never deforms (the editor clones skinned meshes before posing),
+            // so its bind snapshot stays valid for every re-import of the path.
+            part.mesh->SetSkin(std::move(meshSkin));
+        }
         parts.push_back(std::move(part));
     }
     return parts;
