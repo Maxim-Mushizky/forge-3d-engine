@@ -17,6 +17,7 @@ add_executable(forge_tests
     test_settings.cpp
     test_mcp.cpp
     test_mcpscript.cpp
+    test_commandstack.cpp
     test_mcpviews.cpp
     test_meshstats.cpp
     test_uvunwrap.cpp

@@ -1,5 +1,7 @@
 #include "McpScript.h"
 
+#include <forge/core/Log.h>
+
 // Lua is compiled as C++ (see cmake/Dependencies.cmake), so its errors unwind
 // as exceptions and RAII below stays safe. Include the plain headers — not
 // lua.hpp's extern "C" wrapper — or the declarations wouldn't mangle to match.
@@ -7,6 +9,7 @@
 #include <lua.h>
 #include <lualib.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
@@ -23,6 +26,9 @@ namespace {
 // coarse enough to be free, fine enough that a runaway loop dies in ~ms.
 constexpr int kHookStride = 100000;
 constexpr size_t kMemoryCap = 256u * 1024u * 1024u; // string.rep bombs stop here
+constexpr size_t kOutputCap = 4u * 1024u * 1024u;   // print() lives on the C++ heap,
+                                                    // outside the Lua allocator cap
+constexpr int kMaxDepth = 32; // json<->lua nesting, both directions
 
 // Per-run state, reachable from the C callbacks via the state's extra space.
 struct RunCtx {
@@ -30,6 +36,7 @@ struct RunCtx {
     std::vector<std::pair<std::string, ScriptFn>> fns;
     int64_t instructionsLeft = 0;
     size_t memoryUsed = 0;
+    bool outputTruncated = false;
 };
 
 RunCtx*& CtxSlot(lua_State* L)
@@ -66,8 +73,15 @@ void Hook(lua_State* L, lua_Debug*)
 
 // --- json <-> lua ---------------------------------------------------------
 
-void JsonToLua(lua_State* L, const json& v)
+void JsonToLua(lua_State* L, const json& v, int depth = 0)
 {
+    if (depth > kMaxDepth)
+        throw std::runtime_error("result nested too deep for Lua");
+    // A C function is only guaranteed LUA_MINSTACK (20) free slots and each
+    // recursion level holds slots across its children; without explicit growth
+    // a deep table writes past the stack — silent corruption in release Lua.
+    if (!lua_checkstack(L, 4))
+        throw std::runtime_error("Lua stack exhausted converting result");
     switch (v.type()) {
     case json::value_t::boolean:
         lua_pushboolean(L, v.get<bool>());
@@ -89,14 +103,14 @@ void JsonToLua(lua_State* L, const json& v)
     case json::value_t::array:
         lua_createtable(L, (int)v.size(), 0);
         for (int i = 0; i < (int)v.size(); ++i) {
-            JsonToLua(L, v[i]);
+            JsonToLua(L, v[i], depth + 1);
             lua_rawseti(L, -2, i + 1);
         }
         break;
     case json::value_t::object:
         lua_createtable(L, 0, (int)v.size());
         for (const auto& [key, value] : v.items()) {
-            JsonToLua(L, value);
+            JsonToLua(L, value, depth + 1);
             lua_setfield(L, -2, key.c_str());
         }
         break;
@@ -108,8 +122,12 @@ void JsonToLua(lua_State* L, const json& v)
 
 json LuaToJson(lua_State* L, int idx, int depth = 0)
 {
-    if (depth > 32)
+    if (depth > kMaxDepth)
         throw std::runtime_error("table nested too deep (reference cycle?)");
+    // Same story as JsonToLua: the traversal holds up to 2 slots per level
+    // (lua_next key/value stay live while the value recurses) — grow or die.
+    if (!lua_checkstack(L, 4))
+        throw std::runtime_error("Lua stack exhausted converting table");
     idx = lua_absindex(L, idx);
     switch (lua_type(L, idx)) {
     case LUA_TNIL:
@@ -175,14 +193,24 @@ json LuaToJson(lua_State* L, int idx, int depth = 0)
 int Print(lua_State* L)
 {
     RunCtx* ctx = CtxSlot(L);
+    if (ctx->outputTruncated)
+        return 0; // cap already hit — swallow further output, keep running
     const int n = lua_gettop(L);
     for (int i = 1; i <= n; ++i) {
         size_t len = 0;
         const char* s = luaL_tolstring(L, i, &len); // honours __tostring
         if (i > 1)
             ctx->output += '\t';
-        ctx->output.append(s, len);
+        // The output string is host-heap, outside the Lua allocator cap, so it
+        // gets its own budget — a print loop must not OOM the editor.
+        const size_t room = kOutputCap - std::min(ctx->output.size(), kOutputCap);
+        ctx->output.append(s, std::min(len, room));
         lua_pop(L, 1);
+        if (ctx->output.size() >= kOutputCap) {
+            ctx->outputTruncated = true;
+            ctx->output += "\n[print output truncated at 4 MB]\n";
+            return 0;
+        }
     }
     ctx->output += '\n';
     return 0;
@@ -230,6 +258,17 @@ int CallBinding(lua_State* L)
     return luaL_error(L, "%s", err.c_str());
 }
 
+// Last resort for errors raised outside any pcall (state setup, error-object
+// formatting): Lua's default panic behaviour is abort(). Log and unwind as a
+// C++ exception instead — Lua is compiled as C++, so throwing through its
+// frames is safe, and RunSandboxedScript catches it as a script host error.
+int Panic(lua_State* L)
+{
+    const char* msg = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : nullptr;
+    FORGE_ERROR("Lua panic (unprotected error): %s", msg ? msg : "(no message)");
+    throw std::runtime_error(std::string("Lua panic: ") + (msg ? msg : "(no message)"));
+}
+
 struct LuaStateOwner {
     lua_State* L = nullptr;
     ~LuaStateOwner()
@@ -257,69 +296,78 @@ ScriptResult RunSandboxedScript(const std::string& source,
         return result;
     }
     CtxSlot(L) = &ctx;
+    lua_atpanic(L, Panic);
 
-    // Sandbox: only the pure-computation libraries exist. os/io/package are
-    // never opened; the base library's file/chunk loaders are stripped.
-    luaL_requiref(L, LUA_GNAME, luaopen_base, 1);
-    luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1);
-    luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
-    luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1);
-    lua_pop(L, 4);
-    for (const char* gate : {"dofile", "loadfile", "load", "require"}) {
-        lua_pushnil(L);
-        lua_setglobal(L, gate);
-    }
-    for (const char* guarded : {"pcall", "xpcall"}) {
-        lua_getglobal(L, guarded);
-        lua_pushcclosure(L, GuardedProtectedCall, 1);
-        lua_setglobal(L, guarded);
-    }
-    lua_pushcfunction(L, Print);
-    lua_setglobal(L, "print"); // print goes to the tool result, not stdout
-
-    install([&ctx](const std::string& name, ScriptFn fn) {
-        ctx.fns.emplace_back(name, std::move(fn));
-    });
-    lua_createtable(L, 0, (int)ctx.fns.size() + 1);
-    for (size_t i = 0; i < ctx.fns.size(); ++i) {
-        lua_pushinteger(L, (lua_Integer)i);
-        lua_pushcclosure(L, CallBinding, 1);
-        lua_setfield(L, -2, ctx.fns[i].first.c_str());
-    }
-    lua_pushcfunction(L, Print);
-    lua_setfield(L, -2, "print"); // forge.print, alias of print
-    lua_setglobal(L, "forge");
-
-    lua_sethook(L, Hook, LUA_MASKCOUNT, kHookStride);
-
-    // "@" marks the chunk as named source, so errors read "script:12: ..."
-    // instead of the noisier [string "..."] form.
-    if (luaL_loadbufferx(L, source.data(), source.size(), "@script", "t") != LUA_OK) {
-        const char* msg = lua_tostring(L, -1);
-        result.error = msg ? msg : "syntax error";
-        return result;
-    }
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-        size_t len = 0;
-        const char* msg = luaL_tolstring(L, -1, &len);
-        result.error.assign(msg, len);
-        result.output = std::move(ctx.output);
-        return result;
-    }
-    if (ctx.instructionsLeft <= 0) { // belt for any future catch path
-        result.error = "instruction budget exceeded (runaway loop?)";
-        result.output = std::move(ctx.output);
-        return result;
-    }
+    // Everything below runs under the panic handler's C++ unwind: an
+    // unprotected Lua error (alloc failure during setup, error formatting)
+    // lands here as a host error instead of aborting the editor.
     try {
-        if (!lua_isnil(L, -1))
-            result.returned = LuaToJson(L, -1);
+        // Sandbox: only the pure-computation libraries exist. os/io/package are
+        // never opened; the base library's file/chunk loaders are stripped.
+        luaL_requiref(L, LUA_GNAME, luaopen_base, 1);
+        luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1);
+        luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
+        luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1);
+        lua_pop(L, 4);
+        for (const char* gate : {"dofile", "loadfile", "load", "require"}) {
+            lua_pushnil(L);
+            lua_setglobal(L, gate);
+        }
+        for (const char* guarded : {"pcall", "xpcall"}) {
+            lua_getglobal(L, guarded);
+            lua_pushcclosure(L, GuardedProtectedCall, 1);
+            lua_setglobal(L, guarded);
+        }
+        lua_pushcfunction(L, Print);
+        lua_setglobal(L, "print"); // print goes to the tool result, not stdout
+
+        install([&ctx](const std::string& name, ScriptFn fn) {
+            ctx.fns.emplace_back(name, std::move(fn));
+        });
+        lua_createtable(L, 0, (int)ctx.fns.size() + 1);
+        for (size_t i = 0; i < ctx.fns.size(); ++i) {
+            lua_pushinteger(L, (lua_Integer)i);
+            lua_pushcclosure(L, CallBinding, 1);
+            lua_setfield(L, -2, ctx.fns[i].first.c_str());
+        }
+        lua_pushcfunction(L, Print);
+        lua_setfield(L, -2, "print"); // forge.print, alias of print
+        lua_setglobal(L, "forge");
+
+        lua_sethook(L, Hook, LUA_MASKCOUNT, kHookStride);
+
+        // "@" marks the chunk as named source, so errors read "script:12: ..."
+        // instead of the noisier [string "..."] form.
+        if (luaL_loadbufferx(L, source.data(), source.size(), "@script", "t") != LUA_OK) {
+            const char* msg = lua_tostring(L, -1);
+            result.error = msg ? msg : "syntax error";
+            return result;
+        }
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+            size_t len = 0;
+            const char* msg = luaL_tolstring(L, -1, &len);
+            result.error.assign(msg, len);
+            result.output = std::move(ctx.output);
+            return result;
+        }
+        if (ctx.instructionsLeft <= 0) { // belt for any future catch path
+            result.error = "instruction budget exceeded (runaway loop?)";
+            result.output = std::move(ctx.output);
+            return result;
+        }
+        try {
+            if (!lua_isnil(L, -1))
+                result.returned = LuaToJson(L, -1);
+        } catch (const std::exception& ex) {
+            result.error = std::string("return value: ") + ex.what();
+            result.output = std::move(ctx.output);
+            return result;
+        }
+        result.ok = true;
     } catch (const std::exception& ex) {
-        result.error = std::string("return value: ") + ex.what();
-        result.output = std::move(ctx.output);
-        return result;
+        result.ok = false;
+        result.error = std::string("script host error: ") + ex.what();
     }
-    result.ok = true;
     result.output = std::move(ctx.output);
     return result;
 }

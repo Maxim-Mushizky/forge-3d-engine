@@ -237,6 +237,62 @@ static void NonFiniteArgsRejectedAtBridge()
     CHECK(reached);
 }
 
+static void DeepNestingIsSafe()
+{
+    // Depth ~64 nesting in every direction must fail as a clean script error
+    // (depth cap / explicit stack growth), never corrupt the Lua stack: a C
+    // function is only guaranteed 20 free slots (#162).
+
+    // Deep table as a binding argument (LuaToJson).
+    ScriptLog log;
+    ScriptResult r = RunWithStubs("local t = {leaf = true}\n"
+                                  "for i = 1, 64 do t = {inner = t} end\n"
+                                  "forge.echo{payload = t}",
+                                  &log);
+    CHECK(!r.ok);
+    CHECK(r.error.find("nested too deep") != std::string::npos);
+    CHECK(log.empty()); // handler never entered
+
+    // Deep table as the script's return value (LuaToJson outside pcall).
+    r = RunWithStubs("local t = {}\nfor i = 1, 64 do t = {inner = t} end\nreturn t");
+    CHECK(!r.ok);
+    CHECK(r.error.find("nested too deep") != std::string::npos);
+
+    // Deep JSON coming back from a host function (JsonToLua).
+    r = RunSandboxedScript("forge.deep{}", [&](const ScriptInstall& add) {
+        add("deep", [](const json&) {
+            json v = 1;
+            for (int i = 0; i < 64; ++i)
+                v = json{{"inner", v}};
+            return v;
+        });
+    });
+    CHECK(!r.ok);
+    CHECK(r.error.find("nested too deep") != std::string::npos);
+
+    // Within the cap, deep values round-trip intact (exercises stack growth).
+    r = RunWithStubs("local t = {leaf = 7}\n"
+                     "for i = 1, 20 do t = {inner = t} end\n"
+                     "local c = forge.echo{payload = t}.payload\n"
+                     "for i = 1, 20 do c = c.inner end\n"
+                     "return c.leaf");
+    CHECK(r.ok);
+    CHECK(r.returned == json(7));
+}
+
+static void PrintOutputCapped()
+{
+    // print() accumulates on the host heap, outside the Lua allocator cap, so
+    // it carries its own 4 MB budget; the script keeps running past it (#162).
+    ScriptResult r = RunWithStubs("local s = string.rep('x', 65536)\n"
+                                  "for i = 1, 80 do print(s) end\n"
+                                  "return 'done'");
+    CHECK(r.ok);
+    CHECK(r.returned == json("done"));
+    CHECK(r.output.size() <= 4u * 1024u * 1024u + 64u);
+    CHECK(r.output.find("truncated") != std::string::npos);
+}
+
 static void ParametricBuildLoop()
 {
     // The shape of a real agent script: a loop of spawns with computed
@@ -271,6 +327,8 @@ void RunMcpScriptTests()
     BudgetSurvivesProtectedCalls();
     MemoryCapAborts();
     NonFiniteArgsRejectedAtBridge();
+    DeepNestingIsSafe();
+    PrintOutputCapped();
     ParametricBuildLoop();
     std::printf("[ok] mcp script kernel tests\n");
 }
