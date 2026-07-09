@@ -115,11 +115,41 @@ private:
         if (!e || !e->mesh || !e->skeleton)
             return;
         e->pose = pose;
-        ApplyPose(*e->mesh, *e->skeleton, e->pose);
+        // Combined path (#149): undoing a pose must keep the entity's active morphs.
+        ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights);
     }
 
     UUID m_Entity;
     Pose m_Before, m_After;
+};
+
+// One set_morph / set_expression edit: stores just the before/after weight vectors
+// (a few hundred bytes for an ARKit-52 face), never a mesh clone — same rationale
+// as SetPoseCommand. Undo/redo re-runs the full deform from bind with the entity's
+// current skeleton/pose so morphs and pose compose instead of clobbering (#149).
+class SetMorphCommand : public Command {
+public:
+    SetMorphCommand(UUID entity, std::vector<float> before, std::vector<float> after)
+        : m_Entity(entity), m_Before(std::move(before)), m_After(std::move(after))
+    {
+    }
+
+    void Undo(Scene& scene) override { Apply(scene, m_Before); }
+    void Redo(Scene& scene) override { Apply(scene, m_After); }
+    const char* Name() const override { return "Morph"; }
+
+private:
+    void Apply(Scene& scene, const std::vector<float>& weights)
+    {
+        Entity* e = scene.Find(m_Entity);
+        if (!e || !e->mesh || !e->mesh->HasMorphTargets())
+            return;
+        e->morphWeights = weights;
+        ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights);
+    }
+
+    UUID m_Entity;
+    std::vector<float> m_Before, m_After;
 };
 
 // Topology ops (mirror, subdivide, boolean, extrude) replace the whole mesh.

@@ -155,6 +155,8 @@ private:
     ToolResult ToolSetPose(const nlohmann::json& args);         // #147: FK posing (joint delta / preset)
     ToolResult ToolPoseIk(const nlohmann::json& args);          // #148: two-bone IK
     ToolResult ToolPoseAim(const nlohmann::json& args);         // #148: single-joint aim
+    ToolResult ToolSetMorph(const nlohmann::json& args);        // #149: one morph-target weight
+    ToolResult ToolSetExpression(const nlohmann::json& args);   // #149: batch morph weights
     ToolResult ToolExportStl(const nlohmann::json& args);
     // Combined world AABB of an entity and its descendants; optionally
     // collects the subtree's ids (for excluding it from collision queries).
