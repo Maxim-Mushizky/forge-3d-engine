@@ -1,6 +1,6 @@
 #include "test_framework.h"
 
-#include "mcp/McpProtocol.h" // NonFiniteArgPath — the bindings' front-door guard
+#include "mcp/McpProtocol.h" // NonFiniteArgPath/UnknownArgKey — the bindings' front-door guards
 #include "mcp/McpScript.h"
 
 #include <json.hpp>
@@ -237,6 +237,43 @@ static void NonFiniteArgsRejectedAtBridge()
     CHECK(reached);
 }
 
+static void UnknownKeysRejectedAtBridge()
+{
+    // Mirrors the strict-key guard execute_script wraps around every forge.*
+    // binding (#170): UnknownArgKey runs on the raw args before the handler,
+    // so a typo'd field (set_transform{translation=...}) fails the script —
+    // and rolls it back — instead of being silently dropped.
+    bool reached = false;
+    auto run = [&](const std::string& src) {
+        reached = false;
+        return RunSandboxedScript(src, [&](const ScriptInstall& add) {
+            add("set_transform", [&](const json& args) -> json {
+                static const std::vector<const char*> keys{"id", "name", "position",
+                                                           "rotationDeg", "scale"};
+                if (const std::string bad = UnknownArgKey(args, keys); !bad.empty())
+                    throw std::runtime_error("unknown key '" + bad +
+                                             "' (valid: id, name, position, rotationDeg, scale)");
+                reached = true;
+                return json{{"ok", true}};
+            });
+        });
+    };
+
+    ScriptResult r =
+        run("forge.set_transform{id = '1', translation = {1, 2, 3}, scale = {2, 2, 2}}");
+    CHECK(!r.ok);
+    CHECK(r.error.find("forge.set_transform") != std::string::npos); // CallBinding's prefix
+    CHECK(r.error.find("unknown key 'translation'") != std::string::npos);
+    CHECK(r.error.find("valid: id, name, position, rotationDeg, scale") != std::string::npos);
+    CHECK(!reached); // handler never entered — nothing to roll back
+
+    // The full valid surface still goes through.
+    r = run("forge.set_transform{id = '1', position = {1, 2, 3}, rotationDeg = {0, 90, 0}, "
+            "scale = {2, 2, 2}}");
+    CHECK(r.ok);
+    CHECK(reached);
+}
+
 static void DeepNestingIsSafe()
 {
     // Depth ~64 nesting in every direction must fail as a clean script error
@@ -327,6 +364,7 @@ void RunMcpScriptTests()
     BudgetSurvivesProtectedCalls();
     MemoryCapAborts();
     NonFiniteArgsRejectedAtBridge();
+    UnknownKeysRejectedAtBridge();
     DeepNestingIsSafe();
     PrintOutputCapped();
     ParametricBuildLoop();
