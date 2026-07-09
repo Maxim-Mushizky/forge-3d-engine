@@ -30,6 +30,7 @@ void RunSilhouetteTests();
 void RunSssTests();
 void RunSkeletonTests();
 void RunPoseTests();
+void RunIkTests();
 } // namespace forge::test
 
 int main()
@@ -63,6 +64,7 @@ int main()
     RunSssTests();
     RunSkeletonTests();
     RunPoseTests();
+    RunIkTests();
 
     if (g_failures == 0) {
         std::printf("[ok] all tests passed\n");

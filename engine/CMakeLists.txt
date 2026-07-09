@@ -25,6 +25,7 @@ add_library(forge STATIC
     src/forge/anim/SkinApply.cpp
     src/forge/anim/Pose.cpp
     src/forge/anim/PosePresets.cpp
+    src/forge/anim/Ik.cpp
     src/forge/geometry/EditMesh.cpp
     src/forge/geometry/MeshEdit.cpp
     src/forge/geometry/MeshBoolean.cpp

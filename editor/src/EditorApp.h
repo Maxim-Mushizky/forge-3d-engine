@@ -153,6 +153,8 @@ private:
     ToolResult ToolEditElements(const nlohmann::json& args);    // extrude/subdivide/shade
     ToolResult ToolSculpt(const nlohmann::json& args);          // #105: sculpt / move_verts
     ToolResult ToolSetPose(const nlohmann::json& args);         // #147: FK posing (joint delta / preset)
+    ToolResult ToolPoseIk(const nlohmann::json& args);          // #148: two-bone IK
+    ToolResult ToolPoseAim(const nlohmann::json& args);         // #148: single-joint aim
     ToolResult ToolExportStl(const nlohmann::json& args);
     // Combined world AABB of an entity and its descendants; optionally
     // collects the subtree's ids (for excluding it from collision queries).
