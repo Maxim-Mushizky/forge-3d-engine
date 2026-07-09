@@ -21,6 +21,17 @@ namespace forge {
 void MorphVertices(const std::vector<Vertex>& bind, const std::vector<MorphTarget>& targets,
                    const std::vector<float>& weights, std::vector<Vertex>& out);
 
+// Bakes a node transform into morph deltas (#149 review). Rigid glTF nodes bake
+// their world transform into the base vertices at import, so the deltas must
+// ride the same transform or morphs displace in raw model space under a
+// world-baked mesh: position deltas by the linear part (directions — no
+// translation), normal deltas by the inverse-transpose, exactly like the base
+// attributes. Deltas stay raw (no normalize — they are summands, and the final
+// consumer normalizes once after the sum). Skinned meshes never need this
+// (their import world is forced identity).
+void TransformMorphDeltas(std::vector<MorphTarget>& targets, const mat3& positionXf,
+                          const mat3& normalXf);
+
 // glTF sparse-accessor overlay (#149): base[indices[k]] = values[k] — a full
 // element REPLACE, not an add. The caller supplies `base` already dense-read
 // (or zero-filled when the accessor has no bufferView, the common encoding for

@@ -601,8 +601,9 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
                 for (int t = 0; morphsValid && t < targetCount; ++t) {
                     MorphTarget& mt = meshMorphs[(size_t)t];
                     // POSITION absent = zero displacement (spec-legal: a target may
-                    // displace normals only). Deltas are raw model-space like the
-                    // skinned vertex path — never baked with the node transform.
+                    // displace normals only). Deltas read raw here; rigid nodes bake
+                    // the world transform in at attach time (TransformMorphDeltas
+                    // below) to match the world-baked base vertices.
                     std::vector<vec3> deltas(vertices.size(), vec3(0.0f));
                     if (auto dIt = prim.targets[t].find("POSITION");
                         dIt != prim.targets[t].end() &&
@@ -617,8 +618,18 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
                     mt.positionDeltas.insert(mt.positionDeltas.end(), deltas.begin(),
                                              deltas.end());
                     if (auto nIt = prim.targets[t].find("NORMAL");
-                        nIt != prim.targets[t].end() &&
-                        ReadMorphDeltas(model, nIt->second, vertices.size(), deltas)) {
+                        nIt != prim.targets[t].end()) {
+                        // Present-but-unreadable is corrupt, not absent: drop the
+                        // morphs like the POSITION path rather than silently losing
+                        // this target's normal displacement.
+                        if (!ReadMorphDeltas(model, nIt->second, vertices.size(), deltas)) {
+                            FORGE_WARN("glTF: unreadable morph NORMAL deltas (target %d, mesh "
+                                       "\"%s\") — morphs dropped",
+                                       t, gltfMesh.name.c_str());
+                            morphsValid = false;
+                            meshMorphs.clear();
+                            break;
+                        }
                         // Zero-fill the ranges of earlier primitives that lacked
                         // normal deltas so the optional array stays parallel.
                         mt.normalDeltas.resize(vertexBase, vec3(0.0f));
@@ -663,6 +674,13 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             for (MorphTarget& mt : meshMorphs)
                 if (!mt.normalDeltas.empty())
                     mt.normalDeltas.resize(vertexCount, vec3(0.0f));
+            // Rigid nodes bake `world` into the base vertices (and normalMat into
+            // the normals), so the deltas must ride the same transform — otherwise
+            // ApplyDeform sums a model-space delta onto a world-baked base and the
+            // morph displaces in the wrong direction/scale. Skinned meshes read
+            // vertices raw (world forced identity above), so they skip this.
+            if (!skinned)
+                TransformMorphDeltas(meshMorphs, mat3(world), normalMat);
             // Names ride on mesh.extras.targetNames (Blender/three.js convention,
             // not spec) — ARKit-style face rigs resolve set_expression through them.
             for (size_t t = 0; t < meshMorphs.size(); ++t) {

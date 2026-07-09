@@ -178,6 +178,37 @@ void TestMorphNormals()
     CHECK(ApproxVec3(out[0].normal, {0, 0.5f, 0.5f}));
 }
 
+// --- 3b. rigid-node delta bake -------------------------------------------------------
+// Rigid glTF nodes bake their world transform into the base vertices at import, so
+// TransformMorphDeltas must carry the deltas the same way: positions by the linear
+// part, normal deltas by the inverse-transpose. Pin exact values under a 90° Z
+// rotation composed with non-uniform scale (2,4,8) — all inverses power-of-two exact.
+void TestTransformMorphDeltas()
+{
+    const mat3 rot = mat3(glm::mat4_cast(glm::angleAxis(kHalfPi, vec3(0, 0, 1))));
+    const mat3 scale = mat3(glm::scale(mat4(1.0f), vec3(2, 4, 8)));
+    const mat3 positionXf = rot * scale;                              // world linear part
+    const mat3 normalXf = glm::transpose(glm::inverse(positionXf));  // = R * S^-1
+
+    std::vector<MorphTarget> targets = {
+        MakeTarget("t", {{1, 1, 1}, {1, 0, 0}}, {{1, 1, 1}, {0, 1, 0}}),
+    };
+    TransformMorphDeltas(targets, positionXf, normalXf);
+
+    // Positions: S first (2,4,8), then Rz90 maps (x,y) -> (-y,x).
+    CHECK(ApproxVec3(targets[0].positionDeltas[0], {-4, 2, 8}, 1e-5f));
+    CHECK(ApproxVec3(targets[0].positionDeltas[1], {0, 2, 0}, 1e-5f));
+    // Normals: S^-1 (0.5, 0.25, 0.125), then Rz90 — raw, NOT renormalized.
+    CHECK(ApproxVec3(targets[0].normalDeltas[0], {-0.25f, 0.5f, 0.125f}, 1e-5f));
+    CHECK(ApproxVec3(targets[0].normalDeltas[1], {-0.25f, 0, 0}, 1e-5f));
+
+    // Identity transforms leave the deltas bit-exact (the skinned-import path).
+    std::vector<MorphTarget> identity = {MakeTarget("i", {{0.5f, -1, 2}}, {{0, 1, 0}})};
+    TransformMorphDeltas(identity, mat3(1.0f), mat3(1.0f));
+    CHECK(ExactVec3(identity[0].positionDeltas[0], {0.5f, -1, 2}));
+    CHECK(ExactVec3(identity[0].normalDeltas[0], {0, 1, 0}));
+}
+
 // --- 4. morph-then-skin composite (acceptance-critical) ----------------------------
 // glTF normative order: p' = skinMat * (base + Σ w·δ). Pin the correct order by
 // hand-computing the expectation AND asserting the swapped order differs.
@@ -215,6 +246,43 @@ void TestMorphThenSkinComposite()
     SkinVertices(bind, skin, palette, skinnedFirst);
     MorphVertices(skinnedFirst, targets, weights, wrong);
     CHECK(!ApproxVec3(wrong[0].position, expected));
+}
+
+// --- 4b. pass-through vertices normalize morphed normals -----------------------------
+// The importer tolerates skinned primitives missing JOINTS_0/WEIGHTS_0 (weight-0
+// entries), and SkinVertices passes those vertices through. With an active
+// normal-delta morph the pass-through source carries a raw delta sum — the kernel
+// must still ship a unit normal to the VBO.
+void TestPassThroughNormalizesMorphedNormal()
+{
+    Skeleton sk = MakeTwoJointChain();
+    std::vector<mat4> globals = ComputeBindGlobals(sk);
+    std::vector<mat4> palette = ComputePalette(globals, sk.inverseBind);
+
+    std::vector<Vertex> bind = {
+        MakeVert({0, 0.5f, 0}, {0, 0, 1}), // weight-0: importer pass-through vertex
+        MakeVert({0, 1.5f, 0}, {0, 0, 1}), // 100% child, for contrast
+    };
+    std::vector<VertexSkin> skin = {
+        MakeSkin({0, 0, 0, 0}, {0, 0, 0, 0}),
+        MakeSkin({1, 0, 0, 0}, {1, 0, 0, 0}),
+    };
+    // Normal delta (0,3,0) at w=1: raw morphed sum (0,3,1), length sqrt(10).
+    std::vector<MorphTarget> targets =
+        {MakeTarget("n", {{0, 0, 0}, {0, 0, 0}}, {{0, 3, 0}, {0, 3, 0}})};
+
+    std::vector<Vertex> morphed, out;
+    MorphVertices(bind, targets, {1.0f}, morphed);
+    SkinVertices(morphed, skin, palette, out);
+
+    // Both the pass-through and the weighted vertex come out unit-length, along
+    // the normalized sum direction.
+    const vec3 unit = glm::normalize(vec3(0, 3, 1));
+    CHECK(ApproxEq(glm::length(out[0].normal), 1.0f, 1e-5f));
+    CHECK(ApproxVec3(out[0].normal, unit, 1e-5f));
+    CHECK(ApproxVec3(out[1].normal, unit, 1e-5f));
+    // Pass-through position stays at the morphed source.
+    CHECK(ApproxVec3(out[0].position, morphed[0].position));
 }
 
 // --- 5. sparse overlay ---------------------------------------------------------------
@@ -424,7 +492,9 @@ void RunMorphTests()
     TestMorphKernelBasics();
     TestMorphWeightCounts();
     TestMorphNormals();
+    TestTransformMorphDeltas();
     TestMorphThenSkinComposite();
+    TestPassThroughNormalizesMorphedNormal();
     TestSparseOverlay();
     TestMorphSerializationRoundTrip();
     TestMorphBlobGuards();

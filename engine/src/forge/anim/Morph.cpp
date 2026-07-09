@@ -28,6 +28,17 @@ void MorphVertices(const std::vector<Vertex>& bind, const std::vector<MorphTarge
     }
 }
 
+void TransformMorphDeltas(std::vector<MorphTarget>& targets, const mat3& positionXf,
+                          const mat3& normalXf)
+{
+    for (MorphTarget& target : targets) {
+        for (vec3& d : target.positionDeltas)
+            d = positionXf * d;
+        for (vec3& d : target.normalDeltas)
+            d = normalXf * d;
+    }
+}
+
 bool ApplySparseOverlay(std::vector<vec3>& base, const uint8_t* indicesData,
                         int indicesComponentType, const uint8_t* valuesData, size_t sparseCount)
 {

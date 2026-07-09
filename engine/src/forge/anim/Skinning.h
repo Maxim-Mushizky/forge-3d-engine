@@ -12,8 +12,10 @@ namespace forge {
 // Positions blend Σ w·palette[j]·p. Normals blend the PER-JOINT inverse
 // transposes — inverse-transposing the blended matrix is wrong under
 // non-uniform joint scale (unit-tested). UVs copy through. A zero weight sum
-// leaves the vertex at bind; out-of-range joint indices are dropped, never
-// read. out is resized to bind.size() and may alias bind.
+// leaves the vertex at the source position with its normal renormalized (the
+// source may be a morphed bind carrying a raw delta sum, #149); out-of-range
+// joint indices are dropped, never read. out is resized to bind.size() and may
+// alias bind.
 void SkinVertices(const std::vector<Vertex>& bind, const std::vector<VertexSkin>& skin,
                   const std::vector<mat4>& palette, std::vector<Vertex>& out);
 

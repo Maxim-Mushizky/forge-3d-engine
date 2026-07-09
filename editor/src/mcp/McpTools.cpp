@@ -1057,7 +1057,7 @@ void EditorApp::RegisterMcpTools()
         "bone toward forward_child) points at the target. Both #148: no degrees, all "
         "positions world-space; needs a skinned/imported model; one undo entry. "
         "set_morph{id, target='jawOpen' (a name from the asset's targetNames, or an "
-        "index), weight=0..1 (unclamped — negative/>1 extrapolate)} writes one morph-"
+        "index), weight=0..1 (unclamped — negative/>1 extrapolate, |w| <= 1e4)} writes one morph-"
         "target weight; set_expression{id, weights={jawOpen=0.5, mouthSmileLeft=1}, "
         "reset=bool} writes a batch (unknown names reject the whole call and the error "
         "lists the asset's targets — ARKit-52 names ride on the asset's targetNames, "
@@ -3235,6 +3235,13 @@ static int MorphTargetIndex(const std::vector<MorphTarget>& targets, const std::
     return found;
 }
 
+// Sane extrapolation bound for morph weights (#149 review). glTF permits any
+// value, but a merely-finite weight isn't enough: the PRODUCT w·δ must stay
+// finite too (the #167 failure class, multiplicative this time — 1e38 × a
+// 10-unit delta is Inf, poisoning positions and the AABB while returning ok).
+// 1e4 times any plausible delta is still comfortably finite float.
+constexpr float kMaxMorphWeight = 1e4f;
+
 // Comma-joined target names for error messages: the asset defines the vocabulary
 // (ARKit-52 or otherwise), so a failed lookup teaches the agent what exists.
 static std::string MorphTargetNames(const std::vector<MorphTarget>& targets)
@@ -3282,9 +3289,10 @@ ToolResult EditorApp::ToolSetMorph(const json& args)
     if (!args.contains("weight") || !args["weight"].is_number())
         return Err("Provide \"weight\" (0 = off, 1 = full; negative/>1 extrapolate)");
     const double weight = args["weight"].get<double>();
-    // A NaN/Inf weight would poison every morphed vertex while returning ok (#167).
-    if (!std::isfinite(weight) || std::fabs(weight) > (double)FLT_MAX)
-        return Err("\"weight\" must be a finite number");
+    // A NaN/Inf weight — or one whose product with the deltas overflows — would
+    // poison every morphed vertex while returning ok (#167, see kMaxMorphWeight).
+    if (!std::isfinite(weight) || std::fabs(weight) > (double)kMaxMorphWeight)
+        return Err("\"weight\" must be a finite number within ±10000");
 
     // --- mutate: COW the mesh if it is shared, then re-deform from bind ---
     std::vector<float> before = e->morphWeights;
@@ -3331,8 +3339,8 @@ ToolResult EditorApp::ToolSetExpression(const json& args)
         if (!value.is_number())
             return Err("Weight for \"" + name + "\" must be a number");
         const double w = value.get<double>();
-        if (!std::isfinite(w) || std::fabs(w) > (double)FLT_MAX)
-            return Err("Weight for \"" + name + "\" must be a finite number"); // #167 lesson
+        if (!std::isfinite(w) || std::fabs(w) > (double)kMaxMorphWeight) // #167 lesson
+            return Err("Weight for \"" + name + "\" must be a finite number within ±10000");
         resolved.emplace_back((size_t)index, (float)w);
     }
     if (resolved.empty() && !reset)
