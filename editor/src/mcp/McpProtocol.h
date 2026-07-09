@@ -25,6 +25,14 @@ struct ToolResult {
 // instead of committing garbage into transforms and meshes (#104).
 std::string NonFiniteArgPath(const nlohmann::json& args);
 
+// First top-level key of `args` that is not in `validKeys`; empty when every
+// key is accepted. Handlers read fields opportunistically (args.contains), so
+// a typo'd or renamed key was silently dropped — set_transform{translation=...}
+// "succeeded" while moving nothing. Rejecting up front turns that into a hard
+// script error instead (#170). Only top-level keys: nested sub-schemas
+// (spawn params.*, set_expression weights.*) stay the handler's business.
+std::string UnknownArgKey(const nlohmann::json& args, const std::vector<const char*>& validKeys);
+
 using ToolHandler = std::function<ToolResult(const nlohmann::json& args)>;
 // Async tools receive a responder they may store and call on a later frame
 // (e.g. an amortized path-traced render). Call it exactly once; extra calls

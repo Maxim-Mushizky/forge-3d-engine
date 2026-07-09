@@ -1,5 +1,6 @@
 #include "McpProtocol.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <exception>
@@ -75,6 +76,21 @@ std::string NonFiniteArgPath(const json& args)
     if (!FindNonFinite(args, path))
         return {};
     return path.empty() ? "<value>" : path; // bare non-finite scalar has no key
+}
+
+std::string UnknownArgKey(const json& args, const std::vector<const char*>& validKeys)
+{
+    if (!args.is_object())
+        return {};
+    // nlohmann objects iterate in key order, so "first unknown" is stable
+    // regardless of the order the script wrote the fields in.
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        const bool known = std::any_of(validKeys.begin(), validKeys.end(),
+                                       [&](const char* k) { return it.key() == k; });
+        if (!known)
+            return it.key();
+    }
+    return {};
 }
 
 ToolResult ToolResult::Text(std::string text, bool error)

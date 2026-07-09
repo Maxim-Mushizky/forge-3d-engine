@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 // Exercises the GL-free MCP protocol kernel: JSON-RPC 2.0 framing, lifecycle,
 // tool/resource dispatch, and the error taxonomy (protocol errors vs isError
@@ -196,6 +197,29 @@ void TestNonFiniteArgPath()
     CHECK(!NonFiniteArgPath(json{{"a", deep}}).empty());
 }
 
+void TestUnknownArgKey()
+{
+    const std::vector<const char*> keys{"id", "name", "position", "rotationDeg", "scale"};
+
+    // Every key accepted — including the empty table (all fields optional).
+    CHECK(UnknownArgKey(json::object(), keys).empty());
+    CHECK(UnknownArgKey(json{{"id", "1"}, {"scale", {2, 2, 2}}}, keys).empty());
+    CHECK(UnknownArgKey(json{{"position", {0, 1, 0}}, {"rotationDeg", {0, 90, 0}}}, keys).empty());
+
+    // The bug this guards against (#170): a plausible-but-wrong field name is
+    // reported instead of silently dropped next to a valid one.
+    CHECK(UnknownArgKey(json{{"id", "1"}, {"translation", {1, 2, 3}}, {"scale", {2, 2, 2}}},
+                        keys) == "translation");
+
+    // First-unknown is deterministic: nlohmann objects iterate in key order,
+    // not insertion order.
+    CHECK(UnknownArgKey(json{{"zzz", 1}, {"aaa", 2}}, keys) == "aaa");
+
+    // An empty valid list rejects every key (zero-argument verbs like scene).
+    CHECK(UnknownArgKey(json{{"id", "1"}}, {}) == "id");
+    CHECK(UnknownArgKey(json::object(), {}).empty());
+}
+
 void TestWireCannotSmuggleNonFinite()
 {
     // The nlohmann lexer refuses NaN/Inf and double-overflow literals like
@@ -332,6 +356,7 @@ void RunMcpTests()
     TestMissingToolNameIsProtocolError();
     TestThrowingToolBecomesIsErrorResult();
     TestNonFiniteArgPath();
+    TestUnknownArgKey();
     TestWireCannotSmuggleNonFinite();
     TestResourcesListAndRead();
     TestUnknownResourceError();

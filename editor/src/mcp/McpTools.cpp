@@ -1009,8 +1009,11 @@ void EditorApp::RegisterMcpTools()
         "revolved around local +Y}, sectors, closed} and primitive='sweep' "
         "params={profile={{x,y},...} closed section, path={{x,y,z},...}} — crisp cups/"
         "vases/legs/handles instead of sphere-pushing; a +z path maps section (x,y) to "
-        "world (x,y), #138), delete{}, "
-        "duplicate{}, rename{}, set_transform{}, set_parent{}, set_material{slot for "
+        "world (x,y), #138; scale = FULL extent, not radius: unit primitives are "
+        "cube side 1, sphere diameter 1, cylinder diameter 1 x height 1, so an "
+        "ellipsoid of radii (a,b,c) needs scale={2a,2b,2c}), delete{}, "
+        "duplicate{}, rename{}, set_transform{position, rotationDeg, scale}, "
+        "set_parent{}, set_material{slot for "
         "multi-material meshes; subsurface/subsurfaceColor/subsurfaceRadius = SSS, #112}, "
         "set_texture{slot='albedo'|'roughness', source=file path "
         "or procedural recipe {kind='checker'|'stripes'|'gradient'|'noise'|'wood', colorA, "
@@ -1068,6 +1071,9 @@ void EditorApp::RegisterMcpTools()
         "Entity writes return the affected entity as a table (use .id); camera/"
         "selection/element/export calls return their own shapes. "
         "print() lines and the script's return value come back in the result. "
+        "Unknown top-level keys in any forge.* call are hard errors naming the "
+        "valid keys — misspelled fields fail the script instead of being "
+        "silently dropped (#170). "
         "The whole script is ONE undo entry; on error the partial build rolls "
         "back (sun/environment/camera/snap-settings changes and written files "
         "excepted). Sandboxed: no os/io/require; runaway loops and memory "
@@ -4211,9 +4217,23 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
 
     // Each forge.* function re-enters an existing tool handler with the same
     // JSON contract; an isError result becomes a Lua error (aborting the
-    // script), a JSON result comes back as a table.
-    auto call = [this](ToolResult (EditorApp::*handler)(const json&), const char* action) {
-        return [this, handler, action](const json& fnArgs) -> json {
+    // script), a JSON result comes back as a table. `keys` is the verb's full
+    // top-level argument surface: handlers read fields opportunistically, so
+    // without the strict check a typo'd key was silently dropped —
+    // set_transform{translation=...} "succeeded" while moving nothing (#170).
+    auto call = [this](ToolResult (EditorApp::*handler)(const json&), const char* action,
+                       std::vector<const char*> keys) {
+        return [this, handler, action, keys = std::move(keys)](const json& fnArgs) -> json {
+            // Checked on the raw user args, before the action injection below
+            // — query_spatial is the one verb whose user surface includes
+            // "action", and it carries the key in its own list.
+            if (const std::string bad = UnknownArgKey(fnArgs, keys); !bad.empty()) {
+                std::string valid;
+                for (const char* k : keys)
+                    valid += (valid.empty() ? "" : ", ") + std::string(k);
+                throw std::runtime_error("unknown key '" + bad + "' (valid: " +
+                                         (valid.empty() ? "none" : valid) + ")");
+            }
             json a = fnArgs;
             if (action)
                 a["action"] = action;
@@ -4235,79 +4255,134 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         };
     };
 
+    // Key lists mirror exactly what each handler reads (the handler is the
+    // source of truth) — extend both together when a verb grows a field.
     auto installBindings = [&](const ScriptInstall& add) {
-        add("scene", call(&EditorApp::ToolGetScene, nullptr));
-        add("get_entity", call(&EditorApp::ToolGetEntity, nullptr));
-        add("mesh_stats", call(&EditorApp::ToolGetMeshStats, nullptr));
-        add("raycast", call(&EditorApp::ToolRaycast, nullptr));
-        add("check_overlap", call(&EditorApp::ToolCheckOverlap, nullptr));
-        add("query_spatial", call(&EditorApp::ToolQuerySpatial, nullptr));
-        add("measure", call(&EditorApp::ToolMeasure, nullptr)); // #114
-        add("compare_silhouette", call(&EditorApp::ToolCompareSilhouette, nullptr)); // #114: numbers only
-        add("analyze_reference", call(&EditorApp::ToolAnalyzeReference, nullptr)); // #135: numbers only
+        add("scene", call(&EditorApp::ToolGetScene, nullptr, {}));
+        add("get_entity", call(&EditorApp::ToolGetEntity, nullptr, {"id", "name"}));
+        add("mesh_stats", call(&EditorApp::ToolGetMeshStats, nullptr, {"id", "name"}));
+        add("raycast", call(&EditorApp::ToolRaycast, nullptr, {"origin", "direction", "u", "v"}));
+        add("check_overlap", call(&EditorApp::ToolCheckOverlap, nullptr,
+                                  {"id", "name", "otherId", "otherName"}));
+        add("query_spatial", call(&EditorApp::ToolQuerySpatial, nullptr,
+                                  {"action", "radius", "point", "id", "name", "height", "x", "z"}));
+        add("measure", call(&EditorApp::ToolMeasure, nullptr,
+                            {"a", "b", "entity", "id", "name", "axis"})); // #114
+        add("compare_silhouette",
+            call(&EditorApp::ToolCompareSilhouette, nullptr,
+                 {"id", "name", "view", "reference", "references", "threshold",
+                  "size"})); // #114: numbers only
+        add("analyze_reference",
+            call(&EditorApp::ToolAnalyzeReference, nullptr,
+                 {"image", "maxPoints", "tolerancePx", "mirror", "spanRows"})); // #135: numbers only
 
-        add("spawn", call(&EditorApp::ToolManageEntity, "spawn"));
-        add("delete", call(&EditorApp::ToolManageEntity, "delete"));
-        add("duplicate", call(&EditorApp::ToolManageEntity, "duplicate"));
-        add("rename", call(&EditorApp::ToolManageEntity, "rename"));
-        add("set_transform", call(&EditorApp::ToolManageEntity, "set_transform"));
-        add("set_parent", call(&EditorApp::ToolManageEntity, "set_parent"));
+        add("spawn", call(&EditorApp::ToolManageEntity, "spawn",
+                          {"primitive", "params", "name", "position", "rotationDeg", "scale",
+                           "albedo"}));
+        add("delete", call(&EditorApp::ToolManageEntity, "delete", {"id", "name"}));
+        add("duplicate", call(&EditorApp::ToolManageEntity, "duplicate", {"id", "name"}));
+        add("rename", call(&EditorApp::ToolManageEntity, "rename", {"id", "name", "newName"}));
+        add("set_transform", call(&EditorApp::ToolManageEntity, "set_transform",
+                                  {"id", "name", "position", "rotationDeg", "scale"}));
+        add("set_parent", call(&EditorApp::ToolManageEntity, "set_parent",
+                               {"id", "name", "parentId", "parentName"}));
 
-        add("set_material", call(&EditorApp::ToolManageMaterial, nullptr));
-        add("set_texture", call(&EditorApp::ToolSetTexture, nullptr));
-        add("spawn_point_light", call(&EditorApp::ToolManageLight, "spawn_point"));
-        add("set_point_light", call(&EditorApp::ToolManageLight, "set_point"));
-        add("set_sun", call(&EditorApp::ToolManageLight, "set_sun"));
-        add("set_environment", call(&EditorApp::ToolManageLight, "set_environment"));
+        add("set_material", call(&EditorApp::ToolManageMaterial, nullptr,
+                                 {"id", "name", "slot", "albedo", "metallic", "roughness",
+                                  "emissive", "emissiveStrength", "transmission", "ior",
+                                  "subsurface", "subsurfaceColor", "subsurfaceRadius",
+                                  "albedoTexture"}));
+        add("set_texture", call(&EditorApp::ToolSetTexture, nullptr,
+                                {"id", "name", "materialSlot", "slot", "clear", "source"}));
+        add("spawn_point_light", call(&EditorApp::ToolManageLight, "spawn_point",
+                                      {"position", "color", "intensity", "range"}));
+        add("set_point_light", call(&EditorApp::ToolManageLight, "set_point",
+                                    {"id", "name", "enabled", "color", "intensity", "range"}));
+        add("set_sun", call(&EditorApp::ToolManageLight, "set_sun",
+                            {"azimuthDeg", "elevationDeg", "intensity", "color"}));
+        add("set_environment", call(&EditorApp::ToolManageLight, "set_environment",
+                                    {"hdriPath", "intensity", "rotationDeg"}));
 
-        add("subdivide", call(&EditorApp::ToolEditMesh, "subdivide"));
-        add("smooth", call(&EditorApp::ToolEditMesh, "smooth"));
-        add("boolean", call(&EditorApp::ToolEditMesh, "boolean"));
-        add("remesh", call(&EditorApp::ToolEditMesh, "remesh"));
-        add("mirror", call(&EditorApp::ToolEditMesh, "mirror"));
-        add("extrude_face", call(&EditorApp::ToolEditMesh, "extrude_face"));
-        add("unwrap_uv", call(&EditorApp::ToolEditMesh, "unwrap_uv"));
+        add("subdivide", call(&EditorApp::ToolEditMesh, "subdivide", {"id", "name", "keepShape"}));
+        add("smooth", call(&EditorApp::ToolEditMesh, "smooth",
+                           {"id", "name", "strength", "iterations"}));
+        add("boolean", call(&EditorApp::ToolEditMesh, "boolean",
+                            {"id", "name", "otherId", "otherName", "op"}));
+        add("remesh", call(&EditorApp::ToolEditMesh, "remesh", {"id", "name", "detail"}));
+        add("mirror", call(&EditorApp::ToolEditMesh, "mirror", {"id", "name"}));
+        add("extrude_face", call(&EditorApp::ToolEditMesh, "extrude_face",
+                                 {"id", "name", "distance", "origin", "direction", "u", "v"}));
+        add("unwrap_uv", call(&EditorApp::ToolEditMesh, "unwrap_uv",
+                              {"id", "name", "resolution"}));
 
-        add("place_relative", call(&EditorApp::ToolPlaceRelative, nullptr));
-        add("snap_to_surface", call(&EditorApp::ToolSnapToSurface, nullptr));
-        add("align", call(&EditorApp::ToolArrangeEntities, "align"));
-        add("distribute", call(&EditorApp::ToolArrangeEntities, "distribute"));
+        add("place_relative", call(&EditorApp::ToolPlaceRelative, nullptr,
+                                   {"id", "name", "otherId", "otherName", "relation", "clearance",
+                                    "side", "count", "ids", "names"}));
+        add("snap_to_surface", call(&EditorApp::ToolSnapToSurface, nullptr,
+                                    {"id", "name", "direction", "clearance"}));
+        add("align", call(&EditorApp::ToolArrangeEntities, "align",
+                          {"ids", "names", "axis", "mode", "target"}));
+        add("distribute", call(&EditorApp::ToolArrangeEntities, "distribute",
+                               {"ids", "names", "axis", "spacing"}));
 
-        add("look_at", call(&EditorApp::ToolManageScene, "look_at"));
-        add("set_render_settings", call(&EditorApp::ToolManageScene, "set_render_settings"));
+        add("look_at", call(&EditorApp::ToolManageScene, "look_at",
+                            {"point", "id", "name", "distance"}));
+        add("set_render_settings", call(&EditorApp::ToolManageScene, "set_render_settings",
+                                        {"rayTracing", "bounces", "rtScale", "denoise",
+                                         "denoiseStrength", "aperture", "focusDist"}));
 
         // #91: extended editor surface — script-only, no top-level MCP tools.
-        add("camera", call(&EditorApp::ToolCameraOp, "get"));
-        add("set_camera", call(&EditorApp::ToolCameraOp, "set"));
-        add("store_view", call(&EditorApp::ToolCameraOp, "store"));
-        add("recall_view", call(&EditorApp::ToolCameraOp, "recall"));
+        add("camera", call(&EditorApp::ToolCameraOp, "get", {}));
+        add("set_camera", call(&EditorApp::ToolCameraOp, "set",
+                               {"focalPoint", "distance", "pitchDeg", "yawDeg", "fovDeg",
+                                "orthographic"}));
+        add("store_view", call(&EditorApp::ToolCameraOp, "store", {"slot"}));
+        add("recall_view", call(&EditorApp::ToolCameraOp, "recall", {"slot"}));
 
-        add("select", call(&EditorApp::ToolSelectOp, "select"));
-        add("toggle_select", call(&EditorApp::ToolSelectOp, "toggle"));
-        add("clear_selection", call(&EditorApp::ToolSelectOp, "clear"));
-        add("get_selection", call(&EditorApp::ToolSelectOp, "get"));
-        add("box_select", call(&EditorApp::ToolSelectOp, "box"));
+        add("select", call(&EditorApp::ToolSelectOp, "select", {"id", "name"}));
+        add("toggle_select", call(&EditorApp::ToolSelectOp, "toggle", {"id", "name"}));
+        add("clear_selection", call(&EditorApp::ToolSelectOp, "clear", {}));
+        add("get_selection", call(&EditorApp::ToolSelectOp, "get", {}));
+        add("box_select", call(&EditorApp::ToolSelectOp, "box", {"min", "max", "additive"}));
 
-        add("group", call(&EditorApp::ToolSceneStructure, "group"));
-        add("ungroup", call(&EditorApp::ToolSceneStructure, "ungroup"));
-        add("drop_to_ground", call(&EditorApp::ToolSceneStructure, "drop_to_ground"));
-        add("snap_settings", call(&EditorApp::ToolSnapSettings, nullptr));
+        add("group", call(&EditorApp::ToolSceneStructure, "group", {"ids", "names"}));
+        add("ungroup", call(&EditorApp::ToolSceneStructure, "ungroup", {"id", "name"}));
+        add("drop_to_ground", call(&EditorApp::ToolSceneStructure, "drop_to_ground",
+                                   {"ids", "names", "id", "name"}));
+        add("snap_settings", call(&EditorApp::ToolSnapSettings, nullptr,
+                                  {"enabled", "translate", "rotateDeg", "scale"}));
 
-        add("mesh_elements", call(&EditorApp::ToolMeshElements, nullptr));
-        add("sculpt", call(&EditorApp::ToolSculpt, "sculpt"));
-        add("move_verts", call(&EditorApp::ToolSculpt, "move_verts"));
-        add("set_pose", call(&EditorApp::ToolSetPose, nullptr));
-        add("pose_ik", call(&EditorApp::ToolPoseIk, nullptr));   // #148
-        add("pose_aim", call(&EditorApp::ToolPoseAim, nullptr)); // #148
-        add("set_morph", call(&EditorApp::ToolSetMorph, nullptr));           // #149
-        add("set_expression", call(&EditorApp::ToolSetExpression, nullptr)); // #149
-        add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces"));
-        add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges"));
-        add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces"));
-        add("subdivide_edges", call(&EditorApp::ToolEditElements, "subdivide_edges"));
-        add("shade", call(&EditorApp::ToolEditElements, "shade"));
+        add("mesh_elements", call(&EditorApp::ToolMeshElements, nullptr,
+                                  {"id", "name", "kind", "ofFaces", "point", "radius",
+                                   "maxCount"}));
+        add("sculpt", call(&EditorApp::ToolSculpt, "sculpt",
+                           {"id", "name", "center", "radius", "strokes", "mirror", "snap",
+                            "relax", "brush", "strength", "direction"}));
+        add("move_verts", call(&EditorApp::ToolSculpt, "move_verts",
+                               {"id", "name", "point", "radius", "strokes", "mirror", "snap",
+                                "relax", "falloff", "strength", "offset"}));
+        add("set_pose", call(&EditorApp::ToolSetPose, nullptr,
+                             {"id", "name", "preset", "joint", "quat", "euler"}));
+        add("pose_ik", call(&EditorApp::ToolPoseIk, nullptr,
+                            {"id", "name", "joints", "target", "pole"})); // #148
+        add("pose_aim", call(&EditorApp::ToolPoseAim, nullptr,
+                             {"id", "name", "joint", "forward_child", "target", "up"})); // #148
+        add("set_morph", call(&EditorApp::ToolSetMorph, nullptr,
+                              {"id", "name", "target", "weight"})); // #149
+        add("set_expression", call(&EditorApp::ToolSetExpression, nullptr,
+                                   {"id", "name", "weights", "reset"})); // #149
+        add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces",
+                                  {"id", "name", "ids", "distance"}));
+        add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges",
+                                  {"id", "name", "ids", "distance"}));
+        add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces",
+                                    {"id", "name", "ids"}));
+        add("subdivide_edges", call(&EditorApp::ToolEditElements, "subdivide_edges",
+                                    {"id", "name", "ids"}));
+        add("shade", call(&EditorApp::ToolEditElements, "shade", {"id", "name", "smooth"}));
 
-        add("export_stl", call(&EditorApp::ToolExportStl, nullptr));
+        add("export_stl", call(&EditorApp::ToolExportStl, nullptr,
+                               {"path", "ids", "names", "scale"}));
     };
 
     // Nothing may escape between BeginBatch and EndBatch: a leaked open batch
