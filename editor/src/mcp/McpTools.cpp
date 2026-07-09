@@ -5,6 +5,7 @@
 #include "mcp/McpSculpt.h"
 #include "mcp/McpViews.h"
 
+#include <forge/anim/Ik.h>
 #include <forge/anim/Pose.h>
 #include <forge/anim/PosePresets.h>
 #include <forge/anim/Skeleton.h>
@@ -1036,6 +1037,17 @@ void EditorApp::RegisterMcpTools()
         "set_pose{id, preset='rest'|'t-pose'|'a-pose'|'sit'} applies a canned pose to "
         "matching joints; undo stores only the pose, and the path tracer re-skins after "
         "the settle. "
+        "pose_ik{id, joints={'root','mid','end'} (e.g. shoulder/elbow/wrist joint names; "
+        "root must be an ancestor of mid, mid of end), target=[x,y,z] WORLD space, "
+        "pole=[x,y,z] WORLD (optional bend hint — which way the elbow points; defaults to "
+        "the mid joint's current position) } solves two-bone IK so the end joint reaches "
+        "the target; out-of-reach targets clamp to full extension (returns reached=false), "
+        "writes only the root+mid joints. "
+        "pose_aim{id, joint='Head', target=[x,y,z] WORLD, up=[x,y,z] WORLD (optional twist "
+        "reference), forward_child='Neck' (optional child joint naming the forward axis; "
+        "defaults to the joint's first child) } rotates one joint so its forward axis (the "
+        "bone toward forward_child) points at the target. Both #148: no degrees, all "
+        "positions world-space; needs a skinned/imported model; one undo entry. "
         "export_stl{}. "
         "Entity writes return the affected entity as a table (use .id); camera/"
         "selection/element/export calls return their own shapes. "
@@ -3012,6 +3024,175 @@ ToolResult EditorApp::ToolSetPose(const json& args)
     return JsonResult(out);
 }
 
+// #148: analytic two-bone IK. forge.pose_ik drives an end joint (wrist/ankle) onto a
+// world-space target by solving the root+mid rotations; the pole vector picks the bend
+// side. Rides set_pose's plumbing: validate-then-mutate, COW, re-skin, one SetPoseCommand.
+ToolResult EditorApp::ToolPoseIk(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->skeleton)
+        return Err("Entity has no skeleton (import a skinned model first)");
+    if (!e->mesh || !e->mesh->HasSkin())
+        return Err("Entity mesh carries no skin data");
+    const Skeleton& sk = *e->skeleton;
+
+    if (!args.contains("joints") || !args["joints"].is_array() || args["joints"].size() != 3)
+        return Err("Provide \"joints\" = [root, mid, end] (three joint names)");
+    IkChain chain;
+    int* slot[3] = {&chain.root, &chain.mid, &chain.end};
+    std::string names[3];
+    for (int i = 0; i < 3; ++i) {
+        if (!args["joints"][i].is_string())
+            return Err("\"joints\" must be three joint-name strings");
+        names[i] = args["joints"][i].get<std::string>();
+        const int j = JointIndex(sk, names[i]);
+        if (j < 0)
+            return Err("No joint named \"" + names[i] + "\" in this skeleton");
+        *slot[i] = j;
+    }
+    // Ancestry: root above mid above end. Walk parents so the message names the pair.
+    auto isAncestor = [&](int anc, int node) {
+        for (int p = sk.parents[(size_t)node]; p >= 0; p = sk.parents[(size_t)p])
+            if (p == anc)
+                return true;
+        return false;
+    };
+    if (!isAncestor(chain.root, chain.mid))
+        return Err("Joint \"" + names[0] + "\" is not an ancestor of \"" + names[1] + "\"");
+    if (!isAncestor(chain.mid, chain.end))
+        return Err("Joint \"" + names[1] + "\" is not an ancestor of \"" + names[2] + "\"");
+
+    // World targets in, model space to the solver: transform as POINTS with the full
+    // inverse so non-uniform entity scale is honoured (direction normalize happens inside).
+    vec3 targetWorld;
+    if (!GetVec3(args, "target", targetWorld))
+        return Err("Provide \"target\" = [x,y,z] in world space");
+    const mat4 toModel = glm::inverse(m_Scene.WorldTransform(e->id));
+    const vec3 targetModel = vec3(toModel * vec4(targetWorld, 1.0f));
+
+    vec3 poleModel;
+    vec3 poleWorld;
+    if (GetVec3(args, "pole", poleWorld)) {
+        poleModel = vec3(toModel * vec4(poleWorld, 1.0f));
+    } else {
+        // Default: the mid joint's current model-space position — an off-axis bend hint.
+        std::vector<quat> r = PoseLocalRotations(sk, e->pose);
+        std::vector<mat4> g = ComputeGlobalTransforms(sk, sk.bindT, r, sk.bindS);
+        poleModel = vec3(g[(size_t)chain.mid][3]);
+    }
+
+    Pose before = e->pose;
+    Pose next = e->pose;
+    if (!SolveTwoBoneIk(sk, next, chain, targetModel, poleModel))
+        return Err("IK solve failed (degenerate chain, zero-length bone, or bad joints)");
+
+    // reached=false means the target was out of reach and the chain clamped to it.
+    std::vector<quat> rr = PoseLocalRotations(sk, next);
+    std::vector<mat4> gg = ComputeGlobalTransforms(sk, sk.bindT, rr, sk.bindS);
+    const bool reached = glm::length(vec3(gg[(size_t)chain.end][3]) - targetModel) <=
+                         1e-3f; // model units — the world-space tolerance scales with the entity
+
+    if (e->mesh.use_count() > 1) {
+        std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh);
+        if (priv)
+            e->mesh = std::move(priv);
+    }
+    e->pose = std::move(next);
+    ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, std::move(before), e->pose));
+
+    json out = EntityJson(m_Scene, *e);
+    out["joints"] = args["joints"];
+    out["reached"] = reached;
+    out["jointCount"] = (uint64_t)sk.JointCount();
+    return JsonResult(out);
+}
+
+// #148: single-joint aim. forge.pose_aim points a joint's forward axis (the bone
+// toward forward_child) at a world-space target; an optional up hint fixes the twist.
+ToolResult EditorApp::ToolPoseAim(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->skeleton)
+        return Err("Entity has no skeleton (import a skinned model first)");
+    if (!e->mesh || !e->mesh->HasSkin())
+        return Err("Entity mesh carries no skin data");
+    const Skeleton& sk = *e->skeleton;
+
+    const std::string jointName = args.value("joint", "");
+    if (jointName.empty())
+        return Err("Provide \"joint\" (name)");
+    const int joint = JointIndex(sk, jointName);
+    if (joint < 0)
+        return Err("No joint named \"" + jointName + "\" in this skeleton");
+
+    // Forward axis = the bone toward forward_child; default to the joint's first child.
+    int forwardChild = -1;
+    const std::string childName = args.value("forward_child", "");
+    if (!childName.empty()) {
+        forwardChild = JointIndex(sk, childName);
+        if (forwardChild < 0)
+            return Err("No joint named \"" + childName + "\" in this skeleton");
+    } else {
+        for (size_t i = 0; i < sk.JointCount(); ++i)
+            if (sk.parents[i] == joint) {
+                forwardChild = (int)i;
+                break;
+            }
+        if (forwardChild < 0)
+            return Err("Joint \"" + jointName +
+                       "\" is a leaf — provide \"forward_child\" to define the forward axis");
+    }
+    // The forward axis is a real bone only if the child hangs below the joint; a
+    // parent/sibling would aim along nothing (kernel rejects it too, namelessly).
+    bool descends = false;
+    for (int p = sk.parents[(size_t)forwardChild]; p >= 0; p = sk.parents[(size_t)p])
+        if (p == joint) {
+            descends = true;
+            break;
+        }
+    if (!descends)
+        return Err("\"" + sk.names[(size_t)forwardChild] + "\" is not a descendant of \"" +
+                   jointName + "\"");
+
+    vec3 targetWorld;
+    if (!GetVec3(args, "target", targetWorld))
+        return Err("Provide \"target\" = [x,y,z] in world space");
+    const mat4 toModel = glm::inverse(m_Scene.WorldTransform(e->id));
+    const vec3 targetModel = vec3(toModel * vec4(targetWorld, 1.0f));
+
+    std::optional<vec3> upModel;
+    vec3 upWorld;
+    if (GetVec3(args, "up", upWorld))
+        upModel = vec3(toModel * vec4(upWorld, 0.0f)); // twist reference: a direction (w=0)
+
+    Pose before = e->pose;
+    Pose next = e->pose;
+    if (!SolveAim(sk, next, joint, forwardChild, targetModel, upModel))
+        return Err("Aim solve failed (target on the joint, zero-length bone, or bad joints)");
+
+    if (e->mesh.use_count() > 1) {
+        std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh);
+        if (priv)
+            e->mesh = std::move(priv);
+    }
+    e->pose = std::move(next);
+    ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, std::move(before), e->pose));
+
+    json out = EntityJson(m_Scene, *e);
+    out["joint"] = jointName;
+    out["forwardChild"] = sk.names[(size_t)forwardChild];
+    out["jointCount"] = (uint64_t)sk.JointCount();
+    return JsonResult(out);
+}
+
 ToolResult EditorApp::ToolExportStl(const json& args)
 {
     const std::string path = args.value("path", "");
@@ -3941,6 +4122,8 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("sculpt", call(&EditorApp::ToolSculpt, "sculpt"));
         add("move_verts", call(&EditorApp::ToolSculpt, "move_verts"));
         add("set_pose", call(&EditorApp::ToolSetPose, nullptr));
+        add("pose_ik", call(&EditorApp::ToolPoseIk, nullptr));   // #148
+        add("pose_aim", call(&EditorApp::ToolPoseAim, nullptr)); // #148
         add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces"));
         add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges"));
         add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces"));
