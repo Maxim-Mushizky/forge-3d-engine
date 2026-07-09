@@ -163,6 +163,39 @@ void TestDegeneratePole()
     const bool ok = SolveTwoBoneIk(sk, pose, {0, 1, 2}, vec3(1, 1, 0), vec3(0.5f, 0.5f, 0));
     CHECK(ok);
     CHECK(PoseFinite(pose));
+    // The fallback plane must still be a working plane: the reachable target is hit.
+    CHECK(ApproxVec3(Positions(sk, pose)[2], vec3(1, 1, 0)));
+}
+
+// --- 6b. polyline chain: joints BETWEEN root/mid/end ride along rigidly ----------
+void TestPolylineChain()
+{
+    // 5 unit segments along +Y; the chain skips every other joint ({0,2,4}), and the
+    // ride-along joints carry pre-existing bends — the chord-length math must hold.
+    Skeleton sk = MakeChain({-1, 0, 1, 2, 3}, {vec3(0, 0, 0), vec3(0, 1, 0), vec3(0, 1, 0),
+                                               vec3(0, 1, 0), vec3(0, 1, 0)});
+    Pose pose;
+    pose.deltas.assign(5, quat(1, 0, 0, 0));
+    const quat bend1 = glm::angleAxis(0.5f, vec3(0, 0, 1));  // between root and mid
+    const quat bend3 = glm::angleAxis(-0.3f, vec3(1, 0, 0)); // between mid and end
+    pose.deltas[1] = bend1;
+    pose.deltas[3] = bend3;
+
+    std::vector<vec3> p0 = Positions(sk, pose);
+    const float L1 = glm::length(p0[2] - p0[0]); // chord lengths of the bent sub-chains
+    const float L2 = glm::length(p0[4] - p0[2]);
+    const vec3 A = p0[0];
+    const vec3 target = A + glm::normalize(vec3(0.7f, 0.6f, 0.2f)) * (0.85f * (L1 + L2));
+
+    CHECK(SolveTwoBoneIk(sk, pose, {0, 2, 4}, target, A + vec3(1, 0, -0.5f)));
+    CHECK(PoseFinite(pose));
+    std::vector<vec3> p = Positions(sk, pose);
+    CHECK(ApproxVec3(p[4], target, 2e-3f));                  // end hits through ride-alongs
+    CHECK(ApproxEq(glm::length(p[2] - p[0]), L1, 1e-3f));    // sub-chains stayed rigid
+    CHECK(ApproxEq(glm::length(p[4] - p[2]), L2, 1e-3f));
+    // The ride-along joints' own deltas are never written.
+    CHECK(pose.deltas[1].x == bend1.x && pose.deltas[1].w == bend1.w);
+    CHECK(pose.deltas[3].x == bend3.x && pose.deltas[3].w == bend3.w);
 }
 
 // --- 7. FK round-trip under a rotated parent + pre-existing root delta ----------
@@ -213,6 +246,12 @@ void TestAimBasic()
     // Deterministic across repeated calls (same up basis every time).
     quat ru2 = PoseLocalRotations(sk, withUp2)[0];
     CHECK(ru.x == ru2.x && ru.y == ru2.y && ru.z == ru2.z && ru.w == ru2.w);
+
+    // Up collinear with the aim direction: falls back to shortest-arc, still aims.
+    Pose upBad;
+    CHECK(SolveAim(sk, upBad, 0, 1, target, std::optional<vec3>(vec3(0, 1, 0))));
+    CHECK(PoseFinite(upBad));
+    CHECK(ApproxVec3(glm::normalize(PoseLocalRotations(sk, upBad)[0] * fLocal), desired));
 }
 
 // --- 9. aim antiparallel: target directly behind -------------------------------
@@ -274,6 +313,31 @@ void TestBadInput()
     Pose p5 = seed;
     CHECK(!SolveAim(sk, p5, 9, 1, vec3(0, 2, 0), std::nullopt));
     CHECK(untouched(p5));
+
+    // Aim: forwardChild that is the joint's PARENT — no bone to aim along.
+    Pose p6 = seed;
+    CHECK(!SolveAim(sk, p6, 1, 0, vec3(0, 2, 0), std::nullopt));
+    CHECK(untouched(p6));
+
+    // Finite-but-huge target: length() squares to inf; must reject, never NaN the pose.
+    Pose p7 = seed;
+    CHECK(!SolveTwoBoneIk(sk, p7, {0, 1, 2}, vec3(1e20f, 0, 0), vec3(1, 0, 0)));
+    CHECK(untouched(p7));
+    Pose p8 = seed;
+    CHECK(!SolveAim(sk, p8, 0, 1, vec3(1e20f, 0, 0), std::nullopt));
+    CHECK(untouched(p8));
+
+    // NaN straight into the kernel (bypassing any front-door guard).
+    Pose p9 = seed;
+    CHECK(!SolveTwoBoneIk(sk, p9, {0, 1, 2}, vec3(std::nanf(""), 0, 0), vec3(1, 0, 0)));
+    CHECK(untouched(p9));
+
+    // Huge (but finite) POLE overflows the bend-plane cross product: the solve must
+    // fall back to a working plane and still hit the reachable target.
+    Pose p10;
+    CHECK(SolveTwoBoneIk(sk, p10, {0, 1, 2}, vec3(1, 1, 0), vec3(2e19f, -2e19f, 1e19f)));
+    CHECK(PoseFinite(p10));
+    CHECK(ApproxVec3(Positions(sk, p10)[2], vec3(1, 1, 0)));
 }
 
 } // namespace
@@ -286,6 +350,7 @@ void RunIkTests()
     TestPoleFlip();
     TestEndDeltaUntouched();
     TestDegeneratePole();
+    TestPolylineChain();
     TestRotatedParentRoundTrip();
     TestAimBasic();
     TestAimAntiparallel();

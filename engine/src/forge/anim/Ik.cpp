@@ -17,9 +17,12 @@ namespace {
 // around 1.0 bone lengths, so a fixed threshold reads cleaner than a relative one.
 constexpr float kEps = 1e-4f;
 
-// The rotation carried by a joint global. Columns are R*scale_i (no shear from
-// TRS locals), so normalizing each column recovers a pure rotation even when
-// bindS != 1. quat_cast wants an orthonormal basis or it skews the result.
+// The rotation carried by a joint global. Exact for uniform bind scale (columns
+// are R*s, so normalizing recovers a pure rotation). Accumulated globals under
+// NON-uniform or negative bindS shear (R1*S1*R2*S2...), and the normalized basis
+// is then only an approximation — the solve lands near, not on, the target. The
+// importer already approximates shear away (Skeleton.h), so this matches rig
+// quality rather than degrading it.
 quat RotationOf(const mat4& m)
 {
     mat3 r(m);
@@ -76,6 +79,11 @@ quat LocalDelta(const Skeleton& sk, int joint, const std::vector<mat4>& globals,
 
 bool InRange(const Skeleton& sk, int j) { return j >= 0 && j < (int)sk.JointCount(); }
 
+bool Finite(const vec3& v)
+{
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
 // True when `anc` is a strict ancestor of `node` (walks parents; the SoA invariant
 // parents[i] < i guarantees termination).
 bool IsAncestor(const Skeleton& sk, int anc, int node)
@@ -108,6 +116,10 @@ bool SolveTwoBoneIk(const Skeleton& skeleton, Pose& pose, const IkChain& chain,
         return false;
     if (!IsAncestor(sk, chain.root, chain.mid) || !IsAncestor(sk, chain.mid, chain.end))
         return false;
+    // NaN/Inf in, garbage pose out — reject up front so the never-NaN promise holds
+    // for every caller, not just ones behind the MCP front door.
+    if (!Finite(targetModel) || !Finite(poleModel))
+        return false;
 
     Pose work = pose; // commit only on success — Pose stays untouched on any early out
     EnsureSized(sk, work);
@@ -126,6 +138,8 @@ bool SolveTwoBoneIk(const Skeleton& skeleton, Pose& pose, const IkChain& chain,
     // --- reach clamp: both the extension and the fold ends are triangle singularities.
     const vec3 toT = targetModel - A;
     const float distToT = glm::length(toT);
+    if (!std::isfinite(distToT)) // finite components can still square to inf in length()
+        return false;
     vec3 dirAT = (distToT > kEps) ? toT / distToT
                                   : glm::normalize(B - A); // target on the root: keep current aim
     float lo = std::fabs(L1 - L2) + kEps;
@@ -136,12 +150,19 @@ bool SolveTwoBoneIk(const Skeleton& skeleton, Pose& pose, const IkChain& chain,
     const vec3 tEff = A + d * dirAT; // the actually-reachable point the end lands on
 
     // --- bend plane: the pole picks the side; degeneracies fall back deterministically.
+    // A far-away (finite) pole can overflow the cross/length to inf, which passes a
+    // plain `< kEps` test — treat non-finite exactly like degenerate.
     vec3 n = glm::cross(dirAT, poleModel - A);
-    if (glm::length(n) < kEps)
+    float nLen = glm::length(n);
+    if (!std::isfinite(nLen) || nLen < kEps) {
         n = glm::cross(C - A, B - A); // pole collinear with A->T: use the current-pose plane
-    if (glm::length(n) < kEps)
+        nLen = glm::length(n);
+    }
+    if (!std::isfinite(nLen) || nLen < kEps) {
         n = OrthogonalAxis(dirAT); // straight current chain too: any orthogonal axis
-    n = glm::normalize(n);
+        nLen = 1.0f;
+    }
+    n /= nLen;
 
     // --- law of cosines for the interior angle at the root; clamp acos domain -----
     const float cosA = glm::clamp((L1 * L1 + d * d - L2 * L2) / (2.0f * L1 * d), -1.0f, 1.0f);
@@ -176,6 +197,12 @@ bool SolveAim(const Skeleton& skeleton, Pose& pose, int joint, int forwardChild,
     const Skeleton& sk = skeleton;
     if (!InRange(sk, joint) || !InRange(sk, forwardChild) || joint == forwardChild)
         return false;
+    // forwardChild must hang below joint — a parent/sibling "forward" points along
+    // no real bone, and the aim would silently track nothing.
+    if (!IsAncestor(sk, joint, forwardChild))
+        return false;
+    if (!Finite(targetModel) || (upModel && !Finite(*upModel)))
+        return false;
 
     Pose work = pose;
     EnsureSized(sk, work);
@@ -196,9 +223,12 @@ bool SolveAim(const Skeleton& skeleton, Pose& pose, int joint, int forwardChild,
     const quat curGlobal = RotationOf(g[(size_t)joint]);
     const vec3 jointPos = Translation(g[(size_t)joint]);
     const vec3 toTarget = targetModel - jointPos;
-    if (glm::length(toTarget) < kEps) // target on top of the joint: no aim direction
+    const float distToTarget = glm::length(toTarget);
+    // Rejects both "target on top of the joint" and the finite-but-huge overflow case
+    // (length() squares to inf and normalize would return zero, wrecking the basis).
+    if (!std::isfinite(distToTarget) || distToTarget < kEps)
         return false;
-    const vec3 desired = glm::normalize(toTarget);
+    const vec3 desired = toTarget / distToTarget;
 
     quat desiredGlobal;
     bool useUp = false;
@@ -206,9 +236,10 @@ bool SolveAim(const Skeleton& skeleton, Pose& pose, int joint, int forwardChild,
         // Twist-stabilized: map (fLocal, a reference up) onto (desired, up-projected)
         // via an orthonormal change of basis — guarantees fLocal -> desired exactly.
         const vec3 upProj = *upModel - glm::dot(*upModel, desired) * desired;
-        if (glm::length(upProj) >= kEps) {
+        const float upLen = glm::length(upProj); // same overflow caveat as the aim ray
+        if (std::isfinite(upLen) && upLen >= kEps) {
             const vec3 t0 = desired;
-            const vec3 t1 = glm::normalize(upProj);
+            const vec3 t1 = upProj / upLen;
             const vec3 t2 = glm::cross(t0, t1);
             // Source basis in the LOCAL frame: forward + a deterministic orthogonal up.
             const vec3 s0 = fLocal;

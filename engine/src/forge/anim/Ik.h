@@ -27,9 +27,12 @@ struct IkChain {
 // Solve root+mid deltas so the end joint reaches targetModel (model/skin space).
 // poleModel picks the bend side (which way the elbow points). Out-of-reach targets
 // clamp to just under full extension; over-folded ones to just over full fold — the
-// solve never NaNs. Writes ONLY deltas[root] and deltas[mid]; the end joint's delta
-// is left alone (the wrist keeps whatever pose it had). Returns false (Pose
-// untouched) on: index out of range, a non-ancestry chain, or a zero-length bone.
+// solve never NaNs (non-finite or overflow-huge inputs are rejected, not solved).
+// Writes ONLY deltas[root] and deltas[mid]; the end joint's delta is left alone
+// (the wrist keeps whatever pose it had). Returns false (Pose untouched) on: index
+// out of range, a non-ancestry chain, a zero-length bone, or a non-finite/overflow
+// target or pole. Exact for uniform bind scale; non-uniform bindS chains shear and
+// the solve lands near, not on, the target (import already approximates shear away).
 bool SolveTwoBoneIk(const Skeleton& skeleton, Pose& pose, const IkChain& chain,
                     const vec3& targetModel, const vec3& poleModel);
 
@@ -39,7 +42,8 @@ bool SolveTwoBoneIk(const Skeleton& skeleton, Pose& pose, const IkChain& chain,
 // the twist (look-rotation basis); when absent, or when up is collinear with the aim
 // direction, the shortest-arc rotation is used and twist is left as-is. Writes only
 // deltas[joint]. Returns false (Pose untouched) on: index out of range, forwardChild
-// not distinct from joint, a zero-length forward bone, or a target on top of joint.
+// not a strict descendant of joint, a zero-length forward bone, a target on top of
+// joint, or a non-finite/overflow target or up.
 bool SolveAim(const Skeleton& skeleton, Pose& pose, int joint, int forwardChild,
               const vec3& targetModel, const std::optional<vec3>& upModel);
 

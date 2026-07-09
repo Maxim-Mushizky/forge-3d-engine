@@ -3092,7 +3092,8 @@ ToolResult EditorApp::ToolPoseIk(const json& args)
     // reached=false means the target was out of reach and the chain clamped to it.
     std::vector<quat> rr = PoseLocalRotations(sk, next);
     std::vector<mat4> gg = ComputeGlobalTransforms(sk, sk.bindT, rr, sk.bindS);
-    const bool reached = glm::length(vec3(gg[(size_t)chain.end][3]) - targetModel) <= 1e-3f;
+    const bool reached = glm::length(vec3(gg[(size_t)chain.end][3]) - targetModel) <=
+                         1e-3f; // model units — the world-space tolerance scales with the entity
 
     if (e->mesh.use_count() > 1) {
         std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh);
@@ -3148,6 +3149,17 @@ ToolResult EditorApp::ToolPoseAim(const json& args)
             return Err("Joint \"" + jointName +
                        "\" is a leaf — provide \"forward_child\" to define the forward axis");
     }
+    // The forward axis is a real bone only if the child hangs below the joint; a
+    // parent/sibling would aim along nothing (kernel rejects it too, namelessly).
+    bool descends = false;
+    for (int p = sk.parents[(size_t)forwardChild]; p >= 0; p = sk.parents[(size_t)p])
+        if (p == joint) {
+            descends = true;
+            break;
+        }
+    if (!descends)
+        return Err("\"" + sk.names[(size_t)forwardChild] + "\" is not a descendant of \"" +
+                   jointName + "\"");
 
     vec3 targetWorld;
     if (!GetVec3(args, "target", targetWorld))
