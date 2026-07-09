@@ -66,12 +66,13 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
                 SavedMesh sm;
                 sm.recipe = toRecipe ? toRecipe(e.mesh.get()) : std::string();
                 if (sm.recipe.empty()) {
-                    if (e.mesh->HasSkin()) {
-                        // Store BIND, not the posed live verts: on load SetSkin
-                        // snapshots them and ApplyPose re-deforms — storing the
-                        // deformed data would double-deform (#147).
+                    if (e.mesh->HasSkin() || e.mesh->HasMorphTargets()) {
+                        // Store BIND, not the deformed live verts: on load SetSkin/
+                        // SetMorphTargets snapshot them and the deform re-applies —
+                        // storing the deformed data would double-deform (#147/#149).
                         sm.vertices = e.mesh->BindVertices();
                         sm.skin = e.mesh->Skin();
+                        sm.morphTargets = e.mesh->MorphTargets();
                     } else {
                         sm.vertices = e.mesh->Vertices();
                     }
@@ -92,6 +93,7 @@ SavedScene SnapshotScene(const Scene& scene, const std::string& extrasJson,
             se.skeleton.inverseBind = s.inverseBind;
         }
         se.pose = e.pose.deltas;
+        se.morphWeights = e.morphWeights; // #149
         out.entities.push_back(std::move(se));
     }
     return out;
@@ -117,6 +119,8 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
             auto m = std::make_shared<Mesh>(sm.vertices, sm.indices, sm.submeshes);
             if (!sm.skin.empty())
                 m->SetSkin(sm.skin); // vertices are bind data (SnapshotScene stored bind for skinned)
+            if (!sm.morphTargets.empty())
+                m->SetMorphTargets(sm.morphTargets); // ditto: snapshot from bind data (#149)
             meshes.push_back(std::move(m));
         } else {
             meshes.push_back(nullptr);
@@ -226,18 +230,32 @@ int RestoreScene(const SavedScene& saved, Scene& outScene, std::string& outExtra
             }
         }
         e.pose.deltas = se.pose;
+        e.morphWeights = se.morphWeights; // #149
         // The mesh was rebuilt from bind vertices above; reproduce the saved
-        // deformation (empty pose == bind). Clone a shared skinned mesh first so
-        // divergent per-entity poses in a hand-edited file don't clobber each
-        // other (CloneSkinnedMesh rebuilds from the untouched bind snapshot).
-        if (e.mesh && e.mesh->HasSkin() && e.skeleton) {
+        // deformation (empty pose == bind, zero weights == no morph). Every
+        // deformable mesh claims a posedMeshes slot even when it stays at bind:
+        // a later entity with a live pose/weights must clone rather than deform
+        // the shared original out from under this one (CloneSkinnedMesh rebuilds
+        // from the untouched bind snapshot).
+        const bool skinnedDeform = e.mesh && e.mesh->HasSkin() && e.skeleton;
+        bool morphDeform = false;
+        if (e.mesh && e.mesh->HasMorphTargets())
+            for (float w : e.morphWeights)
+                if (w != 0.0f) {
+                    morphDeform = true;
+                    break;
+                }
+        if (e.mesh && (skinnedDeform || e.mesh->HasMorphTargets())) {
             if (!posedMeshes.insert(e.mesh.get()).second) {
                 if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e.mesh)) {
                     e.mesh = std::move(priv);
                     posedMeshes.insert(e.mesh.get());
                 }
             }
-            ApplyPose(*e.mesh, *e.skeleton, e.pose);
+            // Skinned meshes always re-deform (bind globals x IBMs may differ from
+            // identity); morph-only meshes at zero weights already are bind data.
+            if (skinnedDeform || morphDeform)
+                ApplyDeform(*e.mesh, e.skeleton.get(), &e.pose, e.morphWeights);
         }
         outScene.Insert(e);
     }

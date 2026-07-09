@@ -15,7 +15,8 @@ namespace forge {
 // tests; SceneSerializer adapts live Scene/Mesh objects to and from this.
 //
 // File layout (version 3 — v3 added per-vertex skin + per-entity skeleton/pose
-// as optional keys, #147; v2 added submesh ranges + extra material slots, #80;
+// as optional keys, #147; morph targets + per-entity weights are further v3
+// optional keys, #149; v2 added submesh ranges + extra material slots, #80;
 // v1/v2 files read unchanged, the new keys just default to empty = non-skinned):
 //   8 bytes  magic "FORGESCN"
 //   u32      version
@@ -33,6 +34,7 @@ struct SavedMesh {
     std::vector<uint32_t> indices;
     std::vector<Submesh> submeshes; // empty = single-material (whole buffer, slot 0)
     std::vector<VertexSkin> skin;   // empty = not skinned; parallel to vertices (#147)
+    std::vector<MorphTarget> morphTargets; // empty = no morphs; deltas parallel to vertices (#149)
 };
 
 // One material slot's factors plus rebuildable texture sources (#113,
@@ -95,6 +97,7 @@ struct SavedEntity {
 
     SavedSkeleton skeleton;      // empty = not skinned (#147)
     std::vector<quat> pose;      // per-joint local-rotation deltas; empty = bind (#147)
+    std::vector<float> morphWeights; // per-instance morph weights; empty = all zero (#149)
 };
 
 struct SavedScene {
