@@ -1,5 +1,6 @@
 #include "ModelImporter.h"
 
+#include "forge/anim/Morph.h"
 #include "forge/anim/SkinImport.h"
 #include "forge/core/Log.h"
 
@@ -63,6 +64,69 @@ static const uint8_t* AccessorData(const tinygltf::Model& model, const tinygltf:
     int stride = accessor.ByteStride(view);
     strideOut = stride > 0 ? (size_t)stride : 0;
     return buffer.data.data() + view.byteOffset + accessor.byteOffset;
+}
+
+// Bounds-checked pointer into a buffer through a bufferView at byteOffset, valid
+// for bytesNeeded bytes. Sparse index/value blocks read through this rather than
+// AccessorData: they reference bufferViews directly, not via an accessor.
+static const uint8_t* BufferViewData(const tinygltf::Model& model, int viewIdx, size_t byteOffset,
+                                     size_t bytesNeeded)
+{
+    if (viewIdx < 0 || viewIdx >= (int)model.bufferViews.size())
+        return nullptr;
+    const tinygltf::BufferView& view = model.bufferViews[viewIdx];
+    if (view.buffer < 0 || view.buffer >= (int)model.buffers.size())
+        return nullptr;
+    const tinygltf::Buffer& buffer = model.buffers[view.buffer];
+    if (view.byteOffset > buffer.data.size() ||
+        view.byteLength > buffer.data.size() - view.byteOffset)
+        return nullptr;
+    if (byteOffset > view.byteLength || bytesNeeded > view.byteLength - byteOffset)
+        return nullptr;
+    return buffer.data.data() + view.byteOffset + byteOffset;
+}
+
+// Morph-target delta accessor (VEC3 float) -> per-vertex vec3s (#149). Dense data
+// comes from the accessor's bufferView; an ABSENT bufferView means a zero-filled
+// base (spec-legal, THE common encoding for sparse face shapes); the sparse
+// overlay then replaces the flagged elements. False = unreadable or spec-
+// violating — the caller drops the mesh's morphs rather than deform with garbage.
+static bool ReadMorphDeltas(const tinygltf::Model& model, int accessorIdx, size_t vertexCount,
+                            std::vector<vec3>& out)
+{
+    if (accessorIdx < 0 || accessorIdx >= (int)model.accessors.size())
+        return false;
+    const tinygltf::Accessor& acc = model.accessors[accessorIdx];
+    if (acc.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT || acc.type != TINYGLTF_TYPE_VEC3)
+        return false;
+    if (acc.count != vertexCount)
+        return false; // deltas must parallel the primitive's vertices
+    out.assign(vertexCount, vec3(0.0f));
+    size_t stride;
+    if (const uint8_t* data = AccessorData(model, acc, stride))
+        for (size_t i = 0; i < vertexCount; ++i)
+            out[i] = *(const vec3*)(data + i * stride);
+    if (!acc.sparse.isSparse)
+        return true;
+    const auto& sparse = acc.sparse;
+    if (sparse.count < 1 || (size_t)sparse.count > vertexCount)
+        return false; // schema: 1 <= sparse.count <= accessor.count
+    size_t indexSize;
+    switch (sparse.indices.componentType) {
+    case kGltfUnsignedByte: indexSize = 1; break;
+    case kGltfUnsignedShort: indexSize = 2; break;
+    case kGltfUnsignedInt: indexSize = 4; break;
+    default:
+        return false; // spec: u8/u16/u32 only (5124 SIGNED int is explicitly illegal)
+    }
+    const uint8_t* indices = BufferViewData(model, sparse.indices.bufferView,
+                                            sparse.indices.byteOffset,
+                                            (size_t)sparse.count * indexSize);
+    const uint8_t* values =
+        BufferViewData(model, sparse.values.bufferView, sparse.values.byteOffset,
+                       (size_t)sparse.count * sizeof(vec3));
+    return ApplySparseOverlay(out, indices, sparse.indices.componentType, values,
+                              (size_t)sparse.count);
 }
 
 static mat4 NodeLocalMatrix(const tinygltf::Node& node)
@@ -348,6 +412,9 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
         std::vector<uint32_t> meshIndices;
         std::vector<Submesh> submeshes;
         std::vector<VertexSkin> meshSkin;                    // parallel to meshVertices when skinned
+        std::vector<MorphTarget> meshMorphs;                 // merged morph targets (#149)
+        int expectedTargets = -1;                            // -1 = no primitive processed yet
+        bool morphsValid = true;
         std::vector<Material> slotMaterials;                 // slot -> material
         std::unordered_map<int, uint32_t> slotOfGltfMaterial; // glTF material index (-1 = none) -> slot
 
@@ -513,6 +580,53 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             for (uint32_t i : indices)
                 meshIndices.push_back(vertexBase + i);
             submeshes.push_back({firstIndex, (uint32_t)indices.size(), slot});
+
+            // Morph targets (#149), merged with the same vertexBase offsets. glTF
+            // requires every primitive of a mesh to carry the SAME target count —
+            // on mismatch drop the mesh's morphs, keep the geometry. A failed
+            // target read drops them too: a partial set would desync name->index
+            // resolution against the file's targetNames.
+            if (morphsValid) {
+                const int targetCount = (int)prim.targets.size();
+                if (expectedTargets < 0) {
+                    expectedTargets = targetCount;
+                    meshMorphs.resize((size_t)targetCount);
+                } else if (targetCount != expectedTargets) {
+                    FORGE_WARN("glTF: primitives of mesh \"%s\" disagree on morph-target count "
+                               "(%d vs %d) — morphs dropped",
+                               gltfMesh.name.c_str(), targetCount, expectedTargets);
+                    morphsValid = false;
+                    meshMorphs.clear();
+                }
+                for (int t = 0; morphsValid && t < targetCount; ++t) {
+                    MorphTarget& mt = meshMorphs[(size_t)t];
+                    // POSITION absent = zero displacement (spec-legal: a target may
+                    // displace normals only). Deltas are raw model-space like the
+                    // skinned vertex path — never baked with the node transform.
+                    std::vector<vec3> deltas(vertices.size(), vec3(0.0f));
+                    if (auto dIt = prim.targets[t].find("POSITION");
+                        dIt != prim.targets[t].end() &&
+                        !ReadMorphDeltas(model, dIt->second, vertices.size(), deltas)) {
+                        FORGE_WARN("glTF: unreadable morph POSITION deltas (target %d, mesh "
+                                   "\"%s\") — morphs dropped",
+                                   t, gltfMesh.name.c_str());
+                        morphsValid = false;
+                        meshMorphs.clear();
+                        break;
+                    }
+                    mt.positionDeltas.insert(mt.positionDeltas.end(), deltas.begin(),
+                                             deltas.end());
+                    if (auto nIt = prim.targets[t].find("NORMAL");
+                        nIt != prim.targets[t].end() &&
+                        ReadMorphDeltas(model, nIt->second, vertices.size(), deltas)) {
+                        // Zero-fill the ranges of earlier primitives that lacked
+                        // normal deltas so the optional array stays parallel.
+                        mt.normalDeltas.resize(vertexBase, vec3(0.0f));
+                        mt.normalDeltas.insert(mt.normalDeltas.end(), deltas.begin(),
+                                               deltas.end());
+                    }
+                }
+            }
         }
 
         if (meshVertices.empty() || meshIndices.empty())
@@ -541,6 +655,38 @@ static std::vector<ImportedPart> LoadGLTF(const std::string& path)
             // never deforms (the editor clones skinned meshes before posing),
             // so its bind snapshot stays valid for every re-import of the path.
             part.mesh->SetSkin(std::move(meshSkin));
+        }
+        if (morphsValid && !meshMorphs.empty()) {
+            // Primitives without NORMAL deltas leave the optional array short —
+            // pad to fully parallel (empty stays empty; Mesh validates on attach).
+            const size_t vertexCount = part.mesh->Vertices().size();
+            for (MorphTarget& mt : meshMorphs)
+                if (!mt.normalDeltas.empty())
+                    mt.normalDeltas.resize(vertexCount, vec3(0.0f));
+            // Names ride on mesh.extras.targetNames (Blender/three.js convention,
+            // not spec) — ARKit-style face rigs resolve set_expression through them.
+            for (size_t t = 0; t < meshMorphs.size(); ++t) {
+                meshMorphs[t].name = "morphTarget" + std::to_string(t);
+                if (gltfMesh.extras.IsObject() && gltfMesh.extras.Has("targetNames")) {
+                    const tinygltf::Value& names = gltfMesh.extras.Get("targetNames");
+                    if (names.IsArray() && t < names.ArrayLen() && names.Get(t).IsString())
+                        meshMorphs[t].name = names.Get(t).Get<std::string>();
+                }
+            }
+            // Initial weights precedence (spec normative): node.weights over
+            // mesh.weights, both absent = zeros. Non-finite file values zero out
+            // — a NaN weight would poison every morphed vertex downstream.
+            part.defaultMorphWeights.assign(meshMorphs.size(), 0.0f);
+            const std::vector<double>& weights =
+                (inst.node >= 0 && !model.nodes[inst.node].weights.empty())
+                    ? model.nodes[inst.node].weights
+                    : gltfMesh.weights;
+            for (size_t i = 0; i < part.defaultMorphWeights.size() && i < weights.size(); ++i)
+                if (std::isfinite(weights[i]))
+                    part.defaultMorphWeights[i] = (float)weights[i];
+            // Cached-mesh discipline as for the skin above: the original never
+            // deforms, so its bind snapshot stays valid across re-imports.
+            part.mesh->SetMorphTargets(std::move(meshMorphs));
         }
         parts.push_back(std::move(part));
     }
