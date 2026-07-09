@@ -190,7 +190,16 @@ public:
     // it so a failed script rolls back atomically.
     void BeginBatch()
     {
-        FORGE_ASSERT(!m_Batch, "CommandStack batch already open");
+        if (m_Batch) {
+            // The previous batch owner never reached EndBatch (a failure
+            // escaped the script path). Its commands are already applied to
+            // the scene, so land them as a normal undo entry — dropping them
+            // would break undo; aborting would kill the editor (#162).
+            FORGE_ERROR("CommandStack: batch already open — closing the stale one");
+            std::unique_ptr<CompositeCommand> stale = std::move(m_Batch);
+            if (!stale->Empty())
+                Push(std::move(stale));
+        }
         m_Batch = std::make_unique<CompositeCommand>();
     }
     std::unique_ptr<CompositeCommand> EndBatch() { return std::move(m_Batch); }

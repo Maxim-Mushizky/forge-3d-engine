@@ -3879,7 +3879,7 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         };
     };
 
-    ScriptResult run = RunSandboxedScript(source, [&](const ScriptInstall& add) {
+    auto installBindings = [&](const ScriptInstall& add) {
         add("scene", call(&EditorApp::ToolGetScene, nullptr));
         add("get_entity", call(&EditorApp::ToolGetEntity, nullptr));
         add("mesh_stats", call(&EditorApp::ToolGetMeshStats, nullptr));
@@ -3948,7 +3948,22 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("shade", call(&EditorApp::ToolEditElements, "shade"));
 
         add("export_stl", call(&EditorApp::ToolExportStl, nullptr));
-    });
+    };
+
+    // Nothing may escape between BeginBatch and EndBatch: a leaked open batch
+    // would make the next script's BeginBatch drop this one's undo atomicity.
+    // A host failure (panic, bad_alloc) reports like any failed script and
+    // takes the rollback path below.
+    ScriptResult run;
+    try {
+        run = RunSandboxedScript(source, installBindings);
+    } catch (const std::exception& ex) {
+        run.ok = false;
+        run.error = std::string("script host failure: ") + ex.what();
+    } catch (...) {
+        run.ok = false;
+        run.error = "script host failure (unknown exception)";
+    }
 
     std::unique_ptr<CompositeCommand> batch = m_Commands.EndBatch();
     if (!run.ok) {

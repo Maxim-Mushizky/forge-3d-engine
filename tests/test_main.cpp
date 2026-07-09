@@ -15,6 +15,7 @@ void RunDropRouterTests();
 void RunSettingsTests();
 void RunMcpTests();
 void RunMcpScriptTests();
+void RunCommandStackTests();
 void RunMcpViewsTests();
 void RunMeshStatsTests();
 void RunUvUnwrapTests();
@@ -47,6 +48,7 @@ int main()
     RunSettingsTests();
     RunMcpTests();
     RunMcpScriptTests();
+    RunCommandStackTests();
     RunMcpViewsTests();
     RunMeshStatsTests();
     RunUvUnwrapTests();

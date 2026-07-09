@@ -328,6 +328,12 @@ void EditorApp::UpdateRayTracer()
         m_PathTracer.Upload(m_Scene);
         m_PathTracer.ResetAccumulation();
         m_RTUploadPending = false;
+        // A rebuilt scene's cost is unknown: restart the adaptive ramp from 1.
+        // Reusing the previous scene's ramped-up spp (up to 128) on a bulk
+        // script rebuild can push the first dispatch past the Windows TDR
+        // limit — the gradual-doubling argument below only holds when scene
+        // cost changes continuously (#162).
+        m_AdaptiveSpp = 1;
     }
 
     GatherLights();
