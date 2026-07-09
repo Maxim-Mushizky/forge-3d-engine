@@ -36,8 +36,18 @@ void SkinVertices(const std::vector<Vertex>& bind, const std::vector<VertexSkin>
             normalBlend += normalMats[j] * w;
             weightSum += w;
         }
-        if (weightSum <= 0.0f)
-            continue; // unweighted vertex: keep bind position/normal
+        if (weightSum <= 0.0f) {
+            // Unweighted vertex keeps the source position/normal — but normalize
+            // the normal: the source may be a MORPHED bind carrying a raw delta
+            // sum (#149), and this path would otherwise ship it to the VBO
+            // unnormalized. Unit bind normals make this a no-op on skin-only
+            // meshes; a degenerate sum keeps the source value rather than
+            // dividing toward NaN (same guard as the weighted path below).
+            const float len = glm::length(out[v].normal);
+            if (len > 1e-8f)
+                out[v].normal /= len;
+            continue;
+        }
 
         out[v].position = vec3(blend * vec4(bind[v].position, 1.0f));
         vec3 n = normalBlend * bind[v].normal;

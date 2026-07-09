@@ -304,6 +304,9 @@ uint64_t EditorApp::SceneHash() const
         // change signal that survives any future path that poses without re-uploading.
         for (const quat& q : e.pose.deltas)
             mix(&q, sizeof(q));
+        // Morph weights, same rationale (#149): explicit change signal per instance.
+        for (float w : e.morphWeights)
+            mix(&w, sizeof(w));
     }
     return h;
 }
@@ -1427,11 +1430,23 @@ bool EditorApp::ImportModel(const std::string& path)
     std::vector<std::shared_ptr<Mesh>> finalMeshes;
     finalMeshes.reserve(parts->size());
     for (const ImportedPart& p : *parts) {
-        if (p.skeleton) {
+        // Morph-only parts with all-zero default weights render undeformed, so
+        // they can keep sharing the cached mesh — set_morph COW-clones on use.
+        bool anyWeight = false;
+        for (float w : p.defaultMorphWeights)
+            if (w != 0.0f) {
+                anyWeight = true;
+                break;
+            }
+        if (p.skeleton || anyWeight) {
             auto clone = std::make_shared<Mesh>(p.mesh->Vertices(), p.mesh->Indices(),
                                                 p.mesh->Submeshes());
-            clone->SetSkin(p.mesh->Skin()); // before any deform: snapshot = imported bind data
-            ApplyBindPose(*clone, *p.skeleton); // bind-pose render; bumps Mesh::Version for RT
+            if (p.mesh->HasSkin())
+                clone->SetSkin(p.mesh->Skin()); // before any deform: snapshot = imported bind data
+            if (p.mesh->HasMorphTargets())
+                clone->SetMorphTargets(p.mesh->MorphTargets()); // #149
+            // Bind pose + the file's default morph weights; bumps Mesh::Version for RT.
+            ApplyDeform(*clone, p.skeleton.get(), nullptr, p.defaultMorphWeights);
             finalMeshes.push_back(std::move(clone));
         } else {
             finalMeshes.push_back(p.mesh);
@@ -1472,6 +1487,7 @@ bool EditorApp::ImportModel(const std::string& path)
         Entity& e = m_Scene.CreateEntity(p.name);
         e.mesh = finalMeshes[i];
         e.skeleton = p.skeleton; // null for rigid parts
+        e.morphWeights = p.defaultMorphWeights; // sized to target count; empty = no morphs (#149)
         e.material = p.material;
         e.extraMaterials = p.extraMaterials; // slots 1+ for multi-material meshes (#80)
         if (rootId) {
@@ -2760,7 +2776,8 @@ void EditorApp::DrawInspector()
                 if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh))
                     e->mesh = std::move(priv);
             }
-            ApplyPose(*e->mesh, sk, e->pose);
+            // Combined path (#149): re-posing must keep the entity's active morphs.
+            ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights);
         };
 
         // Preset buttons (canned poses as data).
@@ -2772,7 +2789,7 @@ void EditorApp::DrawInspector()
                     if (e->mesh.use_count() > 1)
                         if (std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh))
                             e->mesh = std::move(priv);
-                    ApplyPose(*e->mesh, sk, e->pose);
+                    ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights); // #149
                     m_Commands.Push(
                         std::make_unique<SetPoseCommand>(e->id, m_PoseBeforeEdit, e->pose));
                     m_JointEulerFor = 0; // force buffer rebuild next frame

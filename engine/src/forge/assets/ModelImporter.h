@@ -22,6 +22,9 @@ struct ImportedPart {
     std::shared_ptr<Skeleton> skeleton; // null = rigid part; shared by all parts of one glTF skin
     Material material;
     std::vector<Material> extraMaterials; // material slots 1+ (empty = single-material)
+    // Initial morph weights (#149), glTF precedence: node.weights, else mesh.weights,
+    // else zeros. Sized to the mesh's target count; empty = no morph targets.
+    std::vector<float> defaultMorphWeights;
 };
 
 class ModelImporter {

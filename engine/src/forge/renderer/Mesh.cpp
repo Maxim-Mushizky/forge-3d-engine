@@ -65,6 +65,29 @@ void Mesh::SetSkin(std::vector<VertexSkin> skin)
     m_BindVertices = m_Vertices; // vertices must still be the undeformed bind pose here
 }
 
+void Mesh::SetMorphTargets(std::vector<MorphTarget> targets)
+{
+    for (const MorphTarget& t : targets) {
+        // External asset data can be malformed — degrade to morphless, never assert.
+        // All-or-nothing: a partially-valid target set would desync name->index
+        // resolution against the file's targetNames.
+        if (t.positionDeltas.size() != m_Vertices.size() ||
+            (!t.normalDeltas.empty() && t.normalDeltas.size() != m_Vertices.size())) {
+            FORGE_WARN("Mesh::SetMorphTargets: target \"%s\" has %zu/%zu deltas for %zu vertices "
+                       "— mesh stays morphless",
+                       t.name.c_str(), t.positionDeltas.size(), t.normalDeltas.size(),
+                       m_Vertices.size());
+            return;
+        }
+    }
+    m_MorphTargets = std::move(targets);
+    // Morph-only meshes never pass through SetSkin, so snapshot the bind here
+    // too — deformation always re-derives from bind, never compounds. Don't
+    // clobber a snapshot the skin already took (vertices may be deformed by now).
+    if (m_BindVertices.empty())
+        m_BindVertices = m_Vertices; // vertices must still be the undeformed bind pose here
+}
+
 void Mesh::RecomputeBounds()
 {
     m_Bounds = AABB{};

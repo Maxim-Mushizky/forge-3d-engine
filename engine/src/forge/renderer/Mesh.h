@@ -4,6 +4,7 @@
 #include "forge/core/Math.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace forge {
@@ -21,6 +22,17 @@ struct Vertex {
 struct VertexSkin {
     glm::uvec4 joints{0};
     vec4 weights{0.0f};
+};
+
+// One glTF morph target, parallel to Mesh's vertex array (#149). CPU-only for
+// the same reason as VertexSkin: deformation is evaluated on the CPU and the
+// GPU only ever sees the final vertices, so the VBO layout stays untouched.
+// positionDeltas.size() == vertexCount; normalDeltas is empty (no normal
+// displacement) or vertexCount.
+struct MorphTarget {
+    std::string name; // from mesh.extras.targetNames, or "morphTarget<i>"
+    std::vector<vec3> positionDeltas;
+    std::vector<vec3> normalDeltas; // empty = target moves positions only
 };
 
 // Index range drawn with one material slot (#80). Slots index the owning
@@ -94,12 +106,23 @@ public:
     // why the copy exists). Rejects on size mismatch (warn, stays unskinned).
     void SetSkin(std::vector<VertexSkin> skin);
 
+    // --- morph targets (#149) --------------------------------------------------
+    bool HasMorphTargets() const { return !m_MorphTargets.empty(); }
+    const std::vector<MorphTarget>& MorphTargets() const { return m_MorphTargets; }
+    // Same contract as SetSkin: call while the vertices still hold undeformed
+    // bind data (snapshots them if the skin hasn't already), reject malformed
+    // parallel arrays with a warning — the mesh stays morphless, never asserts.
+    // Live weights are per-entity (Entity::morphWeights), not stored here: the
+    // mesh is a shared asset, weights are instance state (like pose vs skeleton).
+    void SetMorphTargets(std::vector<MorphTarget> targets);
+
 private:
     std::vector<Vertex> m_Vertices;
     std::vector<uint32_t> m_Indices;
     std::vector<Submesh> m_Submeshes; // sanitized at construction, immutable after
     std::vector<VertexSkin> m_Skin;   // empty = not skinned
-    std::vector<Vertex> m_BindVertices; // bind-pose snapshot, set with the skin
+    std::vector<MorphTarget> m_MorphTargets; // empty = no morphs (#149)
+    std::vector<Vertex> m_BindVertices; // bind-pose snapshot, set with the skin/morphs
     AABB m_Bounds;
     uint64_t m_Version = 0;
     uint32_t m_VAO = 0, m_VBO = 0, m_IBO = 0;

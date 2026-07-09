@@ -12,6 +12,7 @@ using nlohmann::json;
 
 static_assert(sizeof(Vertex) == 8 * sizeof(float), "Vertex layout changed - bump kSceneFormatVersion");
 static_assert(sizeof(VertexSkin) == 8 * sizeof(float), "VertexSkin layout changed - bump kSceneFormatVersion");
+static_assert(sizeof(vec3) == 3 * sizeof(float), "vec3 layout changed - bump kSceneFormatVersion"); // morph delta blobs (#149)
 
 namespace {
 
@@ -110,6 +111,22 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
                 jm["skinOffset"] = (uint64_t)blob.size();
                 Append(blob, m.skin.data(), m.skin.size() * sizeof(VertexSkin));
             }
+            if (!m.morphTargets.empty()) { // v3 optional keys (#149), no version bump
+                json targets = json::array();
+                for (const MorphTarget& t : m.morphTargets) {
+                    json jt;
+                    jt["name"] = t.name;
+                    jt["count"] = (uint64_t)t.positionDeltas.size();
+                    jt["offset"] = (uint64_t)blob.size();
+                    Append(blob, t.positionDeltas.data(), t.positionDeltas.size() * sizeof(vec3));
+                    if (!t.normalDeltas.empty()) { // key presence = target carries normal deltas
+                        jt["normalOffset"] = (uint64_t)blob.size();
+                        Append(blob, t.normalDeltas.data(), t.normalDeltas.size() * sizeof(vec3));
+                    }
+                    targets.push_back(std::move(jt));
+                }
+                jm["morphTargets"] = std::move(targets);
+            }
             if (!m.submeshes.empty()) {
                 json subs = json::array();
                 for (const Submesh& s : m.submeshes)
@@ -198,6 +215,8 @@ std::vector<uint8_t> EncodeScene(const SavedScene& scene)
                 jp.push_back(QuatToJson(q));
             je["pose"] = std::move(jp); // per-joint deltas (v3, #147)
         }
+        if (!e.morphWeights.empty())
+            je["morphWeights"] = e.morphWeights; // per-instance weights (v3 optional, #149)
         entities.push_back(std::move(je));
     }
 
@@ -288,6 +307,48 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
                         m.skin.resize(skinCount);
                         std::memcpy(m.skin.data(), blob + skinOffset, skinBytes);
                     }
+                }
+                if (auto mt = jm.find("morphTargets"); mt != jm.end() && mt->is_array()) { // #149
+                    std::vector<MorphTarget> targets;
+                    bool parallel = true; // all targets must parallel the vertices, or none load
+                    for (const json& jt : *mt) {
+                        if (!jt.is_object()) {
+                            parallel = false;
+                            break;
+                        }
+                        MorphTarget t;
+                        t.name = GetOr<std::string>(jt, "name", "");
+                        uint64_t count = GetOr<uint64_t>(jt, "count", 0);
+                        uint64_t offset = GetOr<uint64_t>(jt, "offset", 0);
+                        // Per-count check first (overflow-safe), then range; mirror the skin guard.
+                        if (count > blobSize / sizeof(vec3))
+                            return std::nullopt;
+                        uint64_t bytes = count * sizeof(vec3);
+                        if (offset > blobSize || bytes > blobSize - offset)
+                            return std::nullopt;
+                        // Deltas must be parallel to vertices; a mismatch is a corrupt
+                        // file — drop the whole target set (renders unmorphed) rather
+                        // than desync name->index resolution against partial data.
+                        if (count != vCount) {
+                            parallel = false;
+                            break;
+                        }
+                        t.positionDeltas.resize(count);
+                        if (count)
+                            std::memcpy(t.positionDeltas.data(), blob + offset, bytes);
+                        if (auto no = jt.find("normalOffset");
+                            no != jt.end() && no->is_number_unsigned()) {
+                            uint64_t normalOffset = no->get<uint64_t>();
+                            if (normalOffset > blobSize || bytes > blobSize - normalOffset)
+                                return std::nullopt;
+                            t.normalDeltas.resize(count);
+                            if (count)
+                                std::memcpy(t.normalDeltas.data(), blob + normalOffset, bytes);
+                        }
+                        targets.push_back(std::move(t));
+                    }
+                    if (parallel)
+                        m.morphTargets = std::move(targets);
                 }
                 if (auto st = jm.find("submeshes"); st != jm.end() && st->is_array()) {
                     std::vector<Submesh> subs;
@@ -389,6 +450,11 @@ std::optional<SavedScene> DecodeScene(const uint8_t* data, size_t size)
             if (auto pt = je.find("pose"); pt != je.end() && pt->is_array())
                 for (const json& v : *pt)
                     e.pose.push_back(JsonToQuat(v));
+            if (auto mw = je.find("morphWeights"); mw != je.end() && mw->is_array()) // #149
+                for (const json& v : *mw)
+                    // Non-finite/huge file numbers -> benign 0 (a NaN weight would
+                    // poison every morphed vertex), same posture as JsonToQuat.
+                    e.morphWeights.push_back(SafeFloat(v) ? v.get<float>() : 0.0f);
             scene.entities.push_back(std::move(e));
         }
     }

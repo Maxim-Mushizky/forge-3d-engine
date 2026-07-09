@@ -32,6 +32,7 @@ struct Entity {
     std::shared_ptr<Mesh> mesh; // null = empty node (e.g. a group)
     std::shared_ptr<Skeleton> skeleton; // null = not skinned
     Pose pose; // per-joint FK overrides on top of the skeleton bind; empty = bind (#147)
+    std::vector<float> morphWeights; // per-instance morph target weights; empty = all zero (#149)
     MaterialComponent material; // material slot 0 — kept as a direct field so
                                 // every single-material call site stays valid (#80)
     std::vector<MaterialComponent> extraMaterials; // slots 1+ (multi-material meshes)

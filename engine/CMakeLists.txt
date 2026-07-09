@@ -23,6 +23,7 @@ add_library(forge STATIC
     src/forge/anim/Skinning.cpp
     src/forge/anim/SkinImport.cpp
     src/forge/anim/SkinApply.cpp
+    src/forge/anim/Morph.cpp
     src/forge/anim/Pose.cpp
     src/forge/anim/PosePresets.cpp
     src/forge/anim/Ik.cpp

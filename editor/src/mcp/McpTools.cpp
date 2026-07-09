@@ -30,6 +30,7 @@
 #include <stb_image.h> // reference decode for compare_silhouette (#114)
 
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -177,6 +178,13 @@ static json EntityJson(const Scene& scene, const Entity& e)
                      {"triangles", e.mesh->Indices().size() / 3}};
         if (!e.mesh->Submeshes().empty())
             j["mesh"]["submeshes"] = e.mesh->Submeshes().size();
+        if (e.mesh->HasMorphTargets()) {
+            // Target names (#149) so agents discover what set_morph/set_expression accept.
+            json names = json::array();
+            for (const MorphTarget& t : e.mesh->MorphTargets())
+                names.push_back(t.name);
+            j["mesh"]["morphTargets"] = std::move(names);
+        }
         const AABB wb = WorldBoundsOf(scene, e);
         if (wb.Valid())
             j["worldBounds"] = {{"min", Vec3Json(wb.min)},
@@ -1048,6 +1056,14 @@ void EditorApp::RegisterMcpTools()
         "defaults to the joint's first child) } rotates one joint so its forward axis (the "
         "bone toward forward_child) points at the target. Both #148: no degrees, all "
         "positions world-space; needs a skinned/imported model; one undo entry. "
+        "set_morph{id, target='jawOpen' (a name from the asset's targetNames, or an "
+        "index), weight=0..1 (unclamped — negative/>1 extrapolate, |w| <= 1e4)} writes one morph-"
+        "target weight; set_expression{id, weights={jawOpen=0.5, mouthSmileLeft=1}, "
+        "reset=bool} writes a batch (unknown names reject the whole call and the error "
+        "lists the asset's targets — ARKit-52 names ride on the asset's targetNames, "
+        "nothing is hardcoded; unspecified targets keep their weight, reset=true zeroes "
+        "all first). Morphs compose with the current pose (morph THEN skin, #149) and "
+        "undo stores only the weights. "
         "export_stl{}. "
         "Entity writes return the affected entity as a table (use .id); camera/"
         "selection/element/export calls return their own shapes. "
@@ -3014,7 +3030,8 @@ ToolResult EditorApp::ToolSetPose(const json& args)
             e->mesh = std::move(priv);
     }
     e->pose = std::move(next);
-    ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    // Combined path (#149): re-posing must keep the entity's active morphs.
+    ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights);
     m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, std::move(before), e->pose));
 
     json out = EntityJson(m_Scene, *e);
@@ -3101,7 +3118,7 @@ ToolResult EditorApp::ToolPoseIk(const json& args)
             e->mesh = std::move(priv);
     }
     e->pose = std::move(next);
-    ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights); // keeps morphs (#149)
     m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, std::move(before), e->pose));
 
     json out = EntityJson(m_Scene, *e);
@@ -3183,13 +3200,171 @@ ToolResult EditorApp::ToolPoseAim(const json& args)
             e->mesh = std::move(priv);
     }
     e->pose = std::move(next);
-    ApplyPose(*e->mesh, *e->skeleton, e->pose);
+    ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights); // keeps morphs (#149)
     m_Commands.Push(std::make_unique<SetPoseCommand>(e->id, std::move(before), e->pose));
 
     json out = EntityJson(m_Scene, *e);
     out["joint"] = jointName;
     out["forwardChild"] = sk.names[(size_t)forwardChild];
     out["jointCount"] = (uint64_t)sk.JointCount();
+    return JsonResult(out);
+}
+
+// #149: morph target lookup by asset name. Exact match first (mirrors JointIndex);
+// a UNIQUE case-insensitive match rescues agents that copy ARKit names with the
+// wrong casing, while an ambiguous one stays -1 rather than guessing.
+static int MorphTargetIndex(const std::vector<MorphTarget>& targets, const std::string& name)
+{
+    for (size_t i = 0; i < targets.size(); ++i)
+        if (targets[i].name == name)
+            return (int)i;
+    auto lower = [](const std::string& s) {
+        std::string out = s;
+        std::transform(out.begin(), out.end(), out.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return out;
+    };
+    const std::string wanted = lower(name);
+    int found = -1;
+    for (size_t i = 0; i < targets.size(); ++i)
+        if (lower(targets[i].name) == wanted) {
+            if (found >= 0)
+                return -1; // ambiguous
+            found = (int)i;
+        }
+    return found;
+}
+
+// Sane extrapolation bound for morph weights (#149 review). glTF permits any
+// value, but a merely-finite weight isn't enough: the PRODUCT w·δ must stay
+// finite too (the #167 failure class, multiplicative this time — 1e38 × a
+// 10-unit delta is Inf, poisoning positions and the AABB while returning ok).
+// 1e4 times any plausible delta is still comfortably finite float.
+constexpr float kMaxMorphWeight = 1e4f;
+
+// Comma-joined target names for error messages: the asset defines the vocabulary
+// (ARKit-52 or otherwise), so a failed lookup teaches the agent what exists.
+static std::string MorphTargetNames(const std::vector<MorphTarget>& targets)
+{
+    std::string names;
+    for (const MorphTarget& t : targets) {
+        if (!names.empty())
+            names += ", ";
+        names += t.name;
+    }
+    return names;
+}
+
+// #149: morph weights. forge.set_morph writes ONE named target's weight;
+// forge.set_expression (below) writes a batch. Both ride set_pose's plumbing:
+// validate-then-mutate, COW, re-deform from bind through the combined morph+skin
+// path (an active pose must survive the morph), one SetMorphCommand per call.
+ToolResult EditorApp::ToolSetMorph(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->mesh || !e->mesh->HasMorphTargets())
+        return Err("Entity mesh has no morph targets (import a model that carries them first)");
+    const std::vector<MorphTarget>& targets = e->mesh->MorphTargets();
+
+    // --- validate everything before touching the mesh (validate-then-mutate) ---
+    int index = -1;
+    if (args.contains("target") && args["target"].is_number_integer()) {
+        const int64_t i = args["target"].get<int64_t>();
+        if (i < 0 || i >= (int64_t)targets.size())
+            return Err("Morph target index " + std::to_string(i) + " out of range (0.." +
+                       std::to_string(targets.size() - 1) + ")");
+        index = (int)i;
+    } else if (args.contains("target") && args["target"].is_string()) {
+        const std::string name = args["target"].get<std::string>();
+        index = MorphTargetIndex(targets, name);
+        if (index < 0)
+            return Err("No morph target named \"" + name +
+                       "\" — available: " + MorphTargetNames(targets));
+    } else {
+        return Err("Provide \"target\" (name or index)");
+    }
+    if (!args.contains("weight") || !args["weight"].is_number())
+        return Err("Provide \"weight\" (0 = off, 1 = full; negative/>1 extrapolate)");
+    const double weight = args["weight"].get<double>();
+    // A NaN/Inf weight — or one whose product with the deltas overflows — would
+    // poison every morphed vertex while returning ok (#167, see kMaxMorphWeight).
+    if (!std::isfinite(weight) || std::fabs(weight) > (double)kMaxMorphWeight)
+        return Err("\"weight\" must be a finite number within ±10000");
+
+    // --- mutate: COW the mesh if it is shared, then re-deform from bind ---
+    std::vector<float> before = e->morphWeights;
+    if (e->mesh.use_count() > 1) {
+        std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh);
+        if (priv)
+            e->mesh = std::move(priv);
+    }
+    if (e->morphWeights.size() != targets.size())
+        e->morphWeights.resize(targets.size(), 0.0f); // lazily materialize to all-zero
+    e->morphWeights[(size_t)index] = (float)weight;
+    ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights);
+    m_Commands.Push(std::make_unique<SetMorphCommand>(e->id, std::move(before), e->morphWeights));
+
+    json out = EntityJson(m_Scene, *e);
+    out["target"] = targets[(size_t)index].name;
+    out["weight"] = e->morphWeights[(size_t)index];
+    out["targetCount"] = (uint64_t)targets.size();
+    return JsonResult(out);
+}
+
+// #149: batch morph weights ("expression" = a table of target weights, e.g. an
+// ARKit face pose). All-or-nothing validation: one unknown name or bad value
+// rejects the whole call before anything mutates, so a typo can't half-apply.
+ToolResult EditorApp::ToolSetExpression(const json& args)
+{
+    std::string error;
+    Entity* e = FindToolTarget(m_Scene, args, error);
+    if (!e)
+        return Err(error);
+    if (!e->mesh || !e->mesh->HasMorphTargets())
+        return Err("Entity mesh has no morph targets (import a model that carries them first)");
+    const std::vector<MorphTarget>& targets = e->mesh->MorphTargets();
+
+    if (!args.contains("weights") || !args["weights"].is_object())
+        return Err("Provide \"weights\" = {targetName = weight, ...}");
+    const bool reset = args.value("reset", false);
+    std::vector<std::pair<size_t, float>> resolved;
+    for (const auto& [name, value] : args["weights"].items()) {
+        const int index = MorphTargetIndex(targets, name);
+        if (index < 0)
+            return Err("No morph target named \"" + name +
+                       "\" — available: " + MorphTargetNames(targets));
+        if (!value.is_number())
+            return Err("Weight for \"" + name + "\" must be a number");
+        const double w = value.get<double>();
+        if (!std::isfinite(w) || std::fabs(w) > (double)kMaxMorphWeight) // #167 lesson
+            return Err("Weight for \"" + name + "\" must be a finite number within ±10000");
+        resolved.emplace_back((size_t)index, (float)w);
+    }
+    if (resolved.empty() && !reset)
+        return Err("\"weights\" is empty (pass reset=true to zero every target)");
+
+    std::vector<float> before = e->morphWeights;
+    if (e->mesh.use_count() > 1) {
+        std::shared_ptr<Mesh> priv = CloneSkinnedMesh(*e->mesh);
+        if (priv)
+            e->mesh = std::move(priv);
+    }
+    if (reset)
+        e->morphWeights.assign(targets.size(), 0.0f); // named targets re-apply below
+    else if (e->morphWeights.size() != targets.size())
+        e->morphWeights.resize(targets.size(), 0.0f); // unspecified targets keep their weight
+    for (const auto& [index, w] : resolved)
+        e->morphWeights[index] = w;
+    ApplyDeform(*e->mesh, e->skeleton.get(), &e->pose, e->morphWeights);
+    m_Commands.Push(std::make_unique<SetMorphCommand>(e->id, std::move(before), e->morphWeights));
+
+    json out = EntityJson(m_Scene, *e);
+    out["applied"] = (uint64_t)resolved.size();
+    out["reset"] = reset;
+    out["targetCount"] = (uint64_t)targets.size();
     return JsonResult(out);
 }
 
@@ -4124,6 +4299,8 @@ ToolResult EditorApp::ToolExecuteScript(const json& args)
         add("set_pose", call(&EditorApp::ToolSetPose, nullptr));
         add("pose_ik", call(&EditorApp::ToolPoseIk, nullptr));   // #148
         add("pose_aim", call(&EditorApp::ToolPoseAim, nullptr)); // #148
+        add("set_morph", call(&EditorApp::ToolSetMorph, nullptr));           // #149
+        add("set_expression", call(&EditorApp::ToolSetExpression, nullptr)); // #149
         add("extrude_faces", call(&EditorApp::ToolEditElements, "extrude_faces"));
         add("extrude_edges", call(&EditorApp::ToolEditElements, "extrude_edges"));
         add("subdivide_faces", call(&EditorApp::ToolEditElements, "subdivide_faces"));
